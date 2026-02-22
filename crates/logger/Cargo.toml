@@ -1,0 +1,13 @@
+[package]
+name    = "logger"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+chrono     = { workspace = true }
+tracing    = { workspace = true }
+anyhow     = { workspace = true }
+reqwest    = { workspace = true, features = ["json"] }
+tokio      = { workspace = true }

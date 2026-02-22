@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    ".",
+    "crates/price_monitor",
+    "crates/arb_detector",
+    "crates/logger",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio      = { version = "1",    features = ["full"] }
+reqwest    = { version = "0.12", features = ["json"] }
+serde      = { version = "1",    features = ["derive"] }
+serde_json = "1"
+dotenv     = "0.15"
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono     = { version = "0.4",  features = ["serde"] }
+anyhow     = "1"
+
+[package]
+name    = "rustmisko-live"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "live-observer"
+path = "src/main.rs"
+
+[dependencies]
+tokio              = { workspace = true }
+dotenv             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+price_monitor      = { path = "crates/price_monitor" }
+arb_detector       = { path = "crates/arb_detector" }
+logger             = { path = "crates/logger" }
