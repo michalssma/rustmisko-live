@@ -34,6 +34,24 @@ Nový agent: přečti CONTEXT.md → pak tento soubor → pak kóduj.
 
 ---
 
+## 2026-02-22 — PHASE 1 logging-only deployment START
+
+**Rozhodnutí:** Spouštíme okamžitě logging-only nasazení i bez plných API klíčů.
+
+**Implementováno:**
+- `API_STATUS` event per source/sport v každém poll cyklu
+- `SYSTEM_HEARTBEAT` event per cyklus (health + item summary)
+- `.env` parametry: `POLL_INTERVAL_SECS`, `MIN_ROI_PCT`
+
+**Proč:**
+- Potřebujeme audit trail 24/7 i při částečně nefunkčních zdrojích
+- Agenti musí mít vždy up-to-date obraz stavu systému
+
+**Pravidlo změn:**
+Každý tuning thresholdů musí být zapsán do `PLAN.md` + `DECISIONS.md` (before/after + důvod + metrika).
+
+---
+
 ## 2026-02-22 — Primární strategie: In-play lag arb na Betfair + Smarkets
 
 **Rozhodnutí:** In-play lag arb je primární edge typ.

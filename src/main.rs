@@ -38,21 +38,38 @@ async fn main() -> Result<()> {
 
     let pinnacle_key = env::var("PINNACLE_KEY").ok();   // volitelné
     let oddsapi_key  = env::var("ODDSAPI_KEY").ok();    // volitelné pro free tier
+    let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    let min_roi_pct = env::var("MIN_ROI_PCT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
 
     if pinnacle_key.is_none() {
         info!("PINNACLE_KEY not set — using unauthenticated access (may be rate limited)");
     }
     if oddsapi_key.is_none() {
-        info!("ODDSAPI_KEY not set — odds-api.io free tier (100 req/hour)");
+        info!("ODDSAPI_KEY not set — odds-api poll will be skipped and logged as status");
     }
 
-    let monitor = PriceMonitor::new("logs", pinnacle_key, oddsapi_key);
+    info!("Poll interval: {}s", poll_interval_secs);
+    info!("Paper signal min ROI: {:.2}%", min_roi_pct);
 
-    info!("Starting poll loop (60s interval)...");
+    let monitor = PriceMonitor::new(
+        "logs",
+        pinnacle_key,
+        oddsapi_key,
+        min_roi_pct,
+        poll_interval_secs,
+    );
+
+    info!("Starting poll loop ({}s interval)...", poll_interval_secs);
 
     loop {
         info!("--- Poll cycle ---");
         monitor.poll_all().await;
-        sleep(Duration::from_secs(60)).await;
+        sleep(Duration::from_secs(poll_interval_secs)).await;
     }
 }

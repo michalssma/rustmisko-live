@@ -7,7 +7,14 @@
 /// Fáze 1 (48h): pouze loguje, nevydává signály k obchodování.
 
 use anyhow::{Context, Result};
-use logger::{EventLogger, PinnacleLineEvent, OddsApiArbEvent, now_iso};
+use logger::{
+    ApiStatusEvent,
+    EventLogger,
+    OddsApiArbEvent,
+    PinnacleLineEvent,
+    SystemHeartbeatEvent,
+    now_iso,
+};
 use serde::Deserialize;
 use tracing::{info, warn, debug};
 
@@ -94,6 +101,23 @@ pub struct PriceMonitor {
     logger:       EventLogger,
     pinnacle_key: Option<String>,   // None = Pinnacle bez auth (free)
     oddsapi_key:  Option<String>,   // odds-api.io klíč
+    min_roi_pct:  f64,
+    poll_interval_secs: u64,
+}
+
+struct SourceProbe {
+    scope: String,
+    ok: bool,
+    status_code: Option<u16>,
+    message: String,
+    items_logged: usize,
+}
+
+struct PollSummary {
+    pinnacle_items: usize,
+    oddsapi_items: usize,
+    healthy_sources: usize,
+    total_sources: usize,
 }
 
 impl PriceMonitor {
@@ -101,31 +125,108 @@ impl PriceMonitor {
         log_dir:      impl Into<std::path::PathBuf>,
         pinnacle_key: Option<String>,
         oddsapi_key:  Option<String>,
+        min_roi_pct:  f64,
+        poll_interval_secs: u64,
     ) -> Self {
         Self {
             client:       reqwest::Client::new(),
             logger:       EventLogger::new(log_dir),
             pinnacle_key,
             oddsapi_key,
+            min_roi_pct,
+            poll_interval_secs,
         }
     }
 
     /// Hlavní poll — zavolej periodicky (každých 60s)
     pub async fn poll_all(&self) {
+        let mut summary = PollSummary {
+            pinnacle_items: 0,
+            oddsapi_items: 0,
+            healthy_sources: 0,
+            total_sources: 0,
+        };
+
         // A) Pinnacle
-        if let Err(e) = self.poll_pinnacle().await {
-            warn!("Pinnacle poll failed: {}", e);
+        match self.poll_pinnacle().await {
+            Ok((items, healthy, total)) => {
+                summary.pinnacle_items = items;
+                summary.healthy_sources += healthy;
+                summary.total_sources += total;
+            }
+            Err(e) => {
+                summary.total_sources += 1;
+                let status = ApiStatusEvent {
+                    ts: now_iso(),
+                    event: "API_STATUS",
+                    source: "pinnacle".to_string(),
+                    scope: "global".to_string(),
+                    ok: false,
+                    status_code: None,
+                    message: format!("poll_failed: {e}"),
+                    items_logged: 0,
+                };
+                let _ = self.logger.log(&status);
+            }
+        }
+
+        if summary.total_sources == 0 {
+            summary.total_sources = 1;
         }
 
         // B) odds-api.io arbitrage-bets
-        if let Err(e) = self.poll_oddsapi_arb().await {
-            warn!("odds-api.io arb poll failed: {}", e);
+        match self.poll_oddsapi_arb().await {
+            Ok((items, healthy, total)) => {
+                summary.oddsapi_items = items;
+                summary.healthy_sources += healthy;
+                summary.total_sources += total;
+            }
+            Err(e) => {
+                summary.total_sources += 1;
+                let status = ApiStatusEvent {
+                    ts: now_iso(),
+                    event: "API_STATUS",
+                    source: "odds_api".to_string(),
+                    scope: "global".to_string(),
+                    ok: false,
+                    status_code: None,
+                    message: format!("poll_failed: {e}"),
+                    items_logged: 0,
+                };
+                let _ = self.logger.log(&status);
+            }
+        }
+
+        let heartbeat = SystemHeartbeatEvent {
+            ts: now_iso(),
+            event: "SYSTEM_HEARTBEAT",
+            phase: "PHASE1_LOGGING_ONLY".to_string(),
+            poll_interval_secs: self.poll_interval_secs,
+            pinnacle_items: summary.pinnacle_items,
+            oddsapi_items: summary.oddsapi_items,
+            total_items: summary.pinnacle_items + summary.oddsapi_items,
+            healthy_sources: summary.healthy_sources,
+            total_sources: summary.total_sources,
+        };
+        let _ = self.logger.log(&heartbeat);
+
+        if summary.healthy_sources == 0 {
+            warn!("No healthy data sources in this poll cycle");
+        }
+
+        if summary.pinnacle_items + summary.oddsapi_items > 0 {
+            info!(
+                "Cycle logged {} total items (healthy sources: {}/{})",
+                summary.pinnacle_items + summary.oddsapi_items,
+                summary.healthy_sources,
+                summary.total_sources
+            );
         }
     }
 
     // ── A) Pinnacle ──────────────────────────────────────────────────────────
 
-    async fn poll_pinnacle(&self) -> Result<()> {
+    async fn poll_pinnacle(&self) -> Result<(usize, usize, usize)> {
         // Sports IDs na Pinnacle: 29=soccer, 4=basketball, 3=baseball, 6=hockey, 33=tennis
         let sport_ids = vec![
             (29u32, "soccer"),
@@ -135,16 +236,39 @@ impl PriceMonitor {
             (33, "tennis"),
         ];
 
+        let mut total_items = 0usize;
+        let mut healthy = 0usize;
+        let mut total_sources = 0usize;
+
         for (sport_id, sport_name) in sport_ids {
+            total_sources += 1;
             match self.fetch_pinnacle_sport(sport_id, sport_name).await {
-                Ok(count) => info!("Pinnacle {sport_name}: {count} lines logged"),
+                Ok(probe) => {
+                    let ev = ApiStatusEvent {
+                        ts: now_iso(),
+                        event: "API_STATUS",
+                        source: "pinnacle".to_string(),
+                        scope: probe.scope,
+                        ok: probe.ok,
+                        status_code: probe.status_code,
+                        message: probe.message,
+                        items_logged: probe.items_logged,
+                    };
+                    let _ = self.logger.log(&ev);
+
+                    if probe.ok {
+                        healthy += 1;
+                    }
+                    total_items += probe.items_logged;
+                    info!("Pinnacle {sport_name}: {} lines logged", probe.items_logged);
+                }
                 Err(e)    => warn!("Pinnacle {sport_name} failed: {e}"),
             }
         }
-        Ok(())
+        Ok((total_items, healthy, total_sources))
     }
 
-    async fn fetch_pinnacle_sport(&self, sport_id: u32, sport_name: &str) -> Result<usize> {
+    async fn fetch_pinnacle_sport(&self, sport_id: u32, sport_name: &str) -> Result<SourceProbe> {
         // Pinnacle public API (free, bez auth pro read-only odds)
         // Docs: https://pinnacleapi.github.io/linesapi
         let url = format!(
@@ -166,7 +290,13 @@ impl PriceMonitor {
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             warn!("Pinnacle API {sport_name} status {status}: {}", &body[..body.len().min(200)]);
-            return Ok(0);
+            return Ok(SourceProbe {
+                scope: sport_name.to_string(),
+                ok: false,
+                status_code: Some(status.as_u16()),
+                message: format!("http_status_{status}"),
+                items_logged: 0,
+            });
         }
 
         let raw = resp.text().await.context("Pinnacle body read failed")?;
@@ -228,18 +358,33 @@ impl PriceMonitor {
             }
         }
 
-        Ok(count)
+        Ok(SourceProbe {
+            scope: sport_name.to_string(),
+            ok: true,
+            status_code: Some(status.as_u16()),
+            message: "ok".to_string(),
+            items_logged: count,
+        })
     }
 
     // ── B) odds-api.io /arbitrage-bets ───────────────────────────────────────
 
-    async fn poll_oddsapi_arb(&self) -> Result<()> {
+    async fn poll_oddsapi_arb(&self) -> Result<(usize, usize, usize)> {
         let key = match &self.oddsapi_key {
-            Some(k) => k.clone(),
-            None => {
-                // odds-api.io free tier nevyžaduje klíč pro základní endpointy
-                // Zkusíme bez klíče
-                String::new()
+            Some(k) if !k.trim().is_empty() => k.clone(),
+            _ => {
+                let status = ApiStatusEvent {
+                    ts: now_iso(),
+                    event: "API_STATUS",
+                    source: "odds_api".to_string(),
+                    scope: "global".to_string(),
+                    ok: false,
+                    status_code: None,
+                    message: "skipped_no_api_key".to_string(),
+                    items_logged: 0,
+                };
+                let _ = self.logger.log(&status);
+                return Ok((0, 0, 1));
             }
         };
 
@@ -254,22 +399,43 @@ impl PriceMonitor {
             "tennis_atp_french_open",
         ];
 
+        let mut total_items = 0usize;
+        let mut healthy = 0usize;
+        let mut total_sources = 0usize;
+
         for sport in sports {
-            if let Err(e) = self.fetch_arb_for_sport(sport, &key).await {
-                warn!("odds-api.io arb for {sport}: {e}");
+            total_sources += 1;
+            match self.fetch_arb_for_sport(sport, &key).await {
+                Ok(probe) => {
+                    let ev = ApiStatusEvent {
+                        ts: now_iso(),
+                        event: "API_STATUS",
+                        source: "odds_api".to_string(),
+                        scope: probe.scope,
+                        ok: probe.ok,
+                        status_code: probe.status_code,
+                        message: probe.message,
+                        items_logged: probe.items_logged,
+                    };
+                    let _ = self.logger.log(&ev);
+
+                    if probe.ok {
+                        healthy += 1;
+                    }
+                    total_items += probe.items_logged;
+                }
+                Err(e) => {
+                    warn!("odds-api.io arb for {sport}: {e}");
+                }
             }
         }
-        Ok(())
+        Ok((total_items, healthy, total_sources))
     }
 
-    async fn fetch_arb_for_sport(&self, sport: &str, api_key: &str) -> Result<()> {
+    async fn fetch_arb_for_sport(&self, sport: &str, api_key: &str) -> Result<SourceProbe> {
         // odds-api.io free tier: 100 req/hour
         // Endpoint: GET https://odds-api.io/v1/arbitrage-bets?sport={sport}&apiKey={key}
-        let base_url = if api_key.is_empty() {
-            format!("https://api.the-odds-api.com/v4/sports/{}/odds/?regions=eu&markets=h2h&oddsFormat=decimal&apiKey=PLACEHOLDER", sport)
-        } else {
-            format!("https://odds-api.io/v1/arbitrage-bets?sport={}&apiKey={}", sport, api_key)
-        };
+        let base_url = format!("https://odds-api.io/v1/arbitrage-bets?sport={}&apiKey={}", sport, api_key);
 
         let resp = self.client
             .get(&base_url)
@@ -283,18 +449,26 @@ impl PriceMonitor {
 
         if !status.is_success() {
             debug!("odds-api.io {sport} status {status}: {}", &raw[..raw.len().min(200)]);
-            return Ok(());
+            return Ok(SourceProbe {
+                scope: sport.to_string(),
+                ok: false,
+                status_code: Some(status.as_u16()),
+                message: format!("http_status_{status}"),
+                items_logged: 0,
+            });
         }
 
         // Parsuj arb bets pokud jsou
         let data: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+
+        let mut count = 0usize;
 
         // Formát závisí na tom zda používáme odds-api.io nebo the-odds-api fallback
         // Pro odds-api.io: { "arb_bets": [...] }
         if let Some(arbs) = data["arb_bets"].as_array() {
             for arb in arbs {
                 let roi = arb["roi"].as_f64().unwrap_or(0.0);
-                if roi < 0.01 { continue; } // skip <1%
+            if roi * 100.0 < self.min_roi_pct { continue; }
 
                 let ev = OddsApiArbEvent {
                     ts:              now_iso(),
@@ -319,11 +493,18 @@ impl PriceMonitor {
                 );
 
                 let _ = self.logger.log(&ev);
+                count += 1;
             }
         } else {
             debug!("odds-api.io {sport}: no arb_bets in response (format may differ)");
         }
 
-        Ok(())
+        Ok(SourceProbe {
+            scope: sport.to_string(),
+            ok: true,
+            status_code: Some(status.as_u16()),
+            message: "ok".to_string(),
+            items_logged: count,
+        })
     }
 }

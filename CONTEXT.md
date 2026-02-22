@@ -26,19 +26,26 @@ Resolver — risk check (min 2%, max $300, circuit breaker)
 OBSERVE 48h → pak Executor (live bets)
 ```
 
-## Aktuální stav — CHECKPOINT 0 ✅
+## Aktuální stav — PHASE 1 LOGGING ✅
 
 - [x] PLAN.md s checkpointy
 - [x] DECISIONS.md
 - [x] Adresářová struktura
 - [x] Cargo.toml workspace
-- [ ] **NEXT: CHECKPOINT 1** — Betfair Stream + Smarkets WebSocket price_monitor
+- [x] Logging-only pipeline běží (`live-observer`)
+- [x] JSONL audit eventy: `API_STATUS`, `SYSTEM_HEARTBEAT`
+- [x] Runtime thresholdy přes `.env`: `POLL_INTERVAL_SECS`, `MIN_ROI_PCT`
+- [ ] **NEXT:** naplnit validní API klíče a sbírat 24/7 data kvality
 
 ## Co čeká na tebe (člověka)
 
 1. **Smarkets signup** → API key → do `.env` jako `SMARKETS_API_KEY=xxx`
 2. **Betfair signup** → developer.betfair.com → AppKey → do `.env` jako `BETFAIR_APP_KEY=xxx`
 3. Pak říct agentovi: "pust se do checkpointu 1"
+4. Pro logging phase zkopíruj `.env.example` → `.env` a nastav minimálně:
+        - `ODDSAPI_KEY=...`
+        - `POLL_INTERVAL_SECS=60`
+        - `MIN_ROI_PCT=1.0`
 
 ## Klíče v .env (NIKDY necommitovat)
 

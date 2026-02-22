@@ -30,7 +30,7 @@ impl ArbDetector {
         sport:            &str,
         pinnacle_prob:    f64,  // fair value
         polymarket_price: f64,  // aktuální tržní cena
-        condition_id:     &str,
+        _condition_id:     &str,
     ) {
         // Edge = fair value - market price
         // Pokud Polymarket podhodnotí (cena < fair value) → edge na BUY

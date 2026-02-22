@@ -1,6 +1,30 @@
 # RustMiskoLive — Implementační plán
 # Naposledy aktualizováno: 2026-02-22
-# Status: AKTIVNÍ VÝVOJ
+# Status: PHASE 1 LOGGING-ONLY NASAZENO
+
+## Aktuálně nasazeno (PHASE 1)
+
+- Binárka: `cargo run --bin live-observer`
+- Režim: observe-only, bez exekuce orderů
+- Log stream: JSONL eventy v `logs/YYYY-MM-DD.jsonl`
+- Nové eventy:
+      - `API_STATUS` — stav každého zdroje/sportu po pollu
+      - `SYSTEM_HEARTBEAT` — souhrn cyklu (healthy sources, item count)
+      - `ODDS_API_ARB` / `PINNACLE_LINE` — datové eventy (pokud dorazí)
+- Runtime thresholdy (editovatelné přes `.env`):
+      - `POLL_INTERVAL_SECS`
+      - `MIN_ROI_PCT`
+
+## Iterační pravidlo (POVINNÉ)
+
+Každá změna prahů nebo logiky musí být zapsána sem + do `DECISIONS.md`:
+
+1. before → after
+2. důvod změny
+3. očekávaný dopad
+4. metrika ověření po 24h
+
+Bez zápisu se změna nepovažuje za validní.
 
 ## Přehled architektury
 

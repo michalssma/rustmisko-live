@@ -90,6 +90,31 @@ pub struct OddsApiArbEvent {
     pub bookmaker_b: String,
 }
 
+#[derive(Serialize, Debug)]
+pub struct ApiStatusEvent {
+    pub ts:          String,
+    pub event:       &'static str,    // "API_STATUS"
+    pub source:      String,           // "pinnacle" | "odds_api"
+    pub scope:       String,           // sport/category
+    pub ok:          bool,
+    pub status_code: Option<u16>,
+    pub message:     String,
+    pub items_logged: usize,
+}
+
+#[derive(Serialize, Debug)]
+pub struct SystemHeartbeatEvent {
+    pub ts:                 String,
+    pub event:              &'static str, // "SYSTEM_HEARTBEAT"
+    pub phase:              String,
+    pub poll_interval_secs: u64,
+    pub pinnacle_items:     usize,
+    pub oddsapi_items:      usize,
+    pub total_items:        usize,
+    pub healthy_sources:    usize,
+    pub total_sources:      usize,
+}
+
 /// Pošli čitelný push alert
 pub async fn send_ntfy_alert(msg: &str, title: &str) {
     let client = reqwest::Client::new();
