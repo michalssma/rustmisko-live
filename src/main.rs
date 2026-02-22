@@ -14,10 +14,12 @@
 
 use anyhow::Result;
 use dotenv::dotenv;
-use price_monitor::PriceMonitor;
+use esports_monitor::EsportsMonitor;
+use arb_detector::ArbDetector;
 use std::env;
+use std::fs::File;
 use tokio::time::{sleep, Duration};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[tokio::main]
@@ -31,45 +33,60 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("=== RustMiskoLive Observer — 48h observe mode ===");
+    info!("=== RustMiskoLive Observer — Esports Phase ===");
     info!("Mode: OBSERVE ONLY (no trades)");
-    info!("Logging: Pinnacle lines + odds-api.io arb bets");
+    info!("Logging: Liquipedia/HTML resolved matches");
     info!("Logs: ./logs/");
 
-    let pinnacle_key = env::var("PINNACLE_KEY").ok();   // volitelné
-    let oddsapi_key  = env::var("ODDSAPI_KEY").ok();    // volitelné pro free tier
-    let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
+    // 1. Single instance lock (Process Safety)
+    let lock_file_path = env::temp_dir().join("rustmiskolive_esports.lock");
+    let lock_file = match File::create(&lock_file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("Failed to create lock file at {:?}: {}", lock_file_path, e);
+            return Ok(());
+        }
+    };
+
+    let mut lock = fd_lock::RwLock::new(lock_file);
+    let _write_guard = match lock.try_write() {
+        Ok(guard) => {
+            info!("Acquired single-instance lock.");
+            guard
+        }
+        Err(_) => {
+            warn!("Another instance of live-observer is already running! Exiting.");
+            return Ok(());
+        }
+    };
+
+    // 2. Načtení env
+    let poll_interval_secs = env::var("ESPORTS_POLL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(60);
-    let min_roi_pct = env::var("MIN_ROI_PCT")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1.0);
-
-    if pinnacle_key.is_none() {
-        info!("PINNACLE_KEY not set — using unauthenticated access (may be rate limited)");
-    }
-    if oddsapi_key.is_none() {
-        info!("ODDSAPI_KEY not set — odds-api poll will be skipped and logged as status");
-    }
+        .unwrap_or(15);
 
     info!("Poll interval: {}s", poll_interval_secs);
-    info!("Paper signal min ROI: {:.2}%", min_roi_pct);
 
-    let monitor = PriceMonitor::new(
-        "logs",
-        pinnacle_key,
-        oddsapi_key,
-        min_roi_pct,
-        poll_interval_secs,
-    );
+    let monitor = EsportsMonitor::new("logs", poll_interval_secs);
+    let arb = ArbDetector::new("logs", true); // Observe only mode pro logovani.
 
     info!("Starting poll loop ({}s interval)...", poll_interval_secs);
 
+    info!("⏳ SYSTEM WARMUP: Waiting 15 seconds to let the background thread map all SX Bet markets...");
+    sleep(Duration::from_secs(15)).await;
+    arb.debug_print_cache().await;
+    info!("🚀 WARMUP COMPLETE: Starting to cross-reference scraped matches against the cache.");
+
     loop {
         info!("--- Poll cycle ---");
-        monitor.poll_all().await;
+        let matches = monitor.poll_all().await;
+        for m in matches {
+            if let Err(e) = arb.evaluate_esports_match(&m.home, &m.away, &m.sport, &m.winner).await {
+                warn!("Glimpse edge checking failed for {}: {}", m.match_name, e);
+            }
+        }
+
         sleep(Duration::from_secs(poll_interval_secs)).await;
     }
 }

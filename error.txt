@@ -1,0 +1,11 @@
+error: failed to load manifest for workspace member `C:\RustMiskoLive\.`
+referenced by workspace at `C:\RustMiskoLive\Cargo.toml`
+
+Caused by:
+  failed to load manifest for dependency `esports_monitor`
+
+Caused by:
+  failed to parse manifest at `C:\RustMiskoLive\crates\esports_monitor\Cargo.toml`
+
+Caused by:
+  this virtual manifest specifies a `dependencies` section, which is not allowed

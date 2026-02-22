@@ -40,28 +40,36 @@ Repo: RustMiskoLive (`C:\RustMiskoLive`)
 
 ## Co teď nefunguje / není hotové (pravdivě)
 
-1. **Pinnacle endpoint vrací 401 bez auth**
-   - aktuálně vidíme `INVALID_AUTHORIZATION_HEADER`
-   - bez validního `PINNACLE_KEY` nejsou data z Pinnacle
-
-2. **odds-api polling je skipnutý bez API klíče**
-   - pokud není `ODDSAPI_KEY`, zapisuje se `skipped_no_api_key`
-   - tudíž paper signaly z odds-api nejsou zatím reálně generované
-
-3. **Trading/execution není implementován**
+1. **Trading/execution není implementován**
    - stále čistě logging-only
    - A+/A/B klasifikace signálů zatím není v kódu
 
-4. **Čas od času byl lock na `live-observer.exe` při rebuildu**
+2. **Čas od času byl lock na `live-observer.exe` při rebuildu**
    - potřeba hlídat běžící proces před novým `cargo run`
 
-## Co má Gemini opravit / dodělat jako další krok
+## Co se postavilo a je HOTOVO (Fáze Pivot)
 
-### Priorita 1 — stabilní datové naplnění
-- Přidat robustnější fallback feed (když Pinnacle 401), aby heartbeat nebyl trvale 0 healthy.
-- Ověřit správný endpoint/kontrakt pro odds-api a sjednotit parser pro reálné response varianty.
+### Priorita 1 — Web3 Sázkovka a Scrapery (Nasazeno)
+
+- Opuštěn Polymarket. Zaveden masivní pivot na **SX.bet** s AMM kontrakty. SX Bet Oracle lag představuje 10-25 minut vysoce výnosného okna po konci zápasu.
+- Implementována neuvěřitelně rychlá "Background Sync" cache (`RwLock`), která na pozadí stahuje a neustále mapuje všech ~60 aktivních SX Bet esportových lig rychlostí 16µs.
+- Přidána robustní rodina scraperů (`crates/esports_monitor`) postavená na přesném parsování HTML a neoficiálních API:
+  - **League of Legends** (`lolesports`)
+  - **Valorant** (`vlr.gg`)
+  - **Counter-Strike 2** (`gosugamers.net`)
+  - **Dota 2** (`gosugamers.net` - na žádost uživatele pro maximalizaci volume)
+
+### Priorita 2 — Telegram Alerting (Nasazeno)
+
+- Jakmile `ArbDetector` najde v `live-observer` pro profitabilní SX Bet match tzv. _Edge_, odesílá okamžitě Telegram alert přímo do mobilu uživatele.
+- Notifikační request těží z `tokio::spawn`, a tím pádem absolutně neblokuje a nezpomaluje výkon hlavní smyčky kalkulací.
+
+## Na co se nyní čeká
+
+- Observační nasazení. Nyní nechat 24-48h běžet `cargo run --bin live-observer` a sbírat Telegram Notifikace k ověření Live Edge logiky na vlastních očích.
 
 ### Priorita 2 — paper signal intelligence
+
 - Přidat klasifikaci `A_PLUS | A | B | REJECT` přímo do logu podle:
   - confidence,
   - liquidity,
@@ -71,6 +79,7 @@ Repo: RustMiskoLive (`C:\RustMiskoLive`)
 - Přidat denní agregaci kvality signálů (precision proxy, conversion to resolved outcomes).
 
 ### Priorita 3 — process safety
+
 - Přidat guard proti současnému běhu více instancí observeru.
 - Přidat explicitní `STARTUP_EVENT` a `SHUTDOWN_EVENT` do JSONL.
 

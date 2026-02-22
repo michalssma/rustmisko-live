@@ -75,19 +75,15 @@ pub struct ArbOpportunityEvent {
 }
 
 #[derive(Serialize, Debug)]
-pub struct OddsApiArbEvent {
+pub struct MatchResolvedEvent {
     pub ts:          String,
-    pub event:       &'static str,    // "ODDS_API_ARB"
+    pub event:       &'static str,    // "MATCH_RESOLVED"
     pub sport:       String,
+    pub match_name:  String,
     pub home:        String,
     pub away:        String,
-    pub roi_pct:     f64,
-    pub outcome_a:   String,
-    pub outcome_a_odds: f64,
-    pub bookmaker_a: String,
-    pub outcome_b:   String,
-    pub outcome_b_odds: f64,
-    pub bookmaker_b: String,
+    pub winner:      String,
+    pub ended_at:    String,
 }
 
 #[derive(Serialize, Debug)]
@@ -108,9 +104,14 @@ pub struct SystemHeartbeatEvent {
     pub event:              &'static str, // "SYSTEM_HEARTBEAT"
     pub phase:              String,
     pub poll_interval_secs: u64,
+    
+    // Obsolete classic metrics
     pub pinnacle_items:     usize,
     pub oddsapi_items:      usize,
     pub total_items:        usize,
+    
+    // New Esports metrics
+    pub overall_items:      usize,
     pub healthy_sources:    usize,
     pub total_sources:      usize,
 }

@@ -3,7 +3,7 @@ members = [
     ".",
     "crates/price_monitor",
     "crates/arb_detector",
-    "crates/logger",
+    "crates/logger", "crates/esports_monitor",
 ]
 resolver = "2"
 
@@ -17,6 +17,7 @@ tracing    = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono     = { version = "0.4",  features = ["serde"] }
 anyhow     = "1"
+fd-lock    = "4"
 
 [package]
 name    = "rustmisko-live"
@@ -33,6 +34,7 @@ dotenv             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
-price_monitor      = { path = "crates/price_monitor" }
+fd-lock            = { workspace = true }
+esports_monitor    = { path = "crates/esports_monitor" }
 arb_detector       = { path = "crates/arb_detector" }
 logger             = { path = "crates/logger" }

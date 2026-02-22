@@ -1,0 +1,16 @@
+[package]
+name = "esports_monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tracing = { workspace = true }
+logger = { path = "../logger" }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+scraper = "0.19"
+regex = "1.10"

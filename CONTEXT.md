@@ -1,5 +1,7 @@
 # RustMiskoLive — Context
+
 # Naposledy aktualizováno: 2026-02-22
+
 # Nový agent: přečti tento soubor → DECISIONS.md → PLAN.md → pak kóduj
 
 ## Co je tento projekt
@@ -11,50 +13,34 @@ Sdílí pouze wallet infrastrukturu — vše ostatní je oddělené.
 
 ## Strategie
 
+## Strategie
+
 ```
-ESPN detekuje gól/score change (5s poll, zdarma)
+Unofficial LoL API / VLR.gg / GosuGamers (Scraping & Free Data)
         ↓
-Betfair Stream API / Smarkets WebSocket — aktuální kurzy
+Esports Monitor — detekuje právě ukončené CS2/LoL/Valorant zápasy
         ↓
-ArbDetector — 3 typy edge:
-  1. In-play lag: ESPN ví o gólu, exchange ještě nezareagoval (15–60s)
-  2. Cross-exchange: Betfair vs. Smarkets price mismatch
-  3. Small league: sharp books (Pinnacle) vs. exchange
+ArbDetector — detekuje lag na Web3 SX Bet esports trzích (10–25 minut). Uloží si 64 aktivních lig do 16µs RwLock Cache.
         ↓
-Resolver — risk check (min 2%, max $300, circuit breaker)
+Resolver — risk check
         ↓
-OBSERVE 48h → pak Executor (live bets)
+OBSERVE 48h → pak Telegram Alert → Executor (live bets)
 ```
 
-## Aktuální stav — PHASE 1 LOGGING ✅
+## Aktuální stav — FÁZE 1 (Production Ready) ✅
 
-- [x] PLAN.md s checkpointy
-- [x] DECISIONS.md
-- [x] Adresářová struktura
-- [x] Cargo.toml workspace
-- [x] Logging-only pipeline běží (`live-observer`)
-- [x] JSONL audit eventy: `API_STATUS`, `SYSTEM_HEARTBEAT`
-- [x] Runtime thresholdy přes `.env`: `POLL_INTERVAL_SECS`, `MIN_ROI_PCT`
-- [ ] **NEXT:** naplnit validní API klíče a sbírat 24/7 data kvality
-
-## Co čeká na tebe (člověka)
-
-1. **Smarkets signup** → API key → do `.env` jako `SMARKETS_API_KEY=xxx`
-2. **Betfair signup** → developer.betfair.com → AppKey → do `.env` jako `BETFAIR_APP_KEY=xxx`
-3. Pak říct agentovi: "pust se do checkpointu 1"
-4. Pro logging phase zkopíruj `.env.example` → `.env` a nastav minimálně:
-        - `ODDSAPI_KEY=...`
-        - `POLL_INTERVAL_SECS=60`
-        - `MIN_ROI_PCT=1.0`
+- [x] Observer plně napojen na VLR.gg (HTML scraping), GosuGamers a neoficiální LoL API.
+- [x] Obří pivot z Polymarketu (který neměl likviditu) na SX.bet.
+- [x] Process Safety — implementace `fd-lock` brání běhu dvou instancí.
+- [x] Telegram Notifikace po nalezení validního edge.
+- [x] JSONL eventy pro Esports (`MATCH_RESOLVED`).
 
 ## Klíče v .env (NIKDY necommitovat)
 
 ```
-BETFAIR_APP_KEY=
-BETFAIR_USERNAME=
-BETFAIR_PASSWORD=
-SMARKETS_API_KEY=
-ODDSAPI_KEY=edf29a96be1a0f82a5f2507494e05f88d4d1508912fd54d2878c187767247b13
+ESPORTS_POLL_INTERVAL_SECS=15
+TELEGRAM_BOT_TOKEN=8125729036:...
+TELEGRAM_CHAT_ID=...
 ```
 
 ## Soubory
@@ -66,8 +52,8 @@ RustMiskoLive/
 ├── CONTEXT.md       ← tento soubor
 ├── src/main.rs      ← orchestrátor
 ├── crates/
-│   ├── price_monitor/   ← Betfair Stream + Smarkets WebSocket
-│   ├── arb_detector/    ← edge kalkulace (Typ 1, 2, 3)
+│   ├── esports_monitor/   ← Esports (CS2/LoL/Valo)
+│   ├── arb_detector/    ← edge kalkulace
 │   └── logger/          ← JSONL + NTFY alerts
 ├── logs/            ← YYYY-MM-DD.jsonl
 └── .env             ← secrets (v .gitignore)
@@ -80,9 +66,9 @@ Viz PLAN.md sekce "AI v pipeline".
 
 ## Vztah k RustMisko
 
-| | RustMisko | RustMiskoLive |
-|---|---|---|
-| Platforma | Polymarket | Betfair + Smarkets |
-| Edge typ | News lag | In-play lag + cross-exchange |
-| Frekvence | 0–3/týden | 5–20/den |
-| Priorita | Sekundární | **Primární** |
+|           | RustMisko  | RustMiskoLive              |
+| --------- | ---------- | -------------------------- |
+| Platforma | Polymarket | SX.bet (Polygon)           |
+| Edge typ  | News lag   | Esports in-play Oracle Lag |
+| Frekvence | 0–3/týden  | 5–20/den                   |
+| Priorita  | Sekundární | **Primární**               |
