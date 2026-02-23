@@ -1,178 +1,152 @@
 # RustMiskoLive — Implementační plán
 
-# Naposledy aktualizováno: 2026-02-22
+# Naposledy aktualizováno: 2026-02-23
 
-# Status: PHASE 1 LOGGING-ONLY NASAZENO
+# Status: LIVE SCORING IMPLEMENTACE (kritická priorita)
 
-## Aktuálně nasazeno (PHASE 1)
+---
 
-- Binárka: `cargo run --bin live-observer`
-- Režim: observe-only, bez exekuce orderů
-- Log stream: JSONL eventy v `logs/YYYY-MM-DD.jsonl`
-- Nové eventy: - `API_STATUS` — stav každého zdroje/sportu po pollu - `SYSTEM_HEARTBEAT` — souhrn cyklu (healthy sources, item count) - `ODDS_API_ARB` / `PINNACLE_LINE` — datové eventy (pokud dorazí)
-- Runtime thresholdy (editovatelné přes `.env`): - `POLL_INTERVAL_SECS` - `MIN_ROI_PCT`
+## Diagnóza stavu (2026-02-23)
 
-## Iterační pravidlo (POVINNÉ)
+### Co funguje:
+- SX Bet background cache sync — 12 mapovaných moneyline matchů každých 60s ✅
+- Deduplikace scrapovaných výsledků (Gemini commit `1e471d7`) ✅
+- Info logging pro "No cached SX Bet market" ✅
+- Telegram alerting pipeline (kód hotový, nikdy nefire-oval) ✅
 
-Každá změna prahů nebo logiky musí být zapsána sem + do `DECISIONS.md`:
+### Co NEFUNGUJE (root cause):
+- **Scrapujeme `/results` stránky** = zápasy dokončené před HODINY
+- SX Bet market na tyto staré zápasy už neexistuje → lookup vždy selže
+- Za 2 dny provozu: **0 ARB_OPPORTUNITY**, **0 Telegram notifikací**
+- Systém je de facto NOP loop
 
-1. before → after
-2. důvod změny
-3. očekávaný dopad
-4. metrika ověření po 24h
+### Co je potřeba:
+Přepnout ze scrapování STARÝCH výsledků na sledování LIVE zápasů a detekci momentu dokončení → checknutí SX Bet orderbooku v 10-25min oracle lag window.
 
-Bez zápisu se změna nepovažuje za validní.
+---
 
-## Přehled architektury
+## Architektura Live Scoring
 
-```
-ESPN live scores (free, neomezené)
-        │
-        ▼
-  EsportsMonitor      ← Liquipedia API (nedávno ukončené eventy, 1 req/sec limit)
-  (60s poll)
-        │
-        ▼
-  ArbDetector           ← ŽÁDNÉ AI v hot path
-        │ signal
-        ▼
-  Resolver              ← risk check (min 2%, max $300, circuit breaker)
-        │
-        ▼
-  OBSERVE LOG + NTFY    ← 48h observe, pak executor
-```
-
-## Tři typy edge — seřazeny dle priority
-
-### TYP 1: SX Bet Oracle Lag (PRIMARY — nejvyšší frekvence)
+### Koncept: State Machine per Match
 
 ```
-VLR.gg / GosuGamers detekuje konec zápasu (Nexus padl) → SX Bet contract stále přijímá sázky protože Oracle node nezaúčtoval výsledek
-Příklad: Zápas na SX betu je otevřený ještě 10-25 minut po reálném konci, s kurzem 2.15 na aktuálního jistého výherce.
-Frekvence: Denně při běhu populárních turnajů.
-Riziko: Nízké (výsledek je de-facto rozhodnut).
-Vyžaduje milisekundovou exekuci po ziscích infa ze scrapingu.
+NEZNÁMÝ → LIVE (detekován na live stránce) → JUST_FINISHED (zmizel z live / state=completed) → EVALUATED (SX Bet check proveden)
 ```
 
-### TYP 2: Cross-exchange arb (SECONDARY)
+Klíčový moment je přechod `LIVE → JUST_FINISHED`. V tu vteřinu voláme `arb.evaluate_esports_match()`.
+
+### Nový data flow
 
 ```
-Betfair nabízí Chelsea 2.05, Smarkets nabízí Chelsea 1.95
-→ lay Chelsea na Smarkets + back Chelsea na Betfair = garantovaný profit
-Frekvence: 1–5/den (závisí na počtu sledovaných trhů)
-Riziko: Střední (musíš mít účet + likviditu na OBOU platformách)
-Poznámka: Vyžaduje kapitál na obou platformách najednou
-```
-
-### TYP 3: Small league mispricing (BONUS)
-
-```
-Fortuna liga, Extraliga, nižší fotbalové ligy
-Betfair/Smarkets vs. sharp books (Pinnacle via odds-api.io)
-Menší boti → větší okno → edge 1–4%
-Frekvence: 2–8/den
+┌────────────────────────┐
+│   LIVE MATCH SOURCES   │
+│                        │
+│  LoL: getSchedule API  │──── state: "inProgress" → "completed"
+│  (JSON, 15s poll)      │
+│                        │
+│  Valorant: vlr.gg      │──── /matches stránka, live section
+│  (HTML scrape, 30s)    │
+│                        │
+│  CS2: HLTV/GosuGamers  │──── /matches stránka, live section
+│  (HTML scrape, 30s)    │
+│                        │
+│  Dota2: GosuGamers     │──── /matches stránka, live section
+│  (HTML scrape, 30s)    │
+└──────────┬─────────────┘
+           │
+           ▼
+┌────────────────────────┐
+│  EsportsMonitor        │
+│  live_matches: HashMap │─── pamatuje si LIVE zápasy
+│                        │
+│  Detekuje přechod:     │
+│  LIVE → FINISHED       │
+│  = NOVÝ výsledek!      │
+└──────────┬─────────────┘
+           │ Vec<MatchResolvedEvent>
+           ▼
+┌────────────────────────┐
+│  ArbDetector           │
+│  SX Bet cache lookup   │──── market_hash → orderbook → edge calc
+│  Telegram alert        │
+└────────────────────────┘
 ```
 
 ---
 
-## Checkpointy — kdy co commitovat
+## Datové zdroje — detaily
 
-### ✅ CHECKPOINT 0 — DONE (tento commit)
+### 1. LoL — `getSchedule` API ⭐ PRIORITA (nejsnazší)
+- **URL**: `https://esports-api.lolesports.com/persisted/gw/getSchedule?hl=en-US`
+- **Header**: `x-api-key: 0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z`
+- **State field**: `events[].state` = `"unstarted"` | `"inProgress"` | `"completed"`
+- **Team names**: `events[].match.teams[0].name`, `events[].match.teams[1].name`
+- **Winner**: `events[].match.teams[N].result.outcome` = `"win"`
+- **Strategie**: Poll každých 15s. Trackuj `inProgress` zápasy. Jakmile zmizí z inProgress nebo přejdou na `completed`, emituj resolved event.
 
-- [x] PLAN.md vytvořen
-- [x] DECISIONS.md aktualizován (pivot od Polymarket ke Smarkets/Betfair)
-- [x] RustMisko config.toml aktualizován (news markets)
-- [x] Adresářová struktura RustMiskoLive existuje
+### 2. Valorant — vlr.gg `/matches` ⭐
+- **URL**: `https://www.vlr.gg/matches` (NE /matches/results!)
+- **Live indikátor**: `a.match-item` s live score (ne countdown). Pravděpodobně class `.mod-live` na match itemu.
+- **Strategie**: Scrapuj /matches, identifikuj live zápasy (mají score místo countdown). Trackuj je. Jakmile zmizí ze stránky nebo se přesunou na results → resolved.
 
-### 🔲 CHECKPOINT 1 — Betfair + Smarkets price_monitor scaffold
+### 3. CS2 — HLTV.org alternativně GosuGamers
+- **HLTV**: `https://www.hltv.org/matches` — má live section nahoře, ale 403 anti-bot
+- **GosuGamers fallback**: `https://www.gosugamers.net/counter-strike/matches` — live matches na hlavní stránce (ne /results)
+- **Strategie**: Scrapuj matches stránku (ne results), detekuj live → finished transition.
 
-Soubory: `crates/price_monitor/src/betfair.rs`, `crates/price_monitor/src/smarkets.rs`
-Co dělá: Připojí se na Betfair Stream API + Smarkets WebSocket, loguje raw odds
-Kritérium: `cargo build` projde, log obsahuje PRICE_UPDATE eventy
-Commit: `"feat: price_monitor — Betfair Stream + Smarkets WebSocket"`
-
-### 🔲 CHECKPOINT 2 — ESPN in-play event detection
-
-Soubory: `crates/event_monitor/src/lib.rs` (nový, sport-based)
-Co dělá: ESPN scoreboard poll každých 5s, detekuje SCORE_CHANGE eventy
-Kritérium: Log obsahuje `SCORE_CHANGE { home_score: 1, away_score: 0, minute: 34 }`
-Commit: `"feat: event_monitor — ESPN in-play score change detection"`
-
-### 🔲 CHECKPOINT 3 — ArbDetector (Typ 1 + Typ 2)
-
-Soubory: `crates/arb_detector/src/lib.rs`
-Co dělá: Spojí score_change event s aktuální cenou → vypočítá edge
-Kritérium: Log obsahuje ARB_OPPORTUNITY event s reálnými daty
-Commit: `"feat: arb_detector — in-play lag + cross-exchange edge detection"`
-
-### 🔲 CHECKPOINT 4 — 48h OBSERVE run
-
-Co dělá: Celý pipeline běží, NTFY alertuje při edge, žádné ordery
-Kritérium: Za 48h min. 10× ARB_OPPORTUNITY v logu
-Data: Průměrný lag, průměrný edge%, nejlepší sport/liga
-Commit: `"data: 48h observe results — X opportunities, Y avg edge"`
-→ **ROZHODNUTÍ: zapnout executor nebo pivotovat**
-
-### 🔲 CHECKPOINT 5 — Executor (pouze po zeleném CP4)
-
-Soubory: `crates/executor/src/betfair.rs`, `crates/executor/src/smarkets.rs`
-Co dělá: Zadává live ordery na Betfair/Smarkets
-Start: max $50 notional, max 3 open pozice
-Commit: `"feat: executor — live betting Betfair/Smarkets (Phase 3)"`
+### 4. Dota 2 — GosuGamers
+- **URL**: `https://www.gosugamers.net/dota2/matches`
+- Stejná strategie jako CS2.
 
 ---
 
-## AI v pipeline — ANO nebo NE?
+## Implementační kroky
 
-**Rozhodnutí: ŽÁDNÉ AI v hot path (real-time rozhodování)**
+### Krok 1: Přidat `LiveMatchState` tracking do `EsportsMonitor`
 
-Důvod:
+Nový struct `LiveMatchState` + `HashMap<String, LiveMatchState>` v monitoru.
+State enum: `Live { first_seen, teams, sport }` → `JustFinished { winner }` → `Evaluated`
 
-- Latence AI API (OpenRouter) = 200–2000ms → zabije in-play okno (15–60s)
-- Cost: 100 trades/den × API call = $5–20/den zbytečně
-- In-play lag arb NEPOTŘEBUJE AI — edge je matematický fakt (cena - fair value)
+### Krok 2: Implementovat `poll_live_lol()`
 
-## AI použití MIMO hot path (offline analytika)
+Nejsnazší — čistý JSON API. Volat `getSchedule`, filtrovat `inProgress` a `completed` eventy. Porovnat s předchozím stavem.
 
-- Denní report: shrnutí P&L, nejlepší sporty/ligy
-- Kalibrace keyword tabulky pro Polymarket
-- Detekce anomálií v historických datech (jednou za týden)
-- Cost: $0.10–0.50/den
+### Krok 3: Implementovat `poll_live_valorant()`
 
-## Spektrum sportů a trhů
+Scrapnout `vlr.gg/matches` (ne /results). Parsovat live zápasy. Detekovat transition.
 
-### Betfair Exchange — denní pokrytí
+### Krok 4: Implementovat `poll_live_cs2()` a `poll_live_dota2()`
 
-```
-Sport              Trhy/den    In-play okno    Priorita
-─────────────────────────────────────────────────────
-Fotbal (global)    200–400     15–90s po gólu  ★★★★★
-Basketball NBA     30–50       5–15s po koši   ★★★★☆
-Tenis ATP/WTA      50–100      5–20s po setu   ★★★★☆
-Hockey NHL/Ekl     20–40       10–30s po gólu  ★★★★☆
-Baseball MLB       15–30       pomalejší       ★★★☆☆
-Formule 1          5–15        jiný typ edge   ★★★☆☆
-```
+GosuGamers `/matches` stránka pro oba.
 
-### Malé ligy (Typ 3 edge) — méně botů
+### Krok 5: Nový `poll_live_all()` v monitoru
 
-```
-Fortuna liga (CZ)     3–4 zápasy/kolo
-Tipsliga (SK)         3–4 zápasy/kolo
-Extraliga hokej (CZ)  4–6 zápasů/den v sezóně
-Erste liga (CZ)       menší coverage
-Nižší fotbal EU       stovky zápasů/den
-```
+Agreguje všechny live polly. Vrací jen NOVĚ dokončené zápasy.
+
+### Krok 6: Upravit `main.rs`
+
+Primární loop volá `poll_live_all()`. Stávající `poll_all()` (results scraping) běží jen jako audit/fallback jednou za 5 minut.
+
+### Krok 7: Cleanup `seen_matches`
+
+Periodicky čistit (max 500 entries, FIFO) aby nerostla paměť.
 
 ---
 
-## Kde teď jsme
+## Kde je kód
 
-- Přešli jsme z Liquipedia API na ultrarychlý HTML scraping via **VLR.gg** a **GosuGamers** plus neoficiální **LoL Esports API**.
-- Opuštění Polymarketu a úspěšný masivní pivot na **SX.bet** s rychlostí cache hitu 16µs.
-- Implementována real-time **Telegram Notifikace** při nalezení garantovaného edge pro `live-observer`.
-- Kód je vybaven `fd-lock`, který chrání server proti vícenásobnému spuštění observeru.
+- `crates/esports_monitor/src/lib.rs` — scraping + live state tracking
+- `crates/arb_detector/src/lib.rs` — SX Bet cache + edge detection
+- `crates/logger/src/lib.rs` — event types
+- `src/main.rs` — main loop
 
-## Kde je kód?
+## Stará architektura (pro referenci)
 
-V tuto chvíli monitoruje CS2, LoL a Valorant. Hlavní scrapovací logika je uložená v `crates/esports_monitor` a výpočet hrany nad Web3 trhem SX Bet probíhá v `crates/arb_detector`.
+### TYP 1: SX Bet Oracle Lag (PRIMARY)
+```
+Scraper detekuje konec zápasu → SX Bet contract stále přijímá sázky (oracle lag 10-25 min)
+→ Edge = 1.0 - best_available_prob (protože výsledek je 100% jistý)
+```
+
+### TYP 2-3: Cross-exchange arb, Small league mispricing
+Zatím neimplementováno. `price_monitor` crate je dead code.

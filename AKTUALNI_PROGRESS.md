@@ -1,105 +1,71 @@
-# AKTUALNI_PROGRESS — handoff pro Gemini
+# AKTUALNI_PROGRESS — handoff pro Sonneta
 
-Aktualizováno: 2026-02-22
+Aktualizováno: 2026-02-23
 Repo: RustMiskoLive (`C:\RustMiskoLive`)
 
-## Co bylo skutečně dokončeno
+## 🚀 STAV: LIVE SCORING IMPLEMENTOVÁNO
 
-1. **PHASE 1 logging-only je nasazená v kódu**
-   - `live-observer` běží v observe režimu (bez order execution).
-   - Přidány nové JSONL eventy:
-     - `API_STATUS` (stav zdroje/sportu)
-     - `SYSTEM_HEARTBEAT` (souhrn poll cyklu)
-   - Runtime tunables přes `.env`:
-     - `POLL_INTERVAL_SECS`
-     - `MIN_ROI_PCT`
+### Co se změnilo (2026-02-23)
 
-2. **Code changes (realně aplikováno)**
-   - `crates/logger/src/lib.rs`
-     - nové event struktury `ApiStatusEvent`, `SystemHeartbeatEvent`
-   - `crates/price_monitor/src/lib.rs`
-     - poll vrací health summary
-     - per-source API status logging
-     - heartbeat po každém cyklu
-     - `MIN_ROI_PCT` filtr pro odds-api signály
-   - `src/main.rs`
-     - načítá `POLL_INTERVAL_SECS`, `MIN_ROI_PCT`
-   - `.env.example`
-     - přidány nové konfig položky
-   - `crates/arb_detector/src/lib.rs`
-     - cleanup unused variable warning
+**Kritický fix: systém přepnut z mrtvých výsledků na LIVE sledování.**
 
-3. **Dokumentace byla synchronizována**
-   - `PLAN.md` — status změněn na PHASE 1 logging-only nasazeno
-   - `DECISIONS.md` — rozhodnutí o startu logging-only deploymentu
-   - `CONTEXT.md` — aktualizovaný aktuální stav + next steps
+1. **LIVE State Machine v `esports_monitor`**
+   - Nová metoda `poll_live_all()` jako PRIMÁRNÍ zdroj dat (každých 15s):
+     - **LoL**: `getSchedule` API → sleduje `state: "inProgress"` → `"completed"` přechod
+     - **Valorant**: `vlr.gg/matches` → CSS selektor `a.match-item.mod-live` (ověřeno browser inspekcí)
+     - **CS2 + Dota 2**: `gosugamers.net/counterstrike/matches` a `dota2/matches` → SSR HTML parsování, detekce "Live" badge v `textContent`
+   - In-memory `HashMap<String, LiveMatch>` drží aktuálně live zápasy
+   - Detekce přechodu: zápas zmizí z live sekce → emituje `MATCH_RESOLVED` → okamžitě checkuje SX Bet
 
-4. **Runtime ověření proběhlo**
-   - vznikl log soubor `logs/2026-02-22.jsonl`
-   - log obsahuje validní nové eventy (`API_STATUS`, `SYSTEM_HEARTBEAT`)
+2. **GosuGamers scraper kompletně přepsán**
+   - Starý kód: selektory `.match-list-item`, `.team-name`, `.score` → NA WEBU NEEXISTUJÍ (GosuGamers běží na Material UI)
+   - Starý URL: `/counter-strike/matches` → VRACÍ 404!
+   - Nový kód: parsuje `<a href="/tournaments/.../matches/ID-team1-vs-team2">` elementy
+   - Team names se extrahují z URL slugu (spolehlivější než text parsing)
+   - Skóre se parsuje regexem `(\d+)\s*:\s*(\d+)` z textu
 
-## Co teď nefunguje / není hotové (pravdivě)
+3. **`main.rs` — Dual-mode loop**
+   - PRIMÁRNÍ: `monitor.poll_live_all()` každých 15s → live→finished detekce
+   - FALLBACK: `monitor.poll_all()` jednou za 5 min (20 cyklů) → audit/catch-up
 
-1. **Trading/execution není implementován**
-   - stále čistě logging-only
-   - A+/A/B klasifikace signálů zatím není v kódu
+4. **Deduplikace** — `HashSet` v `seen_matches` zabraňuje opakovanému zpracování
 
-2. **Čas od času byl lock na `live-observer.exe` při rebuildu**
-   - potřeba hlídat běžící proces před novým `cargo run`
+5. **Visibility logging** — SX Bet lookup miss viditelný na `info!` úrovni
 
-3. **Chybí Live-Scoring mechanismus (P1 PRIORITA - Handoff)**
-   - Stále scrapujeme výsledkové stránky (`/results`) místo real-time eventů. Než se výsledek propíše na results stránku, okno pro arbitráž na SX Bet vyprší.
-   - Odstranili jsme "amnézii" bota přidáním _deduplikace_ (`HashSet`) pro `esports_monitor` scrapery. Logy už nebudou spamovat stejné zápasy každých 15 sekund, a naopak se vypíše hláška o tom že se nenašel zápas na SX Bet.
-   - Následující krok pro _Sonneta_ je přeprogramovat scrapy uvnitř `crates/esports_monitor/src/lib.rs` (či přidat nové `poll_live`) na Websockety nebo Live-Score REST polling (volitelně HLTV atd.), které chytnou změnu skóre a vítěze _v milisekundě_ konce zápasu.
+### Co systém REÁLNĚ dělá teď
 
-## Co se postavilo a je HOTOVO (Fáze Pivot)
+```
+Live poll cycle:
+  1. Stáhne live match stránky (LoL API, vlr.gg, GosuGamers)
+  2. Porovná s pamětí: nový live? → zapamatuj. Zmizel live? → FINISHED!
+  3. Pro FINISHED zápasy: dohledá vítěze na results stránce
+  4. Okamžitě checkne SX Bet cache (16µs lookup)
+  5. Pokud SX Bet market existuje → query orderbook → edge evaluation
+  6. Edge >3% → Telegram alert + JSONL log
+```
 
-### Priorita 1 — Web3 Sázkovka a Scrapery (Nasazeno)
+### Proč to bude fungovat
 
-- Opuštěn Polymarket. Zaveden masivní pivot na **SX.bet** s AMM kontrakty. SX Bet Oracle lag představuje 10-25 minut vysoce výnosného okna po konci zápasu.
-- Implementována neuvěřitelně rychlá "Background Sync" cache (`RwLock`), která na pozadí stahuje a neustále mapuje všech ~60 aktivních SX Bet esportových lig rychlostí 16µs.
-- Přidána robustní rodina scraperů (`crates/esports_monitor`) postavená na přesném parsování HTML a neoficiálních API:
-  - **League of Legends** (`lolesports`)
-  - **Valorant** (`vlr.gg`)
-  - **Counter-Strike 2** (`gosugamers.net`)
-  - **Dota 2** (`gosugamers.net` - na žádost uživatele pro maximalizaci volume)
+- SX Bet oracle lag: **10-25 minut** po konci zápasu
+- Náš detection delay: **1-5 minut** (HTML refresh interval)
+- **Zbývající okno: 5-20 minut** na sázku na známého vítěze
 
-### Priorita 2 — Telegram Alerting (Nasazeno)
+### Co stále NENÍ hotové (pravdivě)
 
-- Jakmile `ArbDetector` najde v `live-observer` pro profitabilní SX Bet match tzv. _Edge_, odesílá okamžitě Telegram alert přímo do mobilu uživatele.
-- Notifikační request těží z `tokio::spawn`, a tím pádem absolutně neblokuje a nezpomaluje výkon hlavní smyčky kalkulací.
+1. **Trading/execution** — stále `observe_only = true`
+2. **Signal klasifikace** (A+/A/B/REJECT) — zatím neimplementováno
+3. **Oracle lag měření** — nemáme data o tom jak rychle SX Bet reálně settleuje
+4. **PandaScore/websocket** — free zdroje stačí pro MVP, ale placené API by zkrátily delay na <30s
 
-## Na co se nyní čeká
+### Jak reprodukovat
 
-- Observační nasazení. Nyní nechat 24-48h běžet `cargo run --bin live-observer` a sbírat Telegram Notifikace k ověření Live Edge logiky na vlastních očích.
+```bash
+cp .env.example .env
+# Nastav ESPORTS_POLL_INTERVAL_SECS=15
+cargo run --bin live-observer
+# Sleduj terminál pro 🔴 LIVE a ✅ MATCH FINISHED hlášky
+```
 
-### Priorita 2 — paper signal intelligence
-
-- Přidat klasifikaci `A_PLUS | A | B | REJECT` přímo do logu podle:
-  - confidence,
-  - liquidity,
-  - spread,
-  - stale timing,
-  - source quorum.
-- Přidat denní agregaci kvality signálů (precision proxy, conversion to resolved outcomes).
-
-### Priorita 3 — process safety
-
-- Přidat guard proti současnému běhu více instancí observeru.
-- Přidat explicitní `STARTUP_EVENT` a `SHUTDOWN_EVENT` do JSONL.
-
-## Jak reprodukovat současný stav
-
-1. `cp .env.example .env` (nebo ručně vyplnit)
-2. minimálně nastavit:
-   - `POLL_INTERVAL_SECS=60`
-   - `MIN_ROI_PCT=1.0`
-   - ideálně `ODDSAPI_KEY=...`
-3. spustit:
-   - `cargo run --bin live-observer`
-4. kontrola:
-   - `logs/YYYY-MM-DD.jsonl` obsahuje heartbeat/status eventy
-
-## Poznámka k pravdivosti
+### Poznámka k pravdivosti
 
 Tento soubor je záměrně bez optimism bias: popisuje přesně to, co je v repu a co bylo runtime ověřeno, včetně limitů.

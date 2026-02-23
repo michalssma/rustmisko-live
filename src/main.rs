@@ -1,15 +1,14 @@
-/// RustMiskoLive — Live Odds Observer (48h observe only)
+/// RustMiskoLive — Live Odds Observer
 ///
 /// Co dělá:
-///   1. Každých 60s stahuje Pinnacle lines (sharp benchmark)
-///   2. Každých 60s dotazuje odds-api.io /arbitrage-bets
-///   3. Loguje vše do logs/YYYY-MM-DD.jsonl
-///   4. NTFY alert při edge >3%
+///   1. Každých 15s polluje LIVE zápasy ze 4 zdrojů (LoL, Valorant, CS2, Dota2)
+///   2. Detekuje přechod LIVE → FINISHED (state machine)
+///   3. Okamžitě checkuje SX Bet orderbook pro oracle lag arbitráž
+///   4. Telegram alert při edge >3%
 ///
 /// Co NEDĚLÁ: žádné ordery (observe_only = true)
 ///
-/// Před spuštěním:
-///   cp .env.example .env
+/// Spuštění:
 ///   cargo run --bin live-observer
 
 use anyhow::Result;
@@ -33,12 +32,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    info!("=== RustMiskoLive Observer — Esports Phase ===");
+    info!("=== RustMiskoLive Observer — LIVE SCORING ACTIVE ===");
     info!("Mode: OBSERVE ONLY (no trades)");
-    info!("Logging: Liquipedia/HTML resolved matches");
+    info!("Strategy: Live match state machine → SX Bet oracle lag detection");
     info!("Logs: ./logs/");
 
-    // 1. Single instance lock (Process Safety)
+    // Single instance lock
     let lock_file_path = env::temp_dir().join("rustmiskolive_esports.lock");
     let lock_file = match File::create(&lock_file_path) {
         Ok(f) => f,
@@ -60,30 +59,45 @@ async fn main() -> Result<()> {
         }
     };
 
-    // 2. Načtení env
     let poll_interval_secs = env::var("ESPORTS_POLL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(15);
 
-    info!("Poll interval: {}s", poll_interval_secs);
+    info!("Live poll interval: {}s", poll_interval_secs);
 
     let monitor = EsportsMonitor::new("logs", poll_interval_secs);
-    let arb = ArbDetector::new("logs", true); // Observe only mode pro logovani.
+    let arb = ArbDetector::new("logs", true);
 
-    info!("Starting poll loop ({}s interval)...", poll_interval_secs);
-
-    info!("⏳ SYSTEM WARMUP: Waiting 15 seconds to let the background thread map all SX Bet markets...");
+    info!("⏳ WARMUP: Čekám 15s aby SX Bet cache background thread zmapoval trhy...");
     sleep(Duration::from_secs(15)).await;
     arb.debug_print_cache().await;
-    info!("🚀 WARMUP COMPLETE: Starting to cross-reference scraped matches against the cache.");
+    info!("🚀 READY: Spouštím live scoring loop.");
+
+    let mut fallback_counter: u32 = 0;
 
     loop {
-        info!("--- Poll cycle ---");
-        let matches = monitor.poll_all().await;
-        for m in matches {
+        info!("--- Live poll cycle ---");
+
+        // PRIMÁRNÍ: live match tracking → detekuje právě dokončené zápasy
+        let live_finished = monitor.poll_live_all().await;
+        for m in &live_finished {
             if let Err(e) = arb.evaluate_esports_match(&m.home, &m.away, &m.sport, &m.winner).await {
-                warn!("Glimpse edge checking failed for {}: {}", m.match_name, e);
+                warn!("SX Bet eval failed pro {}: {}", m.match_name, e);
+            }
+        }
+
+        // FALLBACK: results scraping jednou za ~5 minut (audit)
+        // Chytá zápasy co mohly proběhnout bez live detekce (restart bota atd.)
+        fallback_counter += 1;
+        if fallback_counter >= 20 {  // 20 × 15s = 5 minut
+            fallback_counter = 0;
+            info!("--- Fallback results audit ---");
+            let fallback = monitor.poll_all().await;
+            for m in fallback {
+                if let Err(e) = arb.evaluate_esports_match(&m.home, &m.away, &m.sport, &m.winner).await {
+                    warn!("Fallback SX Bet eval failed pro {}: {}", m.match_name, e);
+                }
             }
         }
 
