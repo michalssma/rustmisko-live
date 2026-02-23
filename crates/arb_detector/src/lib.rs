@@ -227,7 +227,7 @@ impl ArbDetector {
         }.unwrap_or((String::new(), String::new()));
         
         if market_hash.is_empty() {
-            tracing::debug!("No cached SX Bet market found for {} vs {} (key: {})", home, away, key);
+            info!("No cached SX Bet market found for {} vs {} (key: {})", home, away, key);
             return Ok(());
         }
 

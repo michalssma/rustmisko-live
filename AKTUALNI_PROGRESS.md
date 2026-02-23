@@ -47,6 +47,11 @@ Repo: RustMiskoLive (`C:\RustMiskoLive`)
 2. **Čas od času byl lock na `live-observer.exe` při rebuildu**
    - potřeba hlídat běžící proces před novým `cargo run`
 
+3. **Chybí Live-Scoring mechanismus (P1 PRIORITA - Handoff)**
+   - Stále scrapujeme výsledkové stránky (`/results`) místo real-time eventů. Než se výsledek propíše na results stránku, okno pro arbitráž na SX Bet vyprší.
+   - Odstranili jsme "amnézii" bota přidáním _deduplikace_ (`HashSet`) pro `esports_monitor` scrapery. Logy už nebudou spamovat stejné zápasy každých 15 sekund, a naopak se vypíše hláška o tom že se nenašel zápas na SX Bet.
+   - Následující krok pro _Sonneta_ je přeprogramovat scrapy uvnitř `crates/esports_monitor/src/lib.rs` (či přidat nové `poll_live`) na Websockety nebo Live-Score REST polling (volitelně HLTV atd.), které chytnou změnu skóre a vítěze _v milisekundě_ konce zápasu.
+
 ## Co se postavilo a je HOTOVO (Fáze Pivot)
 
 ### Priorita 1 — Web3 Sázkovka a Scrapery (Nasazeno)

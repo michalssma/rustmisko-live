@@ -12,13 +12,15 @@ use logger::{ApiStatusEvent, EventLogger, MatchResolvedEvent, SystemHeartbeatEve
 use regex::Regex;
 use scraper::{Html, Selector};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 pub struct EsportsMonitor {
     client: reqwest::Client,
     logger: EventLogger,
     poll_interval_secs: u64,
+    seen_matches: Mutex<HashSet<String>>,
 }
 
 impl EsportsMonitor {
@@ -32,6 +34,7 @@ impl EsportsMonitor {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             logger: EventLogger::new(log_dir),
             poll_interval_secs,
+            seen_matches: Mutex::new(HashSet::new()),
         }
     }
 
@@ -239,6 +242,14 @@ impl EsportsMonitor {
     }
 
     fn log_resolved(&self, sport: &str, m_id: &str, t1: &str, t2: &str, winner: &str) -> Option<MatchResolvedEvent> {
+        let unique_key = format!("{}_{}", sport, m_id);
+        {
+            let mut seen = self.seen_matches.lock().unwrap();
+            if !seen.insert(unique_key) {
+                return None; // Already logged and processed
+            }
+        }
+
         let ev = MatchResolvedEvent {
             ts: now_iso(),
             event: "MATCH_RESOLVED",
