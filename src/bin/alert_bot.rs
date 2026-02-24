@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::time::Duration;
 use tracing::{info, warn, error};
@@ -69,6 +69,25 @@ struct StateResponse {
     odds_items: usize,
     fused_ready: usize,
     odds: Vec<StateOddsItem>,
+    #[serde(default)]
+    live: Vec<LiveItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LiveItem {
+    match_key: String,
+    #[allow(dead_code)]
+    source: String,
+    payload: LivePayload,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LivePayload {
+    team1: String,
+    team2: String,
+    score1: i32,
+    score2: i32,
+    status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,9 +207,76 @@ struct OddsAnomaly {
     value_side: u8,
     /// How much higher Azuro odds are vs market (%)
     discrepancy_pct: f64,
+    /// Confidence: HIGH / MEDIUM / LOW
+    confidence: &'static str,
+    /// Reasons for confidence level
+    confidence_reasons: Vec<String>,
+    /// Was team order swapped for comparison?
+    teams_swapped: bool,
+    /// Is the match currently live?
+    is_live: bool,
+    /// Live score if available
+    live_score: Option<String>,
+}
+
+/// Normalize team name for comparison: lowercase, strip whitespace, remove common suffixes
+fn norm_team(name: &str) -> String {
+    name.to_lowercase()
+        .replace(" esports", "")
+        .replace(" gaming", "")
+        .replace(" cs go", "")
+        .replace(" cs2", "")
+        .replace(" (w)", "")
+        .replace("(w)", "")
+        .trim()
+        .to_string()
+}
+
+/// Check if two team names likely refer to the same team
+fn teams_match(a: &str, b: &str) -> bool {
+    let na = norm_team(a);
+    let nb = norm_team(b);
+    if na == nb { return true; }
+    // One contains the other (e.g. "MIBR" vs "MIBR Academy")
+    if na.contains(&nb) || nb.contains(&na) { return true; }
+    // Levenshtein-like: if short and differ by 1-2 chars, might be typo
+    if na.len() >= 3 && nb.len() >= 3 {
+        let shorter = na.len().min(nb.len());
+        let common = na.chars().zip(nb.chars()).filter(|(a, b)| a == b).count();
+        if common as f64 / shorter as f64 > 0.75 { return true; }
+    }
+    false
+}
+
+/// Detect if odds from two sources have team1/team2 swapped
+/// Returns (market_w1_aligned, market_w2_aligned, is_swapped)
+fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool) {
+    let a1 = norm_team(&azuro.team1);
+    let a2 = norm_team(&azuro.team2);
+    let m1 = norm_team(&market.team1);
+    let m2 = norm_team(&market.team2);
+
+    // Normal order: azuro.t1 ↔ market.t1
+    let normal_score = (if teams_match(&a1, &m1) { 1 } else { 0 })
+                     + (if teams_match(&a2, &m2) { 1 } else { 0 });
+    // Swapped: azuro.t1 ↔ market.t2
+    let swap_score = (if teams_match(&a1, &m2) { 1 } else { 0 })
+                   + (if teams_match(&a2, &m1) { 1 } else { 0 });
+
+    if swap_score > normal_score {
+        // Teams are swapped — flip market odds
+        (market.odds_team2, market.odds_team1, true)
+    } else {
+        (market.odds_team1, market.odds_team2, false)
+    }
 }
 
 fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
+    // Build set of currently live match_keys
+    let live_keys: std::collections::HashMap<String, &LiveItem> = state.live.iter()
+        .map(|l| (l.match_key.clone(), l))
+        .collect();
+
     // Group odds by match_key
     let mut by_match: std::collections::HashMap<String, Vec<&StateOddsItem>> = std::collections::HashMap::new();
     for item in &state.odds {
@@ -200,29 +286,110 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
     let mut anomalies = Vec::new();
 
     for (match_key, items) in &by_match {
-        // Find Azuro odds and market odds
         let azuro_items: Vec<&&StateOddsItem> = items.iter().filter(|i| i.payload.bookmaker.starts_with("azuro_")).collect();
-        let market_items: Vec<&&StateOddsItem> = items.iter().filter(|i| !i.payload.bookmaker.starts_with("azuro_")).collect();
+        let market_items: Vec<&&StateOddsItem> = items.iter().filter(|i| !i.payload.bookmaker.starts_with("azuro_") && i.payload.bookmaker != "hltv-featured").collect();
 
         if azuro_items.is_empty() || market_items.is_empty() {
-            continue; // Need both sides to compare
+            continue;
         }
 
-        // Use first Azuro source and average market odds
         let azuro = &azuro_items[0].payload;
-        
-        // Average market odds across all non-azuro bookmakers
-        let avg_w1: f64 = market_items.iter().map(|i| i.payload.odds_team1).sum::<f64>() / market_items.len() as f64;
-        let avg_w2: f64 = market_items.iter().map(|i| i.payload.odds_team2).sum::<f64>() / market_items.len() as f64;
+        let is_live = live_keys.contains_key(match_key.as_str());
+        let live_score = live_keys.get(match_key.as_str()).map(|l| {
+            format!("{}-{}", l.payload.score1, l.payload.score2)
+        });
+
+        // For each market source, align teams and compute discrepancy
+        let mut total_m_w1 = 0.0_f64;
+        let mut total_m_w2 = 0.0_f64;
+        let mut any_swapped = false;
+        let mut market_count = 0;
+
+        for mi in &market_items {
+            let (mw1, mw2, swapped) = align_teams(azuro, &mi.payload);
+            total_m_w1 += mw1;
+            total_m_w2 += mw2;
+            if swapped { any_swapped = true; }
+            market_count += 1;
+        }
+
+        let avg_w1 = total_m_w1 / market_count as f64;
+        let avg_w2 = total_m_w2 / market_count as f64;
 
         let market_bookie = market_items.iter().map(|i| i.payload.bookmaker.as_str()).collect::<Vec<_>>().join("+");
 
-        // Check discrepancy: Azuro odds vs market
-        // If Azuro offers HIGHER odds than market → potential value on Azuro
         let disc_w1 = (azuro.odds_team1 / avg_w1 - 1.0) * 100.0;
         let disc_w2 = (azuro.odds_team2 / avg_w2 - 1.0) * 100.0;
 
-        // Report the bigger discrepancy (both directions matter)
+        // === Confidence scoring ===
+        let mut reasons: Vec<String> = Vec::new();
+        let mut penalty = 0;
+
+        // PENALTY: match is live but Azuro is prematch-only
+        if is_live {
+            reasons.push("LIVE zápas — Azuro odds mohou být prematch (stale!)".into());
+            penalty += 3;
+        }
+
+        // PENALTY: teams were swapped
+        if any_swapped {
+            reasons.push(format!("Team order PROHOZENÝ (azuro: {} vs {}, trh: {} vs {})",
+                azuro.team1, azuro.team2,
+                market_items[0].payload.team1, market_items[0].payload.team2));
+            penalty += 1;
+        }
+
+        // PENALTY: extreme odds (likely near-resolved match)
+        let max_odds = azuro.odds_team1.max(azuro.odds_team2);
+        if max_odds > 8.0 {
+            reasons.push(format!("Extrémní odds ({:.2}) — pravděpodobně rozhodnutý zápas", max_odds));
+            penalty += 2;
+        }
+
+        // PENALTY: very high discrepancy is suspicious
+        let max_disc = disc_w1.max(disc_w2);
+        if max_disc > 40.0 {
+            reasons.push(format!("{:.0}% discrepancy je podezřele vysoká — stale data?", max_disc));
+            penalty += 2;
+        }
+
+        // CRITICAL: Favorite/underdog FLIP detection
+        // If Azuro says team1 is favorite (w1 < w2) but market says team1 is underdog (w1 > w2)
+        // → odds_team1/odds_team2 are probably SWAPPED in one source → FALSE signal!
+        let azuro_fav1 = azuro.odds_team1 < azuro.odds_team2; // Azuro thinks team1 is favorite
+        let market_fav1 = avg_w1 < avg_w2; // Market thinks team1 is favorite
+        if azuro_fav1 != market_fav1 {
+            reasons.push("⚠️ FAVORIT PROHOZENÝ: Azuro a trh se neshodují kdo je favorit!".into());
+            penalty += 4; // Very strong signal this is data error
+        }
+
+        // BONUS: multiple market sources agree
+        if market_count >= 2 {
+            reasons.push(format!("{} market zdrojů se shoduje", market_count));
+            penalty -= 1;
+        }
+
+        // BONUS: Azuro odds are reasonable (1.2 - 5.0 range)
+        if azuro.odds_team1 > 1.15 && azuro.odds_team1 < 5.0 && azuro.odds_team2 > 1.15 && azuro.odds_team2 < 5.0 {
+            reasons.push("Azuro odds v normálním rozsahu".into());
+        } else {
+            penalty += 1;
+        }
+
+        let confidence = if penalty <= 0 {
+            "HIGH"
+        } else if penalty <= 2 {
+            "MEDIUM"
+        } else {
+            "LOW"
+        };
+
+        // === Only alert HIGH and MEDIUM confidence ===
+        // LOW = skip entirely (stale data, live mismatch, etc.)
+        if confidence == "LOW" {
+            continue;
+        }
+
         if disc_w1 > MIN_EDGE_PCT {
             anomalies.push(OddsAnomaly {
                 match_key: match_key.clone(),
@@ -237,6 +404,11 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                 market_bookmaker: market_bookie.clone(),
                 value_side: 1,
                 discrepancy_pct: disc_w1,
+                confidence,
+                confidence_reasons: reasons.clone(),
+                teams_swapped: any_swapped,
+                is_live,
+                live_score: live_score.clone(),
             });
         }
         if disc_w2 > MIN_EDGE_PCT {
@@ -253,12 +425,25 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                 market_bookmaker: market_bookie,
                 value_side: 2,
                 discrepancy_pct: disc_w2,
+                confidence,
+                confidence_reasons: reasons.clone(),
+                teams_swapped: any_swapped,
+                is_live,
+                live_score: live_score.clone(),
             });
         }
     }
 
-    // Sort by discrepancy desc
-    anomalies.sort_by(|a, b| b.discrepancy_pct.partial_cmp(&a.discrepancy_pct).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort: HIGH first, then by discrepancy desc
+    anomalies.sort_by(|a, b| {
+        let conf_ord = match (a.confidence, b.confidence) {
+            ("HIGH", "HIGH") | ("MEDIUM", "MEDIUM") => std::cmp::Ordering::Equal,
+            ("HIGH", _) => std::cmp::Ordering::Less,
+            (_, "HIGH") => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal,
+        };
+        conf_ord.then_with(|| b.discrepancy_pct.partial_cmp(&a.discrepancy_pct).unwrap_or(std::cmp::Ordering::Equal))
+    });
     anomalies
 }
 
@@ -266,15 +451,39 @@ fn format_anomaly_alert(a: &OddsAnomaly) -> String {
     let value_team = if a.value_side == 1 { &a.team1 } else { &a.team2 };
     let azuro_odds = if a.value_side == 1 { a.azuro_w1 } else { a.azuro_w2 };
     let market_odds = if a.value_side == 1 { a.market_w1 } else { a.market_w2 };
-    
+
+    let conf_emoji = match a.confidence {
+        "HIGH" => "🟢",
+        "MEDIUM" => "🟡",
+        _ => "🔴",
+    };
+
     let url_line = a.azuro_url.as_ref()
         .map(|u| format!("\n🔗 <a href=\"{}\">Azuro link</a>", u))
         .unwrap_or_default();
 
+    let swap_warn = if a.teams_swapped {
+        "\n⚠️ Týmy PROHOZENÉ mezi zdroji (opraveno)"
+    } else {
+        ""
+    };
+
+    let live_line = if a.is_live {
+        format!("\n🔴 LIVE: {}", a.live_score.as_deref().unwrap_or("probíhá"))
+    } else {
+        "\n⏳ Prematch".to_string()
+    };
+
+    let reasons_text = if a.confidence_reasons.is_empty() {
+        String::new()
+    } else {
+        format!("\n📋 {}", a.confidence_reasons.join(" | "))
+    };
+
     format!(
-        "🎯 <b>ODDS ANOMALY</b>\n\
+        "{} <b>ODDS ANOMALY</b> [{}]\n\
          \n\
-         <b>{}</b> vs <b>{}</b>\n\
+         <b>{}</b> vs <b>{}</b>{}{}\n\
          \n\
          📊 Azuro ({}):\n\
          {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
@@ -283,19 +492,20 @@ fn format_anomaly_alert(a: &OddsAnomaly) -> String {
          {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
          \n\
          ⚡ <b>{}</b> na Azuru o <b>{:.1}%</b> VYŠŠÍ než trh\n\
-         Azuro: {:.2} vs Trh: {:.2}\n\
+         Azuro: {:.2} vs Trh: {:.2}{}{}\n\
          \n\
-         💡 Suggestion: BET <b>{}</b> @ <b>{:.2}</b>{}\n\
+         💡 Suggestion: BET <b>{}</b> @ <b>{:.2}</b>\n\
          \n\
          Reply: <code>YES $5</code> / <code>NO</code> / <code>SKIP</code>",
-        a.team1, a.team2,
+        conf_emoji, a.confidence,
+        a.team1, a.team2, live_line, swap_warn,
         a.azuro_bookmaker,
         a.team1, a.azuro_w1, a.team2, a.azuro_w2,
         a.market_bookmaker,
         a.team1, a.market_w1, a.team2, a.market_w2,
         value_team, a.discrepancy_pct,
-        azuro_odds, market_odds,
-        value_team, azuro_odds, url_line
+        azuro_odds, market_odds, reasons_text, url_line,
+        value_team, azuro_odds
     )
 }
 
@@ -429,6 +639,7 @@ async fn main() -> Result<()> {
                         match resp.json::<StateResponse>().await {
                             Ok(state) => {
                                 let anomalies = find_odds_anomalies(&state);
+                                let mut actually_sent = 0;
                                 for anomaly in &anomalies {
                                     let alert_key = format!("{}:{}:{}", anomaly.match_key, anomaly.value_side, anomaly.azuro_bookmaker);
                                     if already_alerted.contains(&alert_key) {
@@ -439,7 +650,9 @@ async fn main() -> Result<()> {
                                     if let Err(e) = tg_send_message(&client, &token, chat_id, &msg).await {
                                         error!("Failed to send alert: {}", e);
                                     } else {
-                                        info!("Alert sent: {} side={} disc={:.1}%", anomaly.match_key, anomaly.value_side, anomaly.discrepancy_pct);
+                                        info!("Alert sent: {} side={} disc={:.1}% conf={}", 
+                                            anomaly.match_key, anomaly.value_side, anomaly.discrepancy_pct, anomaly.confidence);
+                                        actually_sent += 1;
                                         sent_alerts.push(SentAlert {
                                             match_key: alert_key,
                                             sent_at: Utc::now(),
@@ -447,18 +660,8 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                if anomalies.is_empty() {
-                                    info!("Poll: {} odds items, 0 anomalies >{}%", state.odds_items, MIN_EDGE_PCT);
-                                } else {
-                                    info!("Poll: {} anomalies found, {} sent", anomalies.len(), 
-                                        anomalies.len().saturating_sub(
-                                            anomalies.iter().filter(|a| {
-                                                let k = format!("{}:{}:{}", a.match_key, a.value_side, a.azuro_bookmaker);
-                                                already_alerted.contains(&k)
-                                            }).count()
-                                        )
-                                    );
-                                }
+                                info!("Poll: {} anomalies found, {} sent (cooldown={})", 
+                                    anomalies.len(), actually_sent, sent_alerts.len());
                             }
                             Err(e) => warn!("Failed to parse /state: {}", e),
                         }
