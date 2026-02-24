@@ -1,7 +1,8 @@
-//! feed-hub — WS ingest pro headful browser/Android feeds
+//! feed-hub — WS ingest pro headful browser/Android feeds + Azuro GraphQL poller
 //!
 //! Cíl: přijímat realtime JSON z Lenovo (Tampermonkey) / Zebra (Android) a v Rustu
-//! udržovat „co je LIVE“ + „kde jsou LIVE odds“, s gatingem a audit logy.
+//! udržovat „co je LIVE" + „kde jsou LIVE odds", s gatingem a audit logy.
+//! Navíc: periodicky polluje Azuro Protocol (The Graph) pro CS2 on-chain odds.
 //!
 //! Spuštění:
 //!   $env:FEED_HUB_BIND="0.0.0.0:8080"; cargo run --bin feed-hub
@@ -28,6 +29,7 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 
 mod feed_db;
+mod azuro_poller;
 use feed_db::{
     spawn_db_writer,
     DbConfig,
@@ -135,10 +137,17 @@ struct FeedHeartbeatEvent {
     fused_ready: usize,
 }
 
+/// Key for multi-bookmaker odds: match_key + bookmaker
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct OddsKey {
+    match_key: String,
+    bookmaker: String,
+}
+
 #[derive(Clone)]
 struct FeedHubState {
     live: Arc<RwLock<HashMap<String, LiveMatchState>>>,
-    odds: Arc<RwLock<HashMap<String, OddsState>>>,
+    odds: Arc<RwLock<HashMap<OddsKey, OddsState>>>,
     connections: Arc<RwLock<usize>>,
 }
 
@@ -163,12 +172,11 @@ fn normalize_name(name: &str) -> String {
 }
 
 fn match_key(sport: &str, team1: &str, team2: &str) -> String {
-    format!(
-        "{}::{}_vs_{}",
-        sport.to_lowercase(),
-        normalize_name(team1),
-        normalize_name(team2)
-    )
+    let a = normalize_name(team1);
+    let b = normalize_name(team2);
+    // Sort alphabetically so team order doesn't matter for matching
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    format!("{}::{}_vs_{}", sport.to_lowercase(), first, second)
 }
 
 fn parse_ts(ts: &Option<String>) -> DateTime<Utc> {
@@ -226,6 +234,249 @@ struct HttpStateResponse {
     odds: Vec<HttpOddsItem>,
 }
 
+// ====================================================================
+// OPPORTUNITIES — value/arb detection
+// ====================================================================
+
+#[derive(Debug, Clone, Serialize)]
+struct Opportunity {
+    match_key: String,
+    /// "value_bet" | "score_momentum" | "arb_cross_book"
+    opp_type: String,
+    team1: String,
+    team2: String,
+    score: String,
+    /// Which team has value: 1 or 2
+    value_side: u8,
+    /// Description of the signal
+    signal: String,
+    /// Confidence 0.0..1.0
+    confidence: f64,
+    /// The odds that represent value
+    odds: f64,
+    /// Implied probability from odds
+    implied_prob_pct: f64,
+    /// Our estimated fair probability based on score
+    estimated_fair_pct: f64,
+    /// Edge = estimated_fair - implied (positive = value)
+    edge_pct: f64,
+    bookmaker: String,
+    odds_age_secs: i64,
+    live_age_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OpportunitiesResponse {
+    ts: String,
+    total_live: usize,
+    total_odds: usize,
+    fused_matches: usize,
+    opportunities: Vec<Opportunity>,
+}
+
+async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
+    let live_map = state.live.read().await;
+    let odds_map = state.odds.read().await;
+    let now = Utc::now();
+
+    let total_live = live_map.len();
+    let total_odds = odds_map.len();
+
+    // Group odds by match_key
+    let mut odds_by_match: HashMap<&str, Vec<&OddsState>> = HashMap::new();
+    for (ok, ov) in odds_map.iter() {
+        odds_by_match.entry(&ok.match_key).or_default().push(ov);
+    }
+
+    let fused_matches = odds_by_match.keys()
+        .filter(|k| live_map.contains_key(**k))
+        .count();
+
+    let mut opportunities = Vec::new();
+
+    for (match_key, live) in live_map.iter() {
+        let Some(odds_list) = odds_by_match.get(match_key.as_str()) else {
+            continue;
+        };
+
+        let score1 = live.payload.score1.unwrap_or(0);
+        let score2 = live.payload.score2.unwrap_or(0);
+        let score_str = format!("{}-{}", score1, score2);
+        let live_age = now.signed_duration_since(live.seen_at).num_seconds();
+
+        for odds_state in odds_list {
+            let odds = &odds_state.payload;
+            let odds_age = now.signed_duration_since(odds_state.seen_at).num_seconds();
+
+            // Skip stale odds (>60s)
+            if odds_age > 60 { continue; }
+
+            let implied1 = 1.0 / odds.odds_team1 * 100.0;
+            let implied2 = 1.0 / odds.odds_team2 * 100.0;
+
+            // === SCORE MOMENTUM DETECTION ===
+            // If team1 is significantly ahead on score, but odds still favor team2
+            // → potential value on team1 (odds haven't adjusted to live situation)
+            let score_diff = score1 - score2;
+
+            // CS2: Bo3 map scores matter. Being up 2-0 in maps = huge advantage
+            // Also round scores: 13-5 on a map means domination
+            if score_diff >= 3 && implied1 > 40.0 {
+                // team1 is dominating but odds think it's somewhat close
+                // Fair estimate: team1 should have higher prob than implied
+                let fair1 = (implied1 + 15.0_f64).min(95.0);
+                let edge = fair1 - implied1;
+                if edge > 3.0 {
+                    opportunities.push(Opportunity {
+                        match_key: match_key.clone(),
+                        opp_type: "score_momentum".to_string(),
+                        team1: live.payload.team1.clone(),
+                        team2: live.payload.team2.clone(),
+                        score: score_str.clone(),
+                        value_side: 1,
+                        signal: format!("{} leads {}, odds imply only {:.1}%",
+                            live.payload.team1, score_str, implied1),
+                        confidence: (edge / 20.0).min(1.0),
+                        odds: odds.odds_team1,
+                        implied_prob_pct: (implied1 * 100.0).round() / 100.0,
+                        estimated_fair_pct: (fair1 * 100.0).round() / 100.0,
+                        edge_pct: (edge * 100.0).round() / 100.0,
+                        bookmaker: odds.bookmaker.clone(),
+                        odds_age_secs: odds_age,
+                        live_age_secs: live_age,
+                    });
+                }
+            }
+
+            if score_diff <= -3 && implied2 > 40.0 {
+                let fair2 = (implied2 + 15.0_f64).min(95.0);
+                let edge = fair2 - implied2;
+                if edge > 3.0 {
+                    opportunities.push(Opportunity {
+                        match_key: match_key.clone(),
+                        opp_type: "score_momentum".to_string(),
+                        team1: live.payload.team1.clone(),
+                        team2: live.payload.team2.clone(),
+                        score: score_str.clone(),
+                        value_side: 2,
+                        signal: format!("{} leads {}, odds imply only {:.1}%",
+                            live.payload.team2, score_str, implied2),
+                        confidence: (edge / 20.0).min(1.0),
+                        odds: odds.odds_team2,
+                        implied_prob_pct: (implied2 * 100.0).round() / 100.0,
+                        estimated_fair_pct: (fair2 * 100.0).round() / 100.0,
+                        edge_pct: (edge * 100.0).round() / 100.0,
+                        bookmaker: odds.bookmaker.clone(),
+                        odds_age_secs: odds_age,
+                        live_age_secs: live_age,
+                    });
+                }
+            }
+
+            // === SPREAD CHECK (single bookmaker) ===
+            // Very low spread (<3%) = bookmaker very sure → potential value on the underdog
+            // High spread (>12%) = bookmaker unsure → avoid
+            let spread = (implied1 + implied2 - 100.0).abs();
+            if spread < 3.0 && (odds.odds_team1 > 2.5 || odds.odds_team2 > 2.5) {
+                let (side, underdog_odds, underdog_implied) = if odds.odds_team1 > odds.odds_team2 {
+                    (1u8, odds.odds_team1, implied1)
+                } else {
+                    (2u8, odds.odds_team2, implied2)
+                };
+                let fair = underdog_implied + 5.0;
+                let edge = fair - underdog_implied;
+                let underdog_name = if side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                opportunities.push(Opportunity {
+                    match_key: match_key.clone(),
+                    opp_type: "tight_spread_underdog".to_string(),
+                    team1: live.payload.team1.clone(),
+                    team2: live.payload.team2.clone(),
+                    score: score_str.clone(),
+                    value_side: side,
+                    signal: format!("Tight spread {:.1}%, {} at {:.2}",
+                        spread, underdog_name, underdog_odds),
+                    confidence: 0.3,
+                    odds: underdog_odds,
+                    implied_prob_pct: (underdog_implied * 100.0).round() / 100.0,
+                    estimated_fair_pct: (fair * 100.0).round() / 100.0,
+                    edge_pct: (edge * 100.0).round() / 100.0,
+                    bookmaker: odds.bookmaker.clone(),
+                    odds_age_secs: odds_age,
+                    live_age_secs: live_age,
+                });
+            }
+        }
+
+        // === CROSS-BOOKMAKER ARB (if multiple bookmaker odds for same match) ===
+        if odds_list.len() >= 2 {
+            for i in 0..odds_list.len() {
+                for j in (i+1)..odds_list.len() {
+                    let a = &odds_list[i].payload;
+                    let b = &odds_list[j].payload;
+                    // Check arb: 1/odds_a_team1 + 1/odds_b_team2 < 1
+                    let arb1 = 1.0 / a.odds_team1 + 1.0 / b.odds_team2;
+                    let arb2 = 1.0 / a.odds_team2 + 1.0 / b.odds_team1;
+                    if arb1 < 1.0 {
+                        let profit_pct = (1.0 - arb1) * 100.0;
+                        opportunities.push(Opportunity {
+                            match_key: match_key.clone(),
+                            opp_type: "arb_cross_book".to_string(),
+                            team1: live.payload.team1.clone(),
+                            team2: live.payload.team2.clone(),
+                            score: score_str.clone(),
+                            value_side: 0,
+                            signal: format!("ARB {:.2}%: {} t1@{:.2}({}) + t2@{:.2}({})",
+                                profit_pct, match_key, a.odds_team1, a.bookmaker,
+                                b.odds_team2, b.bookmaker),
+                            confidence: (profit_pct / 5.0).min(1.0),
+                            odds: a.odds_team1,
+                            implied_prob_pct: arb1 * 100.0,
+                            estimated_fair_pct: 100.0,
+                            edge_pct: (profit_pct * 100.0).round() / 100.0,
+                            bookmaker: format!("{}+{}", a.bookmaker, b.bookmaker),
+                            odds_age_secs: 0,
+                            live_age_secs: live_age,
+                        });
+                    }
+                    if arb2 < 1.0 {
+                        let profit_pct = (1.0 - arb2) * 100.0;
+                        opportunities.push(Opportunity {
+                            match_key: match_key.clone(),
+                            opp_type: "arb_cross_book".to_string(),
+                            team1: live.payload.team1.clone(),
+                            team2: live.payload.team2.clone(),
+                            score: score_str.clone(),
+                            value_side: 0,
+                            signal: format!("ARB {:.2}%: {} t2@{:.2}({}) + t1@{:.2}({})",
+                                profit_pct, match_key, a.odds_team2, a.bookmaker,
+                                b.odds_team1, b.bookmaker),
+                            confidence: (profit_pct / 5.0).min(1.0),
+                            odds: a.odds_team2,
+                            implied_prob_pct: arb2 * 100.0,
+                            estimated_fair_pct: 100.0,
+                            edge_pct: (profit_pct * 100.0).round() / 100.0,
+                            bookmaker: format!("{}+{}", a.bookmaker, b.bookmaker),
+                            odds_age_secs: 0,
+                            live_age_secs: live_age,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by edge descending
+    opportunities.sort_by(|a, b| b.edge_pct.partial_cmp(&a.edge_pct).unwrap_or(std::cmp::Ordering::Equal));
+
+    OpportunitiesResponse {
+        ts: Utc::now().to_rfc3339(),
+        total_live,
+        total_odds,
+        fused_matches,
+        opportunities,
+    }
+}
+
 async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
     let connections = *state.connections.read().await;
     let live_map = state.live.read().await;
@@ -234,8 +485,14 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
     let live_items = live_map.len();
     let odds_items = odds_map.len();
 
+    // Collect unique match keys from odds
+    let mut odds_match_keys = std::collections::HashSet::new();
+    for ok in odds_map.keys() {
+        odds_match_keys.insert(ok.match_key.clone());
+    }
+
     let mut fused_keys = Vec::new();
-    for k in odds_map.keys() {
+    for k in &odds_match_keys {
         if live_map.contains_key(k) {
             fused_keys.push(k.clone());
         }
@@ -262,7 +519,7 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
     let mut odds = Vec::new();
     for (k, v) in odds_map.iter() {
         odds.push(HttpOddsItem {
-            match_key: k.clone(),
+            match_key: k.match_key.clone(),
             source: v.source.clone(),
             seen_at: v.seen_at.to_rfc3339(),
             payload: v.payload.clone(),
@@ -304,6 +561,11 @@ async fn handle_http_connection(mut stream: TcpStream, state: FeedHubState) -> R
             let json = serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string());
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
         }
+        ("GET", "/opportunities") => {
+            let opps = build_opportunities(&state).await;
+            let json = serde_json::to_string_pretty(&opps).unwrap_or_else(|_| "{}".to_string());
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
         _ => (
             "HTTP/1.1 404 Not Found",
             "text/plain; charset=utf-8",
@@ -322,7 +584,7 @@ async fn handle_http_connection(mut stream: TcpStream, state: FeedHubState) -> R
 
 async fn start_http_server(state: FeedHubState, bind: SocketAddr) -> Result<()> {
     let listener = TcpListener::bind(bind).await.context("http bind")?;
-    info!("feed-hub http listening on http://{} (GET /health, /state)", bind);
+    info!("feed-hub http listening on http://{} (GET /health, /state, /opportunities)", bind);
 
     loop {
         let (stream, peer) = listener.accept().await.context("http accept")?;
@@ -411,8 +673,12 @@ async fn handle_socket(
                                     let key = match_key(&payload.sport, &payload.team1, &payload.team2);
                                     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
+                                    let odds_key = OddsKey {
+                                        match_key: key.clone(),
+                                        bookmaker: payload.bookmaker.clone(),
+                                    };
                                     state.odds.write().await.insert(
-                                        key.clone(),
+                                        odds_key,
                                         OddsState {
                                             source: env_source.clone(),
                                             seen_at,
@@ -546,6 +812,35 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Staleness cleanup — remove entries older than 120s
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let cutoff = Utc::now() - chrono::Duration::seconds(120);
+                {
+                    let mut live = state.live.write().await;
+                    let before = live.len();
+                    live.retain(|_, v| v.seen_at > cutoff);
+                    let removed = before - live.len();
+                    if removed > 0 {
+                        info!("staleness cleanup: removed {} stale live entries", removed);
+                    }
+                }
+                {
+                    let mut odds = state.odds.write().await;
+                    let before = odds.len();
+                    odds.retain(|_, v| v.seen_at > cutoff);
+                    let removed = before - odds.len();
+                    if removed > 0 {
+                        info!("staleness cleanup: removed {} stale odds entries", removed);
+                    }
+                }
+            }
+        });
+    }
+
     // Heartbeat summary
     {
         let state = state.clone();
@@ -563,7 +858,11 @@ async fn main() -> Result<()> {
                 let fused_ready = {
                     let live = state.live.read().await;
                     let odds = state.odds.read().await;
-                    odds.keys().filter(|k| live.contains_key(*k)).count()
+                    let mut match_keys = std::collections::HashSet::new();
+                    for ok in odds.keys() {
+                        match_keys.insert(ok.match_key.clone());
+                    }
+                    match_keys.iter().filter(|k| live.contains_key(k.as_str())).count()
                 };
 
                 let hb = FeedHeartbeatEvent {
@@ -592,6 +891,15 @@ async fn main() -> Result<()> {
     }
 
     // NOTE: path routing se řeší u higher-level serverů; tady přijímáme WS na jakémkoliv path.
+    // Azuro GraphQL poller — periodicky stahuje CS2 odds z on-chain subgraph
+    {
+        let state = state.clone();
+        let db_tx = db_tx.clone();
+        tokio::spawn(async move {
+            azuro_poller::run_azuro_poller(state, db_tx).await;
+        });
+    }
+
     while let Ok((stream, peer)) = listener.accept().await {
         let state = state.clone();
         let logger = Arc::clone(&logger);

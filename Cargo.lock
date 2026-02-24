@@ -1865,6 +1865,7 @@ dependencies = [
  "hltv_scraper",
  "logger",
  "prediction_engine",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

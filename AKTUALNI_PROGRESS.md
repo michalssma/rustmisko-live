@@ -1,98 +1,154 @@
 # AKTUALNI_PROGRESS — handoff pro Sonneta
 
-Aktualizováno: 2026-02-24
+Aktualizováno: 2026-02-25
 Repo: RustMiskoLive (`C:\RustMiskoLive`)
 
-## 🚀 STAV: PHASE 0 STARTOVÁNA (PERSISTENT BROWSER NODE)
+## 🚀 STAV: FEED HUB + AZURO INTEGRATION (LIVE PRODUKCE)
 
 ### Aktuální priorita
 
-Nejvyšší priorita je zprovoznit na tomto Win11 zařízení **permanentní browser runtime** (manual login + persistent sessions), ze kterého Rust ingestuje live data napříč esport zdroji a bookie odds. Profit/scaling řešíme až po datovém PoC.
+Hlavním cílem je **cross-platform arbitráž** mezi tradičními bookery (1xbit, HLTV featured) a **Azuro Protocol** (on-chain, NO KYC, Polygon USDC). Systém běží jako Feed Hub — WS server na portu 8080 s HTTP API na portu 8081. Azuro poller je integrován přímo v Rustu.
 
-### Co už je ověřeno dnes (2026-02-24)
+---
 
-1. **HLTV test binárka běží stabilně** (`cargo run --bin hltv-test`)
-2. **HTTP requesty na HLTV endpointy** vrací 403 (anti-bot), takže čistý reqwest scraping není dostačující
-3. **Browser fallback vrstva** je implementována a připravená na další hardening
-4. **Roadmap + Decisions** přepnuté na "Phase 0 first" workflow
+### Architektura (aktuální)
 
-Pozn.: "MATCH_RESOLVED" eventy jsou užitečné pro oracle-lag strategii (po konci). Phase 0 PoC je ale primárně o **LIVE dění + LIVE kurzech** (in-play), tj. kontinuální live update stream.
+```
+┌─────────────────────────────┐
+│   TAMPERMONKEY USERSCRIPTS  │
+│                             │
+│  HLTV scraper v2+           │──── live matches + featured odds
+│  (391 lines, TextNode walk) │     → WS → Feed Hub
+│                             │
+│  Bo3.gg odds scraper v3     │──── multi-bookmaker odds (1xbit)
+│  (496 lines, TreeWalker)    │     → WS → Feed Hub
+└──────────┬──────────────────┘
+           │ WebSocket (port 8080)
+           ▼
+┌─────────────────────────────┐
+│  FEED HUB (Rust, tokio)     │
+│                             │
+│  WS ingest → parse → store  │
+│  Azuro GraphQL poller ←─────│──── polls Polygon+Gnosis subgraphs
+│  match_key() normalization  │     every 30s for CS2 on-chain odds
+│  OddsKey{match_key,bookie}  │
+│  Staleness cleanup (120s)   │
+│                             │
+│  HTTP API (port 8081):      │
+│    /health                  │
+│    /state                   │
+│    /opportunities           │
+└──────────┬──────────────────┘
+           │
+           ▼
+┌─────────────────────────────┐
+│  OPPORTUNITIES ENGINE       │
+│                             │
+│  1. score_momentum          │──── live score ahead, odds lagging
+│  2. tight_spread_underdog   │──── low-juice line, underdog value
+│  3. arb_cross_book          │──── cross-platform arb detection
+│     (1xbit vs azuro_polygon │     ← THIS IS THE MONEY MAKER
+│      or hltv vs azuro)      │
+└─────────────────────────────┘
+```
 
-### Co děláme teď (bez odboček)
+---
 
-1. Nastavení always-on browser procesu (po rebootu se sám zvedne)
-2. Ruční přihlášení na cílové stránky (esport live data + kurzy)
-3. Rust feed fusion proof: systém musí ukázat „co je live“ + „kde je live odds"
-4. Ukládání replay logu pro kalibraci a ladění
+### Co je hotovo a runtime ověřeno
 
-### Exit criteria pro přechod na scaling
+1. **Feed Hub** — WS server (tokio-tungstenite) + raw TCP HTTP server
+   - Multi-bookmaker `OddsKey {match_key, bookmaker}` architektura
+   - Order-independent `match_key()` (alphabetical team name sorting, normalization)
+   - SQLite persistence (WAL mode) via `feed_db.rs`
+   - Staleness cleanup — entries starší 120s automaticky odstraněny
+   - JSONL event logging
 
-- Feed uptime ≥ 98% za 24h
-- p95 lag < 2s
-- Konsensus feedů ≥ 80%
-- False join rate < 5%
+2. **Tampermonkey scrapers**
+   - **HLTV v2+**: URL slug parsing + TextNode walker for odds, featured bookmaker detection
+   - **Bo3.gg v3**: TreeWalker pattern, `cleanTeamSlug()`, 36-43 valid odds per scan
 
-Dokud není tohle splněné, navyšování stake ani rozšíření na další node není priorita.
+3. **Opportunities engine** — 3 detection types:
+   - `score_momentum`: score leads with lagging odds
+   - `tight_spread_underdog`: tight spread (<3%) + high underdog odds (>2.5)
+   - `arb_cross_book`: **cross-bookmaker arbitrage** (best odds from 2 bookies < 100%)
+   - Historically detected: 21.89%, 5.91%, 2.91%, 2.72% edge signals
 
-### Co se změnilo (2026-02-23)
+4. **Azuro Protocol integration** (NOVÉ!)
+   - `azuro_poller.rs` — Rust-native GraphQL poller
+   - Polluje Polygon + Gnosis subgraphs každých 30s
+   - Parsuje CS2 hry s aktivními podmínkami (match_winner market)
+   - Konvertuje Azuro fixed-point odds (10^12) na decimální
+   - Injektuje jako `bookmaker: "azuro_polygon"` / `"azuro_gnosis"` do FeedHubState
+   - Cross-platform arb detection funguje automaticky (1xbit vs azuro)
 
-**Kritický fix: systém přepnut z mrtvých výsledků na LIVE sledování.**
+---
 
-1. **LIVE State Machine v `esports_monitor`**
-   - Nová metoda `poll_live_all()` jako PRIMÁRNÍ zdroj dat (každých 15s):
-     - **LoL**: `getSchedule` API → sleduje `state: "inProgress"` → `"completed"` přechod
-     - **Valorant**: `vlr.gg/matches` → CSS selektor `a.match-item.mod-live` (ověřeno browser inspekcí)
-     - **CS2 + Dota 2**: `gosugamers.net/counterstrike/matches` a `dota2/matches` → SSR HTML parsování, detekce "Live" badge v `textContent`
-   - In-memory `HashMap<String, LiveMatch>` drží aktuálně live zápasy
-   - Detekce přechodu: zápas zmizí z live sekce → emituje `MATCH_RESOLVED` → okamžitě checkuje SX Bet
+### Platformy — vyšetřeno
 
-2. **GosuGamers scraper kompletně přepsán**
-   - Starý kód: selektory `.match-list-item`, `.team-name`, `.score` → NA WEBU NEEXISTUJÍ (GosuGamers běží na Material UI)
-   - Starý URL: `/counter-strike/matches` → VRACÍ 404!
-   - Nový kód: parsuje `<a href="/tournaments/.../matches/ID-team1-vs-team2">` elementy
-   - Team names se extrahují z URL slugu (spolehlivější než text parsing)
-   - Skóre se parsuje regexem `(\d+)\s*:\s*(\d+)` z textu
+| Platforma   | CS2 coverage | Status |
+|-------------|-------------|--------|
+| **Azuro**   | ✅ MASIVNÍ   | **INTEGROVÁNO** — CS2 sport id 1061, desítky zápasů denně |
+| SX Bet      | ❌ ŽÁDNÉ     | Pouze LoL LPL (2 zápasy). Zero CS2 markets. |
+| Polymarket  | ❌ ŽÁDNÉ     | Zero esports. Pouze politika/geopolitika. |
+| Overtime    | ❌ DEPRECATED | API nefunkční |
 
-3. **`main.rs` — Dual-mode loop**
-   - PRIMÁRNÍ: `monitor.poll_live_all()` každých 15s → live→finished detekce
-   - FALLBACK: `monitor.poll_all()` jednou za 5 min (20 cyklů) → audit/catch-up
+---
 
-4. **Deduplikace** — `HashSet` v `seen_matches` zabraňuje opakovanému zpracování
+### Azuro Protocol — klíčové info
 
-5. **Visibility logging** — SX Bet lookup miss viditelný na `info!` úrovni
+- **Typ**: Decentralizovaný on-chain bookmaker (AMM pool)
+- **Chains**: Polygon (USDC), Gnosis, Base
+- **KYC**: ŽÁDNÉ — wallet-only přístup
+- **API**: GraphQL subgraph (The Graph)
+  - Polygon: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3`
+  - Gnosis: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-gnosis-v3`
+- **WebSocket**: `wss://streams.onchainfeed.org/v1/streams/feed` (live odds stream)
+- **Frontend**: bookmaker.xyz
+- **CS2 turnaje**: CCT, ESL Challenger, PGL Bucharest, BetBoom RUSH B, NODWIN Clutch, European Pro League
+- **Bet flow**: EIP712 signature → Relayer → on-chain execution
+- **Smart contracts**: HostCore (lifecycle), LiveCore (accept), Relayer
+
+---
 
 ### Co systém REÁLNĚ dělá teď
 
 ```
-Live poll cycle:
-  1. Stáhne live match stránky (LoL API, vlr.gg, GosuGamers)
-  2. Porovná s pamětí: nový live? → zapamatuj. Zmizel live? → FINISHED!
-  3. Pro FINISHED zápasy: dohledá vítěze na results stránce
-  4. Okamžitě checkne SX Bet cache (16µs lookup)
-  5. Pokud SX Bet market existuje → query orderbook → edge evaluation
-  6. Edge >3% → Telegram alert + JSONL log
+Continuous loop:
+  1. Tampermonkey scrapers → WS → Feed Hub (live matches + odds z 1xbit/hltv)
+  2. Azuro poller → GraphQL → Feed Hub (on-chain CS2 odds z Polygon/Gnosis)
+  3. match_key normalization → OddsKey storage
+  4. /opportunities endpoint → cross-bookmaker arb detection
+  5. Edge detected → JSON response (pro budoucí automated execution)
 ```
 
-### Proč to bude fungovat
-
-- SX Bet oracle lag: **10-25 minut** po konci zápasu
-- Náš detection delay: **1-5 minut** (HTML refresh interval)
-- **Zbývající okno: 5-20 minut** na sázku na známého vítěze
+---
 
 ### Co stále NENÍ hotové (pravdivě)
 
-1. **Trading/execution** — stále `observe_only = true`
-2. **Signal klasifikace** (A+/A/B/REJECT) — zatím neimplementováno
-3. **Oracle lag měření** — nemáme data o tom jak rychle SX Bet reálně settleuje
-4. **PandaScore/websocket** — free zdroje stačí pro MVP, ale placené API by zkrátily delay na <30s
+1. **Automated execution** — zatím `observe_only`, žádné reálné sázky
+2. **Wallet integration** — EIP712 signing pro Azuro bet placement
+3. **Azuro liquidity parsing** — subgraph vrací pool data, ale ještě neextrahujeme `liquidity_usd`
+4. **Team name normalization cross-platform** — "FURIA" vs "furia esports" matching
+5. **Telegram alerts** — notifikace při arb detekci
+6. **Live odds WebSocket** — `wss://streams.onchainfeed.org` pro sub-second updates (místo 30s polling)
+
+---
 
 ### Jak reprodukovat
 
-```bash
-cp .env.example .env
-# Nastav ESPORTS_POLL_INTERVAL_SECS=15
-cargo run --bin live-observer
-# Sleduj terminál pro 🔴 LIVE a ✅ MATCH FINISHED hlášky
+```powershell
+# Terminal 1: Feed Hub
+$env:FEED_HUB_BIND="0.0.0.0:8080"
+$env:FEED_HTTP_BIND="0.0.0.0:8081"
+$env:FEED_DB_PATH="data/feed.db"
+cargo run --bin feed-hub
+
+# Terminal 2: Check it
+Invoke-RestMethod http://localhost:8081/health
+Invoke-RestMethod http://localhost:8081/state
+Invoke-RestMethod http://localhost:8081/opportunities
+
+# Chrome: Enable Tampermonkey scripts on HLTV + Bo3.gg
 ```
 
 ### Poznámka k pravdivosti
