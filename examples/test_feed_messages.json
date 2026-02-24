@@ -1,0 +1,42 @@
+[
+  {
+    "v": 1,
+    "type": "live_match",
+    "source": "hltv",
+    "ts": "2026-02-24T00:00:00Z",
+    "payload": {
+      "sport": "cs2",
+      "team1": "Alpha",
+      "team2": "Beta",
+      "score1": 1,
+      "score2": 0,
+      "status": "LIVE",
+      "url": "https://example.invalid/match"
+    }
+  },
+  {
+    "v": 1,
+    "type": "odds",
+    "source": "zebra",
+    "ts": "2026-02-24T00:00:01Z",
+    "payload": {
+      "sport": "cs2",
+      "bookmaker": "pinnacle",
+      "market": "match_winner",
+      "team1": "Alpha",
+      "team2": "Beta",
+      "odds_team1": 1.95,
+      "odds_team2": 1.95,
+      "liquidity_usd": 5000.0,
+      "spread_pct": 0.8,
+      "url": "https://example.invalid/odds"
+    }
+  },
+  {
+    "v": 1,
+    "type": "heartbeat",
+    "source": "lenovo",
+    "ts": "2026-02-24T00:00:02Z",
+    "payload": {}
+  }
+]

@@ -79,6 +79,36 @@
   - `/results`: `html_len≈28k`, `match_ids=0`, `challenge_page=true`
   - závěr: browser fallback získává HTML, ale jde stále o challenge stránku, ne sportovní obsah
 
+### 🧪 **Lokální demo: WS ingest → gating → SQLite DB (2026-02-24)**
+- ✅ `feed-hub` přijímá WS JSON a zapisuje do SQLite (`data/feed.db`)
+- ✅ Přidané binárky:
+  - `feed-hub` (WS server)
+  - `feed_ws_send_test` (lokální WS klient, pošle `live_match` + `odds` + `heartbeat`)
+  - `feed_db_stats` (rychlý výpis row countů z DB)
+
+**Repro příkazy (PowerShell):**
+```powershell
+$env:RUST_LOG="info"
+$env:FEED_DB_PATH="data/feed.db"
+$env:FEED_HUB_BIND="127.0.0.1:8080"
+cargo run --bin feed-hub
+```
+
+V druhém terminálu:
+```powershell
+$env:FEED_HUB_URL="ws://127.0.0.1:8080/feed"
+cargo run --bin feed_ws_send_test
+```
+
+Kontrola DB:
+```powershell
+$env:FEED_DB_PATH="data/feed.db"
+cargo run --bin feed_db_stats
+```
+
+**Očekávané minimum:**
+- `live_state >= 1`, `odds_state >= 1`, `fusion_ready >= 1`, `ingest_events >= 3`
+
 ### ⏳ **Čeká na implementaci:**
 1. **Phase 0:** Persistent Browser Node PoC (Win11)
 2. **Fáze 1:** HLTV scraping prototype (dokončení)

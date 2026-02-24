@@ -20,10 +20,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+
+mod feed_db;
+use feed_db::{
+    spawn_db_writer,
+    DbConfig,
+    DbFusionRow,
+    DbHeartbeatRow,
+    DbIngestRow,
+    DbLiveRow,
+    DbMsg,
+    DbOddsRow,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,10 +202,9 @@ async fn handle_socket(
     stream: TcpStream,
     state: FeedHubState,
     logger: Arc<EventLogger>,
+    db_tx: mpsc::Sender<DbMsg>,
 ) -> Result<()> {
-    let ws_stream = accept_async(stream)
-        .await
-        .context("WS handshake failed")?;
+    let ws_stream = accept_async(stream).await.context("WS handshake failed")?;
 
     {
         let mut c = state.connections.write().await;
@@ -214,6 +226,7 @@ async fn handle_socket(
 
         match msg {
             Message::Text(txt) => {
+                let txt = txt.to_string();
                 let parsed: Result<FeedEnvelope> = serde_json::from_str(&txt)
                     .context("invalid JSON envelope")
                     .map_err(Into::into);
@@ -228,27 +241,37 @@ async fn handle_socket(
                                 FeedMessageType::LiveMatch => {
                                     let payload: LiveMatchPayload = serde_json::from_value(env.payload)
                                         .context("invalid live_match payload")?;
-
                                     let seen_at = parse_ts(&env.ts);
                                     let key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
                                     state.live.write().await.insert(
-                                        key,
+                                        key.clone(),
                                         LiveMatchState {
-                                            source: env_source,
+                                            source: env_source.clone(),
                                             seen_at,
-                                            payload,
+                                            payload: payload.clone(),
                                         },
                                     );
+
+                                    let _ = db_tx.try_send(DbMsg::LiveUpsert(DbLiveRow {
+                                        ts: seen_at,
+                                        source: env_source,
+                                        sport: payload.sport,
+                                        team1: payload.team1,
+                                        team2: payload.team2,
+                                        match_key: key,
+                                        payload_json,
+                                    }));
 
                                     (true, "live_match_ingested".to_string())
                                 }
                                 FeedMessageType::Odds => {
                                     let payload: OddsPayload = serde_json::from_value(env.payload)
                                         .context("invalid odds payload")?;
-
                                     let seen_at = parse_ts(&env.ts);
                                     let key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
                                     state.odds.write().await.insert(
                                         key.clone(),
@@ -259,9 +282,24 @@ async fn handle_socket(
                                         },
                                     );
 
+                                    let _ = db_tx.try_send(DbMsg::OddsUpsert(DbOddsRow {
+                                        ts: seen_at,
+                                        source: env_source.clone(),
+                                        sport: payload.sport.clone(),
+                                        bookmaker: payload.bookmaker.clone(),
+                                        market: payload.market.clone(),
+                                        team1: payload.team1.clone(),
+                                        team2: payload.team2.clone(),
+                                        match_key: key.clone(),
+                                        odds_team1: payload.odds_team1,
+                                        odds_team2: payload.odds_team2,
+                                        liquidity_usd: payload.liquidity_usd,
+                                        spread_pct: payload.spread_pct,
+                                        payload_json,
+                                    }));
+
                                     let (pass, why) = gate_odds(&payload, seen_at);
                                     if pass {
-                                        // Fusion: existuje k tomu live?
                                         if let Some(live) = state.live.read().await.get(&key).cloned() {
                                             let fusion = LiveFusionReadyEvent {
                                                 ts: Utc::now().to_rfc3339(),
@@ -269,13 +307,25 @@ async fn handle_socket(
                                                 sport: payload.sport.clone(),
                                                 match_key: key,
                                                 live_source: live.source,
-                                                odds_source: env_source,
+                                                odds_source: env_source.clone(),
                                                 bookmaker: payload.bookmaker.clone(),
                                                 market: payload.market.clone(),
                                                 liquidity_usd: payload.liquidity_usd,
                                                 spread_pct: payload.spread_pct,
                                             };
                                             let _ = logger.log(&fusion);
+
+                                            let _ = db_tx.try_send(DbMsg::Fusion(DbFusionRow {
+                                                ts: Utc::now(),
+                                                sport: fusion.sport.clone(),
+                                                match_key: fusion.match_key.clone(),
+                                                live_source: fusion.live_source.clone(),
+                                                odds_source: fusion.odds_source.clone(),
+                                                bookmaker: fusion.bookmaker.clone(),
+                                                market: fusion.market.clone(),
+                                                liquidity_usd: fusion.liquidity_usd,
+                                                spread_pct: fusion.spread_pct,
+                                            }));
                                         }
                                         (true, format!("odds_ingested_gated:{}", why))
                                     } else {
@@ -299,7 +349,15 @@ async fn handle_socket(
                 };
                 let _ = logger.log(&ingest);
 
-                // Ack klientovi (minimal)
+                let _ = db_tx.try_send(DbMsg::Ingest(DbIngestRow {
+                    ts: Utc::now(),
+                    source: "ws".to_string(),
+                    msg_type: "text".to_string(),
+                    ok,
+                    note: note.clone(),
+                    raw_json: Some(txt.clone()),
+                }));
+
                 let ack = serde_json::json!({"ok": ok, "note": note});
                 let _ = ws_sink.send(Message::Text(ack.to_string().into())).await;
             }
@@ -334,10 +392,15 @@ async fn main() -> Result<()> {
     let state = FeedHubState::new();
     let logger = Arc::new(EventLogger::new("logs"));
 
+    let db_path = std::env::var("FEED_DB_PATH").unwrap_or_else(|_| "data/feed.db".to_string());
+    info!("feed-hub DB: {}", db_path);
+    let db_tx = spawn_db_writer(DbConfig { path: db_path });
+
     // Heartbeat summary
     {
         let state = state.clone();
         let logger = Arc::clone(&logger);
+        let db_tx = db_tx.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(10)).await;
@@ -363,6 +426,13 @@ async fn main() -> Result<()> {
                 };
 
                 let _ = logger.log(&hb);
+                let _ = db_tx.try_send(DbMsg::Heartbeat(DbHeartbeatRow {
+                    ts: Utc::now(),
+                    connections: connections as i64,
+                    live_items: live_items as i64,
+                    odds_items: odds_items as i64,
+                    fused_ready: fused_ready as i64,
+                }));
                 info!(
                     "HB: conns={}, live={}, odds={}, fused_ready={} (see logs/*.jsonl)",
                     connections, live_items, odds_items, fused_ready
@@ -375,9 +445,10 @@ async fn main() -> Result<()> {
     while let Ok((stream, peer)) = listener.accept().await {
         let state = state.clone();
         let logger = Arc::clone(&logger);
+        let db_tx = db_tx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_socket(peer, stream, state, logger).await {
+            if let Err(e) = handle_socket(peer, stream, state, logger, db_tx).await {
                 debug!("socket handler err {}: {}", peer, e);
             }
         });
