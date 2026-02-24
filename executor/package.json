@@ -1,0 +1,16 @@
+{
+  "name": "azuro-executor",
+  "version": "1.0.0",
+  "description": "Azuro Protocol bet/cashout executor sidecar for RustMisko Alert Bot",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@azuro-org/toolkit": "^5",
+    "viem": "^2",
+    "express": "^4"
+  }
+}

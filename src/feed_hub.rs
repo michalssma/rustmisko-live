@@ -87,6 +87,23 @@ pub struct OddsPayload {
     pub spread_pct: Option<f64>,
 
     pub url: Option<String>,
+
+    // === Azuro execution data (pro BUY + cashout) ===
+    /// Azuro game ID (subgraph)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_id: Option<String>,
+    /// Azuro condition ID (pro bet placement)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_id: Option<String>,
+    /// Azuro outcome ID pro team1 win
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome1_id: Option<String>,
+    /// Azuro outcome ID pro team2 win
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome2_id: Option<String>,
+    /// Chain name (polygon, gnosis, base, chiliz)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
 }
 
 #[derive(Debug, Clone)]

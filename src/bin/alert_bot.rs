@@ -2,18 +2,20 @@
 //!
 //! Standalone binary — polluje feed-hub /opportunities endpoint,
 //! detekuje odds discrepancy mezi Azuro a trhem, posílá Telegram alerty.
-//! Miša odpoví YES $X / NO a bot (budoucí fáze) umístí sázku.
+//! Miša odpoví YES $X / NO a bot umístí sázku přes Azuro executor sidecar.
+//! Auto-cashout monitoruje aktivní sázky a cashoutuje při profitu.
 //!
 //! Spuštění:
 //!   $env:TELEGRAM_BOT_TOKEN="7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk"
-//!   $env:TELEGRAM_CHAT_ID="<tvoje chat id>"
+//!   $env:TELEGRAM_CHAT_ID="6458129071"
 //!   $env:FEED_HUB_URL="http://127.0.0.1:8081"
+//!   $env:EXECUTOR_URL="http://127.0.0.1:3030"  # Node.js sidecar
 //!   cargo run --bin alert_bot
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use serde::Deserialize;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashSet, HashMap};
 use std::time::Duration;
 use tracing::{info, warn, error};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -26,7 +28,11 @@ const POLL_INTERVAL_SECS: u64 = 30;
 /// Minimum edge % to trigger alert (all tiers)
 const MIN_EDGE_PCT: f64 = 5.0;
 /// Don't re-alert same match within this window
-const ALERT_COOLDOWN_SECS: i64 = 300; // 5 min
+const ALERT_COOLDOWN_SECS: i64 = 1800; // 30 min
+/// Auto-cashout check interval
+const CASHOUT_CHECK_SECS: u64 = 30;
+/// Minimum profit % to auto-cashout
+const CASHOUT_MIN_PROFIT_PCT: f64 = 3.0;
 
 // ====================================================================
 // Types matching feed-hub /opportunities JSON
@@ -110,6 +116,12 @@ struct OddsPayload {
     liquidity_usd: Option<f64>,
     spread_pct: Option<f64>,
     url: Option<String>,
+    // Azuro execution data
+    game_id: Option<String>,
+    condition_id: Option<String>,
+    outcome1_id: Option<String>,
+    outcome2_id: Option<String>,
+    chain: Option<String>,
 }
 
 // Telegram getUpdates response
@@ -217,6 +229,74 @@ struct OddsAnomaly {
     is_live: bool,
     /// Live score if available
     live_score: Option<String>,
+    // === Azuro execution data ===
+    game_id: Option<String>,
+    condition_id: Option<String>,
+    /// Outcome ID for the VALUE side
+    outcome_id: Option<String>,
+    chain: Option<String>,
+}
+
+// === Executor types ===
+
+#[derive(Debug, Clone, Serialize)]
+struct ActiveBet {
+    alert_id: u32,
+    bet_id: String,
+    match_key: String,
+    team1: String,
+    team2: String,
+    value_team: String,
+    amount_usd: f64,
+    odds: f64,
+    placed_at: String,
+    condition_id: String,
+    outcome_id: String,
+    graph_bet_id: Option<String>,
+    token_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutorBetResponse {
+    status: Option<String>,
+    #[serde(rename = "betId")]
+    bet_id: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutorHealthResponse {
+    status: Option<String>,
+    wallet: Option<String>,
+    balance: Option<String>,
+    #[serde(rename = "relayerAllowance")]
+    relayer_allowance: Option<String>,
+    #[serde(rename = "activeBets")]
+    active_bets: Option<u32>,
+    #[serde(rename = "toolkitAvailable")]
+    toolkit_available: Option<bool>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExecutorCashoutResponse {
+    status: Option<String>,
+    #[serde(rename = "cashoutId")]
+    cashout_id: Option<String>,
+    state: Option<String>,
+    #[serde(rename = "cashoutOdds")]
+    cashout_odds: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CashoutCheckResponse {
+    available: Option<bool>,
+    #[serde(rename = "cashoutOdds")]
+    cashout_odds: Option<String>,
+    #[serde(rename = "calculationId")]
+    calculation_id: Option<String>,
 }
 
 /// Normalize team name for comparison: lowercase, strip whitespace, remove common suffixes
@@ -409,6 +489,10 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                 teams_swapped: any_swapped,
                 is_live,
                 live_score: live_score.clone(),
+                game_id: azuro.game_id.clone(),
+                condition_id: azuro.condition_id.clone(),
+                outcome_id: azuro.outcome1_id.clone(),
+                chain: azuro.chain.clone(),
             });
         }
         if disc_w2 > MIN_EDGE_PCT {
@@ -430,6 +514,10 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                 teams_swapped: any_swapped,
                 is_live,
                 live_score: live_score.clone(),
+                game_id: azuro.game_id.clone(),
+                condition_id: azuro.condition_id.clone(),
+                outcome_id: azuro.outcome2_id.clone(),
+                chain: azuro.chain.clone(),
             });
         }
     }
@@ -447,7 +535,7 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
     anomalies
 }
 
-fn format_anomaly_alert(a: &OddsAnomaly) -> String {
+fn format_anomaly_alert(a: &OddsAnomaly, alert_id: u32) -> String {
     let value_team = if a.value_side == 1 { &a.team1 } else { &a.team2 };
     let azuro_odds = if a.value_side == 1 { a.azuro_w1 } else { a.azuro_w2 };
     let market_odds = if a.value_side == 1 { a.market_w1 } else { a.market_w2 };
@@ -480,8 +568,14 @@ fn format_anomaly_alert(a: &OddsAnomaly) -> String {
         format!("\n📋 {}", a.confidence_reasons.join(" | "))
     };
 
+    let exec_ready = if a.condition_id.is_some() && a.outcome_id.is_some() {
+        "✅ BET READY"
+    } else {
+        "⚠️ Manuální bet (chybí contract data)"
+    };
+
     format!(
-        "{} <b>ODDS ANOMALY</b> [{}]\n\
+        "🎯 <b>#{}</b> {} <b>ODDS ANOMALY</b> [{}]\n\
          \n\
          <b>{}</b> vs <b>{}</b>{}{}\n\
          \n\
@@ -494,10 +588,11 @@ fn format_anomaly_alert(a: &OddsAnomaly) -> String {
          ⚡ <b>{}</b> na Azuru o <b>{:.1}%</b> VYŠŠÍ než trh\n\
          Azuro: {:.2} vs Trh: {:.2}{}{}\n\
          \n\
-         💡 Suggestion: BET <b>{}</b> @ <b>{:.2}</b>\n\
+         🏦 {}\n\
+         💡 BET <b>{}</b> @ <b>{:.2}</b>\n\
          \n\
-         Reply: <code>YES $5</code> / <code>NO</code> / <code>SKIP</code>",
-        conf_emoji, a.confidence,
+         Reply: <code>{} YES $5</code> / <code>{} NO</code>",
+        alert_id, conf_emoji, a.confidence,
         a.team1, a.team2, live_line, swap_warn,
         a.azuro_bookmaker,
         a.team1, a.azuro_w1, a.team2, a.azuro_w2,
@@ -505,7 +600,9 @@ fn format_anomaly_alert(a: &OddsAnomaly) -> String {
         a.team1, a.market_w1, a.team2, a.market_w2,
         value_team, a.discrepancy_pct,
         azuro_odds, market_odds, reasons_text, url_line,
-        value_team, azuro_odds
+        exec_ready,
+        value_team, azuro_odds,
+        alert_id, alert_id
     )
 }
 
@@ -543,15 +640,65 @@ fn format_opportunity_alert(opp: &Opportunity) -> String {
 // Main loop
 // ====================================================================
 
+/// Parse reply like "3 YES $5", "3 YES 5", "3 YES", "YES $5", "YES" → (alert_id, amount)
+/// If no alert_id given, returns 0 (caller uses latest alert)
+fn parse_yes_reply(text: &str) -> Option<(u32, f64)> {
+    let text = text.trim();
+    let parts: Vec<&str> = text.splitn(4, char::is_whitespace).collect();
+    if parts.is_empty() { return None; }
+
+    // Format 1: "{id} YES [$]{amount}" e.g. "3 YES $5"
+    // Format 2: "{id} YES" e.g. "3 YES" → default $5
+    // Format 3: "YES [$]{amount}" e.g. "YES $5" → use latest alert (id=0)
+    // Format 4: "YES" → use latest alert, default $5
+
+    if let Ok(id) = parts[0].parse::<u32>() {
+        // Starts with number → Format 1 or 2
+        if parts.len() < 2 { return None; }
+        if !parts[1].eq_ignore_ascii_case("YES") { return None; }
+        let amount = if parts.len() >= 3 {
+            parts[2].trim_start_matches('$').trim().parse::<f64>().unwrap_or(5.0)
+        } else {
+            5.0
+        };
+        Some((id, amount))
+    } else if parts[0].eq_ignore_ascii_case("YES") {
+        // Starts with YES → Format 3 or 4 (id=0 means "latest")
+        let amount = if parts.len() >= 2 {
+            parts[1].trim_start_matches('$').trim().parse::<f64>().unwrap_or(5.0)
+        } else {
+            5.0
+        };
+        Some((0, amount))
+    } else {
+        None
+    }
+}
+
+/// Parse reply like "3 NO" → alert_id
+fn parse_no_reply(text: &str) -> Option<u32> {
+    let text = text.trim();
+    let parts: Vec<&str> = text.splitn(2, char::is_whitespace).collect();
+    if parts.len() < 2 { return None; }
+    let id: u32 = parts[0].parse().ok()?;
+    if parts[1].eq_ignore_ascii_case("NO") || parts[1].eq_ignore_ascii_case("SKIP") {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?)).init();
 
     let token = std::env::var("TELEGRAM_BOT_TOKEN")
-        .unwrap_or_else(|_| "7611316975:AAG_bStGX283uHCdog96y".to_string());
+        .unwrap_or_else(|_| "7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk".to_string());
     let feed_hub_url = std::env::var("FEED_HUB_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
-    
+    let executor_url = std::env::var("EXECUTOR_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3030".to_string());
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()?;
@@ -567,12 +714,15 @@ async fn main() -> Result<()> {
 
     let mut update_offset: i64 = 0;
     let mut sent_alerts: Vec<SentAlert> = Vec::new();
+    let mut alert_counter: u32 = 0;
+    let mut alert_map: HashMap<u32, OddsAnomaly> = HashMap::new();
+    let mut active_bets: Vec<ActiveBet> = Vec::new();
 
     // If no chat_id, wait for user to send /start
     if chat_id.is_none() {
         info!("No TELEGRAM_CHAT_ID set. Waiting for /start message from user...");
         info!("Open Telegram and send /start to your bot");
-        
+
         loop {
             match tg_get_updates(&client, &token, update_offset).await {
                 Ok(updates) => {
@@ -585,12 +735,13 @@ async fn main() -> Result<()> {
                                 info!("Chat ID discovered: {}", msg.chat.id);
                                 tg_send_message(&client, &token, msg.chat.id,
                                     &format!(
-                                        "🤖 <b>RustMisko Alert Bot</b> activated!\n\n\
-                                         Budu ti posílat CS2 odds anomálie z Azuro vs trh.\n\
-                                         Odpověz <code>YES $5</code> pro sázku nebo <code>NO</code> pro skip.\n\n\
+                                        "🤖 <b>RustMisko Alert Bot v3</b> activated!\n\n\
+                                         Automatický CS2 Azuro betting system.\n\
+                                         Alert → Reply → BET → AUTO-CASHOUT.\n\n\
                                          ⚙️ Min edge: 5%\n\
-                                         📡 Polling interval: 30s\n\
-                                         🏠 Feed Hub: {}", feed_hub_url
+                                         📡 Polling: 30s\n\
+                                         🏠 Feed Hub: {}\n\
+                                         🔧 Executor: {}", feed_hub_url, executor_url
                                     )
                                 ).await?;
                                 break;
@@ -606,26 +757,45 @@ async fn main() -> Result<()> {
     }
 
     let chat_id = chat_id.unwrap();
-    info!("Alert bot running. chat_id={}, feed_hub={}", chat_id, feed_hub_url);
+    info!("Alert bot running. chat_id={}, feed_hub={}, executor={}", chat_id, feed_hub_url, executor_url);
+
+    // Check executor health at startup
+    let executor_status = match client.get(format!("{}/health", executor_url)).send().await {
+        Ok(resp) => {
+            match resp.json::<ExecutorHealthResponse>().await {
+                Ok(h) => {
+                    let wallet = h.wallet.as_deref().unwrap_or("?");
+                    let balance = h.balance.as_deref().unwrap_or("?");
+                    let allowance = h.relayer_allowance.as_deref().unwrap_or("?");
+                    format!("✅ Executor ONLINE\n   Wallet: <code>{}</code>\n   Balance: {} USDT\n   Allowance: {}", wallet, balance, allowance)
+                }
+                Err(_) => "⚠️ Executor odpověděl, ale nevalidní JSON".to_string(),
+            }
+        }
+        Err(_) => "❌ Executor OFFLINE — sázky nebudou fungovat!\n   Spusť: cd executor && node index.js".to_string(),
+    };
 
     // Startup message
     tg_send_message(&client, &token, chat_id,
-        "🟢 <b>Alert Bot Online</b>\n\n\
-         Monitoruji Azuro vs 1xbit/HLTV odds discrepancy.\n\
-         Pošlu alert když najdu >5% edge.\n\n\
-         Commands:\n\
-         /status — aktuální stav\n\
-         /odds — top odds anomálie teď\n\
-         /help — nápověda"
+        &format!(
+            "🟢 <b>Alert Bot v3 Online</b>\n\n\
+             {}\n\n\
+             Monitoruji Azuro vs 1xbit/HLTV odds.\n\
+             Alert → <code>N YES $5</code> → BET → AUTO-CASHOUT.\n\n\
+             /status — stav systému + executor + bety\n\
+             /odds — aktuální anomálie\n\
+             /bets — aktivní sázky\n\
+             /help — nápověda", executor_status
+        )
     ).await?;
 
     let mut poll_ticker = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
+    let mut cashout_ticker = tokio::time::interval(Duration::from_secs(CASHOUT_CHECK_SECS));
 
     loop {
         tokio::select! {
+            // === POLL feed-hub for anomalies ===
             _ = poll_ticker.tick() => {
-                // === POLL feed-hub for anomalies ===
-                
                 // Clean old alerts from cooldown
                 let now = Utc::now();
                 sent_alerts.retain(|a| (now - a.sent_at).num_seconds() < ALERT_COOLDOWN_SECS);
@@ -640,28 +810,39 @@ async fn main() -> Result<()> {
                             Ok(state) => {
                                 let anomalies = find_odds_anomalies(&state);
                                 let mut actually_sent = 0;
-                                for anomaly in &anomalies {
+                                let total_anomalies = anomalies.len();
+                                for anomaly in anomalies {
                                     let alert_key = format!("{}:{}:{}", anomaly.match_key, anomaly.value_side, anomaly.azuro_bookmaker);
                                     if already_alerted.contains(&alert_key) {
                                         continue;
                                     }
 
-                                    let msg = format_anomaly_alert(anomaly);
+                                    alert_counter += 1;
+                                    let aid = alert_counter;
+
+                                    let msg = format_anomaly_alert(&anomaly, aid);
                                     if let Err(e) = tg_send_message(&client, &token, chat_id, &msg).await {
                                         error!("Failed to send alert: {}", e);
                                     } else {
-                                        info!("Alert sent: {} side={} disc={:.1}% conf={}", 
-                                            anomaly.match_key, anomaly.value_side, anomaly.discrepancy_pct, anomaly.confidence);
+                                        info!("Alert #{} sent: {} side={} disc={:.1}% conf={}",
+                                            aid, anomaly.match_key, anomaly.value_side, anomaly.discrepancy_pct, anomaly.confidence);
                                         actually_sent += 1;
                                         sent_alerts.push(SentAlert {
                                             match_key: alert_key,
                                             sent_at: Utc::now(),
                                         });
+                                        alert_map.insert(aid, anomaly);
                                     }
                                 }
 
-                                info!("Poll: {} anomalies found, {} sent (cooldown={})", 
-                                    anomalies.len(), actually_sent, sent_alerts.len());
+                                // Clean old alerts from map (keep last 50)
+                                if alert_map.len() > 50 {
+                                    let min_keep = alert_counter.saturating_sub(50);
+                                    alert_map.retain(|k, _| *k > min_keep);
+                                }
+
+                                info!("Poll: {} anomalies found, {} sent (cooldown={})",
+                                    total_anomalies, actually_sent, sent_alerts.len());
                             }
                             Err(e) => warn!("Failed to parse /state: {}", e),
                         }
@@ -669,35 +850,92 @@ async fn main() -> Result<()> {
                     Err(e) => warn!("Failed to fetch /state: {}", e),
                 }
 
-                // 2. Also check /opportunities for arb_cross_book specifically
-                match client.get(format!("{}/opportunities", feed_hub_url)).send().await {
-                    Ok(resp) => {
-                        match resp.json::<OpportunitiesResponse>().await {
-                            Ok(opps) => {
-                                for opp in &opps.opportunities {
-                                    // Only alert arb_cross_book with significant edge
-                                    if opp.opp_type != "arb_cross_book" { continue; }
-                                    if opp.edge_pct < MIN_EDGE_PCT { continue; }
-                                    
-                                    let alert_key = format!("opp:{}:{}", opp.match_key, opp.bookmaker);
-                                    if already_alerted.contains(&alert_key) { continue; }
+                // arb_cross_book alerts DISABLED — odds_anomaly covers the same 
+                // matches with better context (condition_id, numbered alerts, BET READY)
+            }
 
-                                    let msg = format_opportunity_alert(opp);
-                                    if let Err(e) = tg_send_message(&client, &token, chat_id, &msg).await {
-                                        error!("Failed to send opp alert: {}", e);
+            // === AUTO-CASHOUT check ===
+            _ = cashout_ticker.tick() => {
+                if active_bets.is_empty() { continue; }
+
+                for bet in &mut active_bets {
+                    // Need graph_bet_id or token_id for cashout
+                    let token_id = match &bet.token_id {
+                        Some(tid) => tid.clone(),
+                        None => {
+                            // Try to get bet status from executor to discover token_id
+                            if let Ok(resp) = client.get(format!("{}/bet/{}", executor_url, bet.bet_id)).send().await {
+                                if let Ok(status) = resp.json::<serde_json::Value>().await {
+                                    if let Some(tid) = status.get("tokenId").and_then(|v| v.as_str()) {
+                                        bet.token_id = Some(tid.to_string());
+                                        tid.to_string()
+                                    } else if let Some(gid) = status.get("graphBetId").and_then(|v| v.as_str()) {
+                                        bet.graph_bet_id = Some(gid.to_string());
+                                        continue; // still no tokenId
                                     } else {
-                                        info!("Opp alert sent: {} edge={:.1}%", opp.match_key, opp.edge_pct);
-                                        sent_alerts.push(SentAlert {
-                                            match_key: alert_key,
-                                            sent_at: Utc::now(),
-                                        });
+                                        continue;
+                                    }
+                                } else { continue; }
+                            } else { continue; }
+                        }
+                    };
+
+                    // Check cashout availability
+                    let check_body = serde_json::json!({
+                        "tokenId": token_id,
+                    });
+                    let cashout_check = match client.post(format!("{}/check-cashout", executor_url))
+                        .json(&check_body).send().await {
+                        Ok(r) => r.json::<CashoutCheckResponse>().await.ok(),
+                        Err(_) => None,
+                    };
+
+                    if let Some(check) = cashout_check {
+                        if check.available.unwrap_or(false) {
+                            if let Some(odds_str) = &check.cashout_odds {
+                                let cashout_odds: f64 = odds_str.parse().unwrap_or(0.0);
+                                // Only cashout if profitable (cashout_odds > bet_odds means we can lock profit)
+                                let profit_pct = if bet.odds > 0.0 {
+                                    (cashout_odds / bet.odds - 1.0) * 100.0
+                                } else { 0.0 };
+
+                                if profit_pct >= CASHOUT_MIN_PROFIT_PCT {
+                                    info!("Auto-cashout #{}: odds {:.3} → cashout {:.3} (+{:.1}%)",
+                                        bet.alert_id, bet.odds, cashout_odds, profit_pct);
+
+                                    // Execute cashout
+                                    let cashout_body = serde_json::json!({
+                                        "tokenId": token_id,
+                                    });
+                                    match client.post(format!("{}/cashout", executor_url))
+                                        .json(&cashout_body).send().await {
+                                        Ok(resp) => {
+                                            match resp.json::<ExecutorCashoutResponse>().await {
+                                                Ok(cr) => {
+                                                    let state = cr.state.as_deref().unwrap_or("?");
+                                                    let _ = tg_send_message(&client, &token, chat_id,
+                                                        &format!(
+                                                            "💰 <b>AUTO-CASHOUT #{}</b>\n\n\
+                                                             {} vs {}\n\
+                                                             Bet: ${:.2} @ {:.2}\n\
+                                                             Cashout odds: {:.3}\n\
+                                                             Profit: <b>+{:.1}%</b>\n\
+                                                             Status: {}",
+                                                            bet.alert_id, bet.team1, bet.team2,
+                                                            bet.amount_usd, bet.odds,
+                                                            cashout_odds, profit_pct, state
+                                                        )
+                                                    ).await;
+                                                }
+                                                Err(e) => warn!("Cashout response parse error: {}", e),
+                                            }
+                                        }
+                                        Err(e) => warn!("Cashout request failed: {}", e),
                                     }
                                 }
                             }
-                            Err(e) => warn!("Failed to parse /opportunities: {}", e),
                         }
                     }
-                    Err(e) => warn!("Failed to fetch /opportunities: {}", e),
                 }
             }
 
@@ -711,119 +949,265 @@ async fn main() -> Result<()> {
                                 if msg.chat.id != chat_id { continue; }
                                 let text = msg.text.as_deref().unwrap_or("").trim();
 
-                                match text {
-                                    "/status" => {
-                                        let status = match client.get(format!("{}/health", feed_hub_url)).send().await {
-                                            Ok(r) => {
-                                                let health = r.text().await.unwrap_or_default();
-                                                match client.get(format!("{}/state", feed_hub_url)).send().await {
-                                                    Ok(sr) => {
-                                                        match sr.json::<StateResponse>().await {
-                                                            Ok(s) => {
-                                                                let azuro_count = s.odds.iter().filter(|o| o.payload.bookmaker.starts_with("azuro_")).count();
-                                                                let market_count = s.odds.iter().filter(|o| !o.payload.bookmaker.starts_with("azuro_")).count();
-                                                                format!(
-                                                                    "📊 <b>Status</b>\n\n\
-                                                                     Feed Hub: {}\n\
-                                                                     Connections: {}\n\
-                                                                     Live matches: {}\n\
-                                                                     Azuro odds: {}\n\
-                                                                     Market odds: {}\n\
-                                                                     Fused (matchable): {}\n\
-                                                                     Alerts sent: {} (cooldown {}s)",
-                                                                    health, s.connections, s.live_items,
-                                                                    azuro_count, market_count, s.fused_ready,
-                                                                    sent_alerts.len(), ALERT_COOLDOWN_SECS
-                                                                )
-                                                            }
-                                                            Err(_) => "Feed Hub /state error".to_string(),
-                                                        }
-                                                    }
-                                                    Err(_) => format!("Feed Hub health: {} (state err)", health),
-                                                }
-                                            }
-                                            Err(e) => format!("❌ Feed Hub offline: {}", e),
-                                        };
-                                        let _ = tg_send_message(&client, &token, chat_id, &status).await;
-                                    }
+                                // === Commands ===
+                                if text == "/status" {
+                                    let mut status_msg = String::new();
 
-                                    "/odds" => {
-                                        match client.get(format!("{}/state", feed_hub_url)).send().await {
-                                            Ok(resp) => {
-                                                match resp.json::<StateResponse>().await {
-                                                    Ok(state) => {
-                                                        let anomalies = find_odds_anomalies(&state);
-                                                        if anomalies.is_empty() {
-                                                            let _ = tg_send_message(&client, &token, chat_id, 
-                                                                "📭 Žádné odds anomálie právě teď.\nAzuro a trh se shodují."
-                                                            ).await;
-                                                        } else {
-                                                            let summary = anomalies.iter().take(5)
-                                                                .map(|a| {
-                                                                    let team = if a.value_side == 1 { &a.team1 } else { &a.team2 };
-                                                                    format!("• {} <b>+{:.1}%</b> ({})", team, a.discrepancy_pct, a.match_key)
-                                                                })
-                                                                .collect::<Vec<_>>()
-                                                                .join("\n");
-                                                            let msg = format!("📊 <b>Top {} anomálií:</b>\n\n{}", anomalies.len().min(5), summary);
-                                                            let _ = tg_send_message(&client, &token, chat_id, &msg).await;
-                                                            // Send top anomaly as full alert
-                                                            if let Some(top) = anomalies.first() {
-                                                                let _ = tg_send_message(&client, &token, chat_id, &format_anomaly_alert(top)).await;
-                                                            }
+                                    // Feed Hub status
+                                    match client.get(format!("{}/health", feed_hub_url)).send().await {
+                                        Ok(r) => {
+                                            let health = r.text().await.unwrap_or_default();
+                                            match client.get(format!("{}/state", feed_hub_url)).send().await {
+                                                Ok(sr) => {
+                                                    match sr.json::<StateResponse>().await {
+                                                        Ok(s) => {
+                                                            let azuro_count = s.odds.iter().filter(|o| o.payload.bookmaker.starts_with("azuro_")).count();
+                                                            let market_count = s.odds.iter().filter(|o| !o.payload.bookmaker.starts_with("azuro_")).count();
+                                                            status_msg.push_str(&format!(
+                                                                "📊 <b>Status</b>\n\n\
+                                                                 Feed Hub: {}\n\
+                                                                 Connections: {}\n\
+                                                                 Live matches: {}\n\
+                                                                 Azuro odds: {}\n\
+                                                                 Market odds: {}\n\
+                                                                 Fused: {}\n",
+                                                                health, s.connections, s.live_items,
+                                                                azuro_count, market_count, s.fused_ready
+                                                            ));
                                                         }
+                                                        Err(_) => status_msg.push_str("Feed Hub /state error\n"),
                                                     }
-                                                    Err(_) => { let _ = tg_send_message(&client, &token, chat_id, "❌ /state parse error").await; }
                                                 }
+                                                Err(_) => status_msg.push_str(&format!("Feed Hub health: {} (state err)\n", health)),
                                             }
-                                            Err(e) => { let _ = tg_send_message(&client, &token, chat_id, &format!("❌ Feed Hub offline: {}", e)).await; }
                                         }
+                                        Err(e) => status_msg.push_str(&format!("❌ Feed Hub offline: {}\n", e)),
+                                    };
+
+                                    // Executor status
+                                    match client.get(format!("{}/health", executor_url)).send().await {
+                                        Ok(resp) => {
+                                            match resp.json::<ExecutorHealthResponse>().await {
+                                                Ok(h) => {
+                                                    status_msg.push_str(&format!(
+                                                        "\n🔧 <b>Executor</b>\n\
+                                                         Wallet: <code>{}</code>\n\
+                                                         Balance: {} USDT\n\
+                                                         Allowance: {}\n",
+                                                        h.wallet.as_deref().unwrap_or("?"),
+                                                        h.balance.as_deref().unwrap_or("?"),
+                                                        h.relayer_allowance.as_deref().unwrap_or("?"),
+                                                    ));
+                                                }
+                                                Err(_) => status_msg.push_str("\n⚠️ Executor: nevalidní odpověď\n"),
+                                            }
+                                        }
+                                        Err(_) => status_msg.push_str("\n❌ Executor OFFLINE\n"),
+                                    };
+
+                                    status_msg.push_str(&format!(
+                                        "\nAlerts: {} (cooldown {}s)\nAktivní bety: {}",
+                                        sent_alerts.len(), ALERT_COOLDOWN_SECS, active_bets.len()
+                                    ));
+
+                                    let _ = tg_send_message(&client, &token, chat_id, &status_msg).await;
+
+                                } else if text == "/odds" {
+                                    match client.get(format!("{}/state", feed_hub_url)).send().await {
+                                        Ok(resp) => {
+                                            match resp.json::<StateResponse>().await {
+                                                Ok(state) => {
+                                                    let anomalies = find_odds_anomalies(&state);
+                                                    if anomalies.is_empty() {
+                                                        let _ = tg_send_message(&client, &token, chat_id,
+                                                            "📭 Žádné odds anomálie právě teď.\nAzuro a trh se shodují."
+                                                        ).await;
+                                                    } else {
+                                                        let summary = anomalies.iter().take(5)
+                                                            .map(|a| {
+                                                                let team = if a.value_side == 1 { &a.team1 } else { &a.team2 };
+                                                                format!("• {} <b>+{:.1}%</b> ({})", team, a.discrepancy_pct, a.match_key)
+                                                            })
+                                                            .collect::<Vec<_>>()
+                                                            .join("\n");
+                                                        let msg_text = format!("📊 <b>Top {} anomálií:</b>\n\n{}", anomalies.len().min(5), summary);
+                                                        let _ = tg_send_message(&client, &token, chat_id, &msg_text).await;
+                                                        // Send top anomaly as full alert
+                                                        if let Some(top) = anomalies.first() {
+                                                            alert_counter += 1;
+                                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                                &format_anomaly_alert(top, alert_counter)).await;
+                                                        }
+                                                    }
+                                                }
+                                                Err(_) => { let _ = tg_send_message(&client, &token, chat_id, "❌ /state parse error").await; }
+                                            }
+                                        }
+                                        Err(e) => { let _ = tg_send_message(&client, &token, chat_id, &format!("❌ Feed Hub offline: {}", e)).await; }
                                     }
 
-                                    "/help" => {
+                                } else if text == "/bets" {
+                                    if active_bets.is_empty() {
+                                        let _ = tg_send_message(&client, &token, chat_id, "📭 Žádné aktivní sázky.").await;
+                                    } else {
+                                        let bets_text = active_bets.iter().map(|b| {
+                                            format!("• #{} {} ${:.2} @ {:.2} ({})",
+                                                b.alert_id, b.value_team, b.amount_usd, b.odds, b.match_key)
+                                        }).collect::<Vec<_>>().join("\n");
                                         let _ = tg_send_message(&client, &token, chat_id,
-                                            "🤖 <b>RustMisko Alert Bot</b>\n\n\
-                                             Automaticky monitoruji Azuro vs trh (1xbit, HLTV).\n\
-                                             Když najdu >5% odds discrepancy, pošlu alert.\n\n\
-                                             <b>Commands:</b>\n\
-                                             /status — stav systému\n\
-                                             /odds — aktuální anomálie\n\
-                                             /help — tato zpráva\n\n\
-                                             <b>Na alert odpověz:</b>\n\
-                                             <code>YES $5</code> — sázka $5 (budoucí fáze)\n\
-                                             <code>NO</code> — skip\n\n\
-                                             Všechny tiers CS2 zápasů jsou monitorovány."
+                                            &format!("🎰 <b>Aktivní sázky ({})</b>\n\n{}", active_bets.len(), bets_text)
                                         ).await;
                                     }
 
-                                    t if t.to_uppercase().starts_with("YES") => {
-                                        // Parse amount: "YES $5" or "YES 5"
-                                        let amount_str = t[3..].trim().trim_start_matches('$').trim();
-                                        let amount: f64 = amount_str.parse().unwrap_or(5.0);
+                                } else if text == "/help" {
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        "🤖 <b>RustMisko Alert Bot v3</b>\n\n\
+                                         Automatický CS2 Azuro betting + auto-cashout.\n\n\
+                                         <b>Commands:</b>\n\
+                                         /status — systém + executor + wallet\n\
+                                         /odds — aktuální anomálie\n\
+                                         /bets — aktivní sázky\n\
+                                         /help — tato zpráva\n\n\
+                                         <b>Na alert odpověz:</b>\n\
+                                         <code>3 YES $5</code> — sázka $5 na alert #3\n\
+                                         <code>3 NO</code> — skip alert #3\n\n\
+                                         Auto-cashout: každých 30s kontroluji sázky.\n\
+                                         Profit ≥3% → automatický cashout + notifikace."
+                                    ).await;
+
+                                // === YES reply: place bet ===
+                                } else if let Some((mut aid, amount)) = parse_yes_reply(text) {
+                                    // aid=0 means "latest alert"
+                                    if aid == 0 {
+                                        aid = alert_counter;
+                                    }
+                                    if let Some(anomaly) = alert_map.get(&aid) {
+                                        // Check we have execution data
+                                        let condition_id = match &anomaly.condition_id {
+                                            Some(c) => c.clone(),
+                                            None => {
+                                                let _ = tg_send_message(&client, &token, chat_id,
+                                                    &format!("⚠️ Alert #{} nemá condition_id — nelze automaticky vsadit.", aid)
+                                                ).await;
+                                                continue;
+                                            }
+                                        };
+                                        let outcome_id = match &anomaly.outcome_id {
+                                            Some(o) => o.clone(),
+                                            None => {
+                                                let _ = tg_send_message(&client, &token, chat_id,
+                                                    &format!("⚠️ Alert #{} nemá outcome_id — nelze automaticky vsadit.", aid)
+                                                ).await;
+                                                continue;
+                                            }
+                                        };
+
+                                        let azuro_odds = if anomaly.value_side == 1 { anomaly.azuro_w1 } else { anomaly.azuro_w2 };
+                                        let value_team = if anomaly.value_side == 1 { &anomaly.team1 } else { &anomaly.team2 };
+
+                                        // Acknowledge
                                         let _ = tg_send_message(&client, &token, chat_id,
                                             &format!(
-                                                "🔧 <b>BET ACKNOWLEDGED</b>\n\
-                                                 Amount: ${:.2} USDC\n\n\
-                                                 ⚠️ Executor modul ještě není implementován.\n\
-                                                 Toto bude: EIP712 sign → Azuro Relayer → on-chain bet.\n\
-                                                 Prozatím: otevři Azuro link a vsaď manuálně.", amount
+                                                "⏳ <b>Placing bet #{}</b>\n\
+                                                 {} @ {:.2} | ${:.2}\n\
+                                                 Condition: {}\n\
+                                                 Outcome: {}\n\
+                                                 Posílám do executoru...",
+                                                aid, value_team, azuro_odds, amount,
+                                                condition_id, outcome_id
                                             )
+                                        ).await;
+
+                                        // POST to executor
+                                        let min_odds = (azuro_odds * 0.95 * 1e12) as u64; // 5% slippage, raw format
+                                        let amount_raw = (amount * 1e6) as u64; // USDT 6 decimals
+
+                                        let bet_body = serde_json::json!({
+                                            "conditionId": condition_id,
+                                            "outcomeId": outcome_id,
+                                            "amount": amount_raw.to_string(),
+                                            "minOdds": min_odds.to_string(),
+                                        });
+
+                                        match client.post(format!("{}/bet", executor_url))
+                                            .json(&bet_body).send().await {
+                                            Ok(resp) => {
+                                                match resp.json::<ExecutorBetResponse>().await {
+                                                    Ok(br) => {
+                                                        if let Some(err) = &br.error {
+                                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                                &format!("❌ <b>BET FAILED #{}</b>\n\nError: {}", aid, err)
+                                                            ).await;
+                                                        } else {
+                                                            let bet_id = br.bet_id.as_deref().unwrap_or("?");
+                                                            let state = br.state.as_deref().unwrap_or("?");
+
+                                                            active_bets.push(ActiveBet {
+                                                                alert_id: aid,
+                                                                bet_id: bet_id.to_string(),
+                                                                match_key: anomaly.match_key.clone(),
+                                                                team1: anomaly.team1.clone(),
+                                                                team2: anomaly.team2.clone(),
+                                                                value_team: value_team.to_string(),
+                                                                amount_usd: amount,
+                                                                odds: azuro_odds,
+                                                                placed_at: Utc::now().to_rfc3339(),
+                                                                condition_id: condition_id.clone(),
+                                                                outcome_id: outcome_id.clone(),
+                                                                graph_bet_id: None,
+                                                                token_id: None,
+                                                            });
+
+                                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                                &format!(
+                                                                    "✅ <b>BET PLACED #{}</b>\n\n\
+                                                                     {} @ {:.2} | ${:.2}\n\
+                                                                     Bet ID: <code>{}</code>\n\
+                                                                     State: {}\n\n\
+                                                                     Auto-cashout aktivní (≥{}% profit).",
+                                                                    aid, value_team, azuro_odds, amount,
+                                                                    bet_id, state, CASHOUT_MIN_PROFIT_PCT
+                                                                )
+                                                            ).await;
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tg_send_message(&client, &token, chat_id,
+                                                            &format!("❌ Executor bet response error: {}", e)
+                                                        ).await;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                let _ = tg_send_message(&client, &token, chat_id,
+                                                    &format!("❌ Executor nedostupný: {}\nSpusť: cd executor && node index.js", e)
+                                                ).await;
+                                            }
+                                        }
+                                    } else {
+                                        let _ = tg_send_message(&client, &token, chat_id,
+                                            &format!("⚠️ Alert #{} nenalezen. Možná expiroval (max 50 v paměti).", aid)
                                         ).await;
                                     }
 
-                                    "NO" | "no" | "SKIP" | "skip" => {
-                                        let _ = tg_send_message(&client, &token, chat_id, "⏭️ Skipped.").await;
-                                    }
+                                // === NO reply: skip ===
+                                } else if let Some(aid) = parse_no_reply(text) {
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        &format!("⏭️ Alert #{} přeskočen.", aid)
+                                    ).await;
 
-                                    _ => {
-                                        // Ignore unknown messages
-                                    }
+                                // Legacy NO/SKIP without number
+                                } else if text.eq_ignore_ascii_case("NO") || text.eq_ignore_ascii_case("SKIP") {
+                                    let _ = tg_send_message(&client, &token, chat_id, "⏭️ Skipped.").await;
+
+                                } else if text.starts_with("/") {
+                                    // Unknown command — ignore
                                 }
+                                // else: ignore non-command messages
                             }
                         }
                     }
                     Err(e) => {
-                        // Quiet — might be network blip
                         if Utc::now().timestamp() % 60 == 0 {
                             warn!("getUpdates err: {}", e);
                         }

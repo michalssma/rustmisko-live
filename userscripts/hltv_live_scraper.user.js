@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HLTV → Feed Hub Live Scraper
 // @namespace    rustmisko
-// @version      2.0
-// @description  Scrapes live CS2 matches from HLTV and sends to Feed Hub via WebSocket
+// @version      3.0
+// @description  Scrapes live CS2 matches from HLTV + auto-refresh to prevent stale data
 // @author       RustMisko
 // @match        https://www.hltv.org/matches*
 // @match        https://www.hltv.org/live*
@@ -24,12 +24,22 @@
   const SOURCE_NAME = "hltv-tm";
   const DEBUG = true;
 
+  // === AUTO-REFRESH CONFIG ===
+  // HLTV DOM goes stale when matches end — periodic reload fixes it
+  const AUTO_REFRESH_MS = 3 * 60 * 1000; // 3 minutes — full page reload
+  const STALE_DETECT_MS = 90 * 1000; // 90s — if same data, refresh early
+  const FINISHED_SCORE = 13; // CS2 match point — likely finished
+
   let ws = null;
   let connected = false;
   let sentCount = 0;
   let lastScan = [];
   let scanTimer = null;
   let hbTimer = null;
+  let refreshTimer = null;
+  let refreshAt = 0; // timestamp when next refresh happens
+  let lastScanHash = ""; // detect stale data
+  let staleStartedAt = 0; // when we first detected stale data
 
   const PREFIX = "[HLTV→Hub]";
   function log(...args) { console.log(PREFIX, ...args); }
@@ -51,18 +61,20 @@
     `;
     panel.innerHTML = `
       <div style="font-weight:bold; margin-bottom:6px; font-size:13px;">
-        🎮 HLTV → Feed Hub v2
+        🎮 HLTV → Feed Hub v3
       </div>
       <div id="fh-status">⏳ Connecting...</div>
       <div id="fh-matches">Matches: –</div>
       <div id="fh-sent">Sent: 0</div>
       <div id="fh-last">Last scan: –</div>
+      <div id="fh-refresh" style="color:#ff0;">🔄 Refresh: –</div>
       <div id="fh-detail" style="font-size:10px;color:#8f8;margin-top:4px;max-height:80px;overflow-y:auto;"></div>
       <div style="margin-top:6px; font-size:10px; color:#888;">
         <span>${WS_URL}</span>
       </div>
       <div style="margin-top:6px;">
         <button id="fh-btn-scan" style="background:#0a0;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;margin-right:4px;">Force Scan</button>
+        <button id="fh-btn-refresh" style="background:#a80;color:#fff;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;margin-right:4px;">Refresh Now</button>
         <button id="fh-btn-debug" style="background:#333;color:#ff0;border:none;padding:3px 8px;border-radius:4px;cursor:pointer;font-size:11px;">DOM Debug</button>
       </div>
     `;
@@ -85,6 +97,7 @@
     document.addEventListener("mouseup", () => { isDragging = false; });
 
     document.getElementById("fh-btn-scan").addEventListener("click", () => scanAndSend());
+    document.getElementById("fh-btn-refresh").addEventListener("click", () => doPageRefresh("manual"));
     document.getElementById("fh-btn-debug").addEventListener("click", () => domDiscovery());
   }
 
@@ -345,11 +358,100 @@
   }
 
   // ====================================================================
-  // SCAN LOOP
+  // AUTO-REFRESH — HLTV DOM goes stale when matches end
+  // ====================================================================
+  function doPageRefresh(reason) {
+    log(`🔄 Page refresh (${reason})...`);
+    // Save state for post-reload panel
+    try {
+      sessionStorage.setItem("fh_refresh_reason", reason);
+      sessionStorage.setItem("fh_refresh_time", Date.now().toString());
+      sessionStorage.setItem("fh_sent_count", sentCount.toString());
+    } catch (e) {}
+    location.reload();
+  }
+
+  function scheduleAutoRefresh() {
+    if (refreshTimer) clearTimeout(refreshTimer);
+    refreshAt = Date.now() + AUTO_REFRESH_MS;
+    refreshTimer = setTimeout(() => doPageRefresh("auto-timer"), AUTO_REFRESH_MS);
+    log(`🔄 Auto-refresh scheduled in ${AUTO_REFRESH_MS / 1000}s`);
+  }
+
+  function updateRefreshCountdown() {
+    const el = document.getElementById("fh-refresh");
+    if (!el) return;
+    const remaining = Math.max(0, Math.round((refreshAt - Date.now()) / 1000));
+    const mins = Math.floor(remaining / 60);
+    const secs = remaining % 60;
+    el.textContent = `🔄 Refresh: ${mins}:${secs.toString().padStart(2, "0")}`;
+    // Color: green when plenty of time, yellow under 60s, red under 15s
+    if (remaining < 15) el.style.color = "#f00";
+    else if (remaining < 60) el.style.color = "#ff0";
+    else el.style.color = "#8f8";
+  }
+
+  // Start countdown display updater (every second)
+  function startRefreshCountdown() {
+    setInterval(updateRefreshCountdown, 1000);
+  }
+
+  // Smart stale detection: if scan data hasn't changed → refresh early
+  function checkStaleData(matches) {
+    // Build hash of current scan data
+    const hash = matches.map(m =>
+      `${m.team1}|${m.team2}|${m.score1}-${m.score2}`
+    ).sort().join(";");
+
+    if (hash === lastScanHash && hash.length > 0) {
+      // Same data as before
+      if (staleStartedAt === 0) {
+        staleStartedAt = Date.now();
+      } else if (Date.now() - staleStartedAt > STALE_DETECT_MS) {
+        log("⚠️ Data stale for >90s — refreshing early");
+        doPageRefresh("stale-data");
+        return;
+      }
+    } else {
+      // Data changed — reset stale timer
+      staleStartedAt = 0;
+      lastScanHash = hash;
+    }
+
+    // Detect likely-finished matches: any team at 13+
+    for (const m of matches) {
+      if (m.score1 >= FINISHED_SCORE || m.score2 >= FINISHED_SCORE) {
+        // This match is probably over — mark data as potentially stale
+        if (staleStartedAt === 0) staleStartedAt = Date.now();
+        dbg(`⚠️ Match ${m.team1} vs ${m.team2} likely finished (${m.score1}-${m.score2})`);
+      }
+    }
+  }
+
+  // Recover state after reload
+  function recoverPostReload() {
+    try {
+      const reason = sessionStorage.getItem("fh_refresh_reason");
+      const prevSent = parseInt(sessionStorage.getItem("fh_sent_count") || "0");
+      if (reason) {
+        sentCount = prevSent;
+        log(`🔄 Reloaded (reason: ${reason}), preserving sent count: ${sentCount}`);
+        sessionStorage.removeItem("fh_refresh_reason");
+        sessionStorage.removeItem("fh_refresh_time");
+        sessionStorage.removeItem("fh_sent_count");
+      }
+    } catch (e) {}
+  }
+
+  // ====================================================================
+  // SCAN LOOP (updated with stale detection)
   // ====================================================================
   function scanAndSend() {
     const matches = scrapeMatches();
     lastScan = matches;
+
+    // Check for stale/finished matches → auto-refresh if needed
+    checkStaleData(matches);
 
     let detailHtml = "";
     for (const m of matches) {
@@ -381,9 +483,15 @@
   // INIT
   // ====================================================================
   function init() {
-    log("Initializing v2...");
+    log("Initializing v3 (auto-refresh)...");
     log(`Page: ${window.location.href}`);
-    setTimeout(() => { createPanel(); connectWS(); }, 2000);
+    recoverPostReload();
+    setTimeout(() => {
+      createPanel();
+      connectWS();
+      scheduleAutoRefresh();
+      startRefreshCountdown();
+    }, 2000);
   }
 
   init();

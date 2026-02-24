@@ -186,8 +186,9 @@ fn extract_teams(game: &AzuroGame) -> Option<(String, String)> {
     None
 }
 
-/// Extract match winner odds — first condition with exactly 2 outcomes
-fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64)> {
+/// Extract match winner odds + condition/outcome IDs
+/// Returns (odds1, odds2, condition_id, outcome1_id, outcome2_id)
+fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64, Option<String>, Option<String>, Option<String>)> {
     let conditions = game.conditions.as_ref()?;
 
     for cond in conditions {
@@ -199,18 +200,21 @@ fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64)> {
 
         let outcomes = cond.outcomes.as_ref()?;
         if outcomes.len() == 2 {
-            let odds1 = outcomes.iter()
-                .find(|o| o.sort_order == Some(0))
+            let out1 = outcomes.iter().find(|o| o.sort_order == Some(0));
+            let out2 = outcomes.iter().find(|o| o.sort_order == Some(1));
+
+            let odds1 = out1
                 .and_then(|o| o.current_odds.as_ref())
                 .and_then(|raw| parse_decimal_odds(raw));
-
-            let odds2 = outcomes.iter()
-                .find(|o| o.sort_order == Some(1))
+            let odds2 = out2
                 .and_then(|o| o.current_odds.as_ref())
                 .and_then(|raw| parse_decimal_odds(raw));
 
             if let (Some(o1), Some(o2)) = (odds1, odds2) {
-                return Some((o1, o2));
+                let cond_id = cond.id.clone();
+                let oid1 = out1.and_then(|o| o.id.clone());
+                let oid2 = out2.and_then(|o| o.id.clone());
+                return Some((o1, o2, cond_id, oid1, oid2));
             }
         }
     }
@@ -233,6 +237,12 @@ struct GameOdds {
     odds2: f64,
     game_id: String,
     state: String,
+    /// Azuro condition ID for match winner market
+    condition_id: Option<String>,
+    /// Outcome ID for team1 win (sortOrder=0)
+    outcome1_id: Option<String>,
+    /// Outcome ID for team2 win (sortOrder=1)
+    outcome2_id: Option<String>,
 }
 
 async fn poll_subgraph(
@@ -283,7 +293,7 @@ async fn poll_subgraph(
             Some(t) => t,
             None => continue,
         };
-        let (odds1, odds2) = match extract_match_winner_odds(g) {
+        let (odds1, odds2, condition_id, outcome1_id, outcome2_id) = match extract_match_winner_odds(g) {
             Some(o) => o,
             None => continue,
         };
@@ -293,6 +303,9 @@ async fn poll_subgraph(
             team1, team2, odds1, odds2,
             game_id: g.id.clone(),
             state,
+            condition_id,
+            outcome1_id,
+            outcome2_id,
         });
     }
 
@@ -363,6 +376,11 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
                     liquidity_usd: None,
                     spread_pct: None,
                     url: Some(format!("https://bookmaker.xyz/esports/cs2/{}", game.game_id)),
+                    game_id: Some(game.game_id.clone()),
+                    condition_id: game.condition_id.clone(),
+                    outcome1_id: game.outcome1_id.clone(),
+                    outcome2_id: game.outcome2_id.clone(),
+                    chain: Some(result.chain.to_string()),
                 };
 
                 let odds_key = OddsKey {
