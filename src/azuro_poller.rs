@@ -1,12 +1,17 @@
-//! Azuro Protocol GraphQL poller — stahuje CS2 odds z on-chain subgraph
+//! Azuro Protocol — data-feed subgraph poller pro CS2 odds
 //!
-//! Azuro je decentralizovaný bookmaker na Polygon/Gnosis/Base.
-//! Používáme The Graph subgraph pro structured query CS2 her s aktivními podmínkami.
-//! Výsledné odds se injektují do FeedHubState jako bookmaker "azuro".
+//! Používáme **data-feed** subgraph (thegraph-1.onchainfeed.org) který má:
+//! - Aktuální hry (Live, Prematch) s odds v decimálním formátu
+//! - Pole `state` (ne `status`), `conditions` s `outcomes.currentOdds`
+//! - Pokrytí: Polygon, Gnosis, Base, Chiliz
 //!
-//! Endpointy:
-//!   Polygon: https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3
-//!   Gnosis:  https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-gnosis-v3
+//! Client subgraph (thegraph.onchainfeed.org) je zastaralý a data nevrací!
+//!
+//! Endpointy data-feed (production):
+//!   Polygon: https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon
+//!   Gnosis:  https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-gnosis
+//!   Base:    https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base
+//!   Chiliz:  https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -20,7 +25,7 @@ use crate::{
 };
 
 // ====================================================================
-// Azuro GraphQL response types
+// GraphQL response types (data-feed subgraph schema)
 // ====================================================================
 
 #[derive(Debug, Deserialize)]
@@ -42,19 +47,13 @@ struct GqlData {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzuroGame {
-    /// On-chain game ID
     id: String,
-    /// Game title (e.g. "FURIA vs M80")
     title: Option<String>,
-    /// Unix timestamp
     starts_at: Option<String>,
-    /// "Created" | "Resolved" | "Canceled" | "Paused"
-    status: Option<String>,
-    /// Whether the game has active betting conditions
-    has_active_conditions: Option<bool>,
-    /// Participants (team names)
+    /// "Prematch" | "Live" | "PendingResolution" | "Resolved" | "Canceled"
+    state: Option<String>,
+    active_conditions_count: Option<i64>,
     participants: Option<Vec<AzuroParticipant>>,
-    /// Betting conditions with outcomes &  odds
     conditions: Option<Vec<AzuroCondition>>,
 }
 
@@ -68,92 +67,98 @@ struct AzuroParticipant {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzuroCondition {
-    condition_id: Option<String>,
-    status: Option<String>,
+    id: Option<String>,
+    /// "Active" | "Stopped" | "Resolved" | "Canceled"
+    state: Option<String>,
     outcomes: Option<Vec<AzuroOutcome>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AzuroOutcome {
-    outcome_id: Option<String>,
-    /// Raw odds from the AMM pool (string representation of a large integer)
-    /// Azuro stores odds as fixed-point: value / 10^12 gives decimal odds
+    id: Option<String>,
+    /// Decimal odds as string (e.g. "1.34", "2.86") — already decimal!
     current_odds: Option<String>,
-    /// Sort order: typically 1 = team1, 2 = team2
     sort_order: Option<i64>,
 }
 
 // ====================================================================
-// Constants
+// Data-feed subgraph endpoints (production)
 // ====================================================================
 
-const AZURO_POLYGON_SUBGRAPH: &str =
-    "https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3";
+/// Data-feed subgraphs — tyto mají aktuální hry a odds!
+const AZURO_FEED_POLYGON: &str =
+    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon";
+const AZURO_FEED_GNOSIS: &str =
+    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-gnosis";
+const AZURO_FEED_BASE: &str =
+    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base";
+const AZURO_FEED_CHILIZ: &str =
+    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz";
 
-const AZURO_GNOSIS_SUBGRAPH: &str =
-    "https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-gnosis-v3";
-
-/// Poll interval in seconds
+/// Poll interval
 const AZURO_POLL_INTERVAL_SECS: u64 = 30;
 
-/// GraphQL query to fetch CS2 games with active conditions and their outcomes
-const CS2_GAMES_QUERY: &str = r#"
-{
+/// GraphQL query — data-feed schema (state, not status; Active conditions)
+fn build_cs2_query() -> String {
+    let now_unix = Utc::now().timestamp();
+    // Fetch games starting in the past 6h (live) through next 24h (prematch)
+    let from = now_unix - 6 * 3600;
+    let to = now_unix + 24 * 3600;
+
+    format!(r#"{{
   games(
     first: 50
-    where: {
-      sport_: { slug: "cs2" }
-      status: Created
-      hasActiveConditions: true
-    }
+    where: {{
+      sport_: {{ slug: "cs2" }}
+      state_in: ["Prematch", "Live"]
+      startsAt_gte: "{from}"
+      startsAt_lte: "{to}"
+    }}
     orderBy: startsAt
     orderDirection: asc
-  ) {
+  ) {{
     id
     title
     startsAt
-    status
-    hasActiveConditions
-    participants(orderBy: sortOrder) {
+    state
+    activeConditionsCount
+    participants(orderBy: sortOrder) {{
       name
       sortOrder
-    }
+    }}
     conditions(
       first: 5
-      where: { status: Created }
-    ) {
-      conditionId
-      status
-      outcomes(orderBy: sortOrder) {
-        outcomeId
+      where: {{ state_in: ["Active", "Stopped"] }}
+    ) {{
+      id
+      state
+      outcomes(orderBy: sortOrder) {{
+        id
         currentOdds
         sortOrder
-      }
-    }
-  }
+      }}
+    }}
+  }}
+}}"#)
 }
-"#;
 
 // ====================================================================
-// Poller implementation
+// Odds parsing
 // ====================================================================
 
-/// Converts Azuro raw odds (fixed-point 10^12) to decimal odds
-fn parse_azuro_odds(raw: &str) -> Option<f64> {
+/// Parse decimal odds string — data-feed already gives decimal (e.g. "1.34")
+fn parse_decimal_odds(raw: &str) -> Option<f64> {
     let val: f64 = raw.parse().ok()?;
-    let decimal = val / 1_000_000_000_000.0;
-    // Sanity check: decimal odds should be >= 1.0
-    if decimal >= 1.01 && decimal <= 100.0 {
-        Some(decimal)
+    if val >= 1.01 && val <= 100.0 {
+        Some(val)
     } else {
         None
     }
 }
 
-/// Extract team names from AzuroGame, preferring participants over title
+/// Extract team names from participants, fallback to title parsing
 fn extract_teams(game: &AzuroGame) -> Option<(String, String)> {
-    // Try participants first (ordered by sortOrder)
     if let Some(participants) = &game.participants {
         if participants.len() >= 2 {
             let t1 = participants[0].name.as_deref().unwrap_or("").trim();
@@ -164,10 +169,10 @@ fn extract_teams(game: &AzuroGame) -> Option<(String, String)> {
         }
     }
 
-    // Fallback: parse title "Team1 vs Team2" or "Team1 - Team2"
+    // Fallback: title contains unicode separator or " vs "
     if let Some(title) = &game.title {
-        // Try " vs " first, then " - "
-        for sep in [" vs ", " - "] {
+        // Azuro uses \u{2013} (–) as separator in titles
+        for sep in [" \u{2013} ", " – ", " vs ", " - "] {
             if let Some(pos) = title.find(sep) {
                 let t1 = title[..pos].trim();
                 let t2 = title[(pos + sep.len())..].trim();
@@ -181,22 +186,28 @@ fn extract_teams(game: &AzuroGame) -> Option<(String, String)> {
     None
 }
 
-/// Extract match winner odds (the first condition with exactly 2 outcomes)
+/// Extract match winner odds — first condition with exactly 2 outcomes
 fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64)> {
     let conditions = game.conditions.as_ref()?;
 
     for cond in conditions {
+        // Prefer Active conditions
+        let cond_state = cond.state.as_deref().unwrap_or("");
+        if cond_state != "Active" && cond_state != "Stopped" {
+            continue;
+        }
+
         let outcomes = cond.outcomes.as_ref()?;
         if outcomes.len() == 2 {
             let odds1 = outcomes.iter()
-                .find(|o| o.sort_order == Some(1))
+                .find(|o| o.sort_order == Some(0))
                 .and_then(|o| o.current_odds.as_ref())
-                .and_then(|raw| parse_azuro_odds(raw));
+                .and_then(|raw| parse_decimal_odds(raw));
 
             let odds2 = outcomes.iter()
-                .find(|o| o.sort_order == Some(2))
+                .find(|o| o.sort_order == Some(1))
                 .and_then(|o| o.current_odds.as_ref())
-                .and_then(|raw| parse_azuro_odds(raw));
+                .and_then(|raw| parse_decimal_odds(raw));
 
             if let (Some(o1), Some(o2)) = (odds1, odds2) {
                 return Some((o1, o2));
@@ -206,73 +217,97 @@ fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64)> {
     None
 }
 
-/// Poll a single Azuro subgraph endpoint for CS2 games
+// ====================================================================
+// Subgraph polling
+// ====================================================================
+
+struct PollResult {
+    chain: &'static str,
+    games: Vec<GameOdds>,
+}
+
+struct GameOdds {
+    team1: String,
+    team2: String,
+    odds1: f64,
+    odds2: f64,
+    game_id: String,
+    state: String,
+}
+
 async fn poll_subgraph(
     client: &reqwest::Client,
     url: &str,
-    chain_name: &str,
-) -> Vec<(String, String, f64, f64, String)> {
-    // Returns Vec of (team1, team2, odds1, odds2, game_id)
-    let body = serde_json::json!({ "query": CS2_GAMES_QUERY });
+    chain: &'static str,
+) -> PollResult {
+    let query = build_cs2_query();
+    let body = serde_json::json!({ "query": query });
 
     let resp = match client.post(url).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
-            warn!("azuro {} fetch error: {}", chain_name, e);
-            return vec![];
+            warn!("azuro {} fetch error: {}", chain, e);
+            return PollResult { chain, games: vec![] };
         }
     };
 
-    let status = resp.status();
-    if !status.is_success() {
-        warn!("azuro {} HTTP {}", chain_name, status);
-        return vec![];
+    if !resp.status().is_success() {
+        warn!("azuro {} HTTP {}", chain, resp.status());
+        return PollResult { chain, games: vec![] };
     }
 
     let gql: GqlResponse = match resp.json().await {
         Ok(g) => g,
         Err(e) => {
-            warn!("azuro {} parse error: {}", chain_name, e);
-            return vec![];
+            warn!("azuro {} json parse error: {}", chain, e);
+            return PollResult { chain, games: vec![] };
         }
     };
 
     if let Some(errors) = &gql.errors {
         for e in errors {
-            warn!("azuro {} GQL error: {}", chain_name, e.message);
+            warn!("azuro {} GQL error: {}", chain, e.message);
         }
     }
 
-    let games = match gql.data.and_then(|d| d.games) {
+    let api_games = match gql.data.and_then(|d| d.games) {
         Some(g) => g,
         None => {
-            debug!("azuro {} no games returned", chain_name);
-            return vec![];
+            return PollResult { chain, games: vec![] };
         }
     };
 
-    let mut results = Vec::new();
-
-    for game in &games {
-        let (team1, team2) = match extract_teams(game) {
+    let mut games = Vec::new();
+    for g in &api_games {
+        let (team1, team2) = match extract_teams(g) {
             Some(t) => t,
             None => continue,
         };
-
-        let (odds1, odds2) = match extract_match_winner_odds(game) {
+        let (odds1, odds2) = match extract_match_winner_odds(g) {
             Some(o) => o,
             None => continue,
         };
+        let state = g.state.as_deref().unwrap_or("?").to_string();
 
-        results.push((team1, team2, odds1, odds2, game.id.clone()));
+        games.push(GameOdds {
+            team1, team2, odds1, odds2,
+            game_id: g.id.clone(),
+            state,
+        });
     }
 
-    results
+    PollResult { chain, games }
 }
 
-/// Main polling loop — runs forever, injecting Azuro odds into FeedHubState
+// ====================================================================
+// Main polling loop
+// ====================================================================
+
 pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
-    info!("azuro poller starting — polling every {}s for CS2 odds", AZURO_POLL_INTERVAL_SECS);
+    info!(
+        "azuro data-feed poller starting — polling every {}s for CS2 odds (Polygon+Gnosis+Base+Chiliz)",
+        AZURO_POLL_INTERVAL_SECS
+    );
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -280,97 +315,107 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         .build()
         .expect("failed to create reqwest client");
 
-    // Initial delay to let the rest of the system start
+    // Initial delay
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     loop {
         let now = Utc::now();
         let mut total_injected = 0usize;
+        let mut total_live = 0usize;
+        let mut total_prematch = 0usize;
 
-        // Poll both Polygon and Gnosis subgraphs
-        let (polygon_games, gnosis_games) = tokio::join!(
-            poll_subgraph(&client, AZURO_POLYGON_SUBGRAPH, "polygon"),
-            poll_subgraph(&client, AZURO_GNOSIS_SUBGRAPH, "gnosis"),
+        // Poll all 4 chains in parallel
+        let (polygon, gnosis, base, chiliz) = tokio::join!(
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon"),
+            poll_subgraph(&client, AZURO_FEED_GNOSIS, "gnosis"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base"),
+            poll_subgraph(&client, AZURO_FEED_CHILIZ, "chiliz"),
         );
 
-        // Merge results — prefer Polygon if same match exists on both
-        // Use match_key for dedup
+        // Merge results — dedup by match_key (prefer polygon > gnosis > base > chiliz)
         let mut seen_keys = std::collections::HashSet::new();
-        let all_games: Vec<_> = polygon_games.iter().map(|g| ("polygon", g))
-            .chain(gnosis_games.iter().map(|g| ("gnosis", g)))
-            .collect();
+        let all_results = [polygon, gnosis, base, chiliz];
 
-        for (chain, (team1, team2, odds1, odds2, game_id)) in &all_games {
-            let key = match_key("cs2", team1, team2);
+        for result in &all_results {
+            for game in &result.games {
+                let key = match_key("cs2", &game.team1, &game.team2);
 
-            // Skip if we already processed this match from another chain
-            if !seen_keys.insert(key.clone()) {
-                continue;
+                if !seen_keys.insert(key.clone()) {
+                    continue; // Already processed this match from higher-priority chain
+                }
+
+                match game.state.as_str() {
+                    "Live" => total_live += 1,
+                    "Prematch" => total_prematch += 1,
+                    _ => {}
+                }
+
+                let bookmaker_name = format!("azuro_{}", result.chain);
+
+                let payload = OddsPayload {
+                    sport: "cs2".to_string(),
+                    bookmaker: bookmaker_name.clone(),
+                    market: "match_winner".to_string(),
+                    team1: game.team1.clone(),
+                    team2: game.team2.clone(),
+                    odds_team1: game.odds1,
+                    odds_team2: game.odds2,
+                    liquidity_usd: None,
+                    spread_pct: None,
+                    url: Some(format!("https://bookmaker.xyz/esports/cs2/{}", game.game_id)),
+                };
+
+                let odds_key = OddsKey {
+                    match_key: key.clone(),
+                    bookmaker: bookmaker_name.clone(),
+                };
+
+                state.odds.write().await.insert(
+                    odds_key,
+                    OddsState {
+                        source: format!("azuro_{}", result.chain),
+                        seen_at: now,
+                        payload: payload.clone(),
+                    },
+                );
+
+                let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+                let _ = db_tx.try_send(DbMsg::OddsUpsert(DbOddsRow {
+                    ts: now,
+                    source: format!("azuro_{}", result.chain),
+                    sport: "cs2".to_string(),
+                    bookmaker: bookmaker_name,
+                    market: "match_winner".to_string(),
+                    team1: game.team1.clone(),
+                    team2: game.team2.clone(),
+                    match_key: key,
+                    odds_team1: game.odds1,
+                    odds_team2: game.odds2,
+                    liquidity_usd: None,
+                    spread_pct: None,
+                    payload_json,
+                }));
+
+                total_injected += 1;
             }
-
-            let bookmaker_name = format!("azuro_{}", chain);
-
-            let payload = OddsPayload {
-                sport: "cs2".to_string(),
-                bookmaker: bookmaker_name.clone(),
-                market: "match_winner".to_string(),
-                team1: team1.clone(),
-                team2: team2.clone(),
-                odds_team1: *odds1,
-                odds_team2: *odds2,
-                liquidity_usd: None, // Azuro AMM pool — TODO: extract from subgraph
-                spread_pct: None,
-                url: Some(format!("https://bookmaker.xyz/esports/cs2/{}", game_id)),
-            };
-
-            let odds_key = OddsKey {
-                match_key: key.clone(),
-                bookmaker: bookmaker_name.clone(),
-            };
-
-            // Inject into FeedHubState
-            state.odds.write().await.insert(
-                odds_key,
-                OddsState {
-                    source: format!("azuro_{}", chain),
-                    seen_at: now,
-                    payload: payload.clone(),
-                },
-            );
-
-            // Log to DB
-            let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
-            let _ = db_tx.try_send(DbMsg::OddsUpsert(DbOddsRow {
-                ts: now,
-                source: format!("azuro_{}", chain),
-                sport: "cs2".to_string(),
-                bookmaker: bookmaker_name,
-                market: "match_winner".to_string(),
-                team1: team1.clone(),
-                team2: team2.clone(),
-                match_key: key,
-                odds_team1: *odds1,
-                odds_team2: *odds2,
-                liquidity_usd: None,
-                spread_pct: None,
-                payload_json,
-            }));
-
-            total_injected += 1;
         }
 
         if total_injected > 0 {
             info!(
-                "azuro poll: injected {} CS2 odds entries (polygon={}, gnosis={})",
-                total_injected,
-                polygon_games.len(),
-                gnosis_games.len()
+                "azuro poll OK: {} CS2 games injected ({} live, {} prematch) — poly={} gno={} base={} chz={}",
+                total_injected, total_live, total_prematch,
+                all_results[0].games.len(),
+                all_results[1].games.len(),
+                all_results[2].games.len(),
+                all_results[3].games.len(),
             );
         } else {
-            debug!(
-                "azuro poll: 0 active CS2 games (polygon={}, gnosis={})",
-                polygon_games.len(),
-                gnosis_games.len()
+            info!(
+                "azuro poll: 0 CS2 games with odds right now (poly={} gno={} base={} chz={})",
+                all_results[0].games.len(),
+                all_results[1].games.len(),
+                all_results[2].games.len(),
+                all_results[3].games.len(),
             );
         }
 
