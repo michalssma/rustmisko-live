@@ -1,8 +1,7 @@
 # RustMiskoLive — Implementační plán
 
-# Naposledy aktualizováno: 2026-02-25
-
-# Status: PHASE 5 — AZURO CROSS-PLATFORM ARB (LIVE)
+Aktualizováno: 2026-02-24
+Status: **PHASE 6 COMPLETE — LIVE EXECUTION**
 
 ---
 
@@ -14,73 +13,27 @@
 │                                                                  │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐ │
 │  │ HLTV.org    │  │ Bo3.gg       │  │ Azuro Protocol          │ │
-│  │ Tampermonkey│  │ Tampermonkey │  │ (Rust-native GraphQL)   │ │
-│  │ v2+ scraper │  │ v3 scraper   │  │ Polygon + Gnosis        │ │
-│  │ live+odds   │  │ 1xbit odds   │  │ 30s poll interval       │ │
+│  │ Tampermonkey│  │ Tampermonkey │  │ (Rust GraphQL poller)   │ │
+│  │ v3 scraper  │  │ v3 scraper   │  │ 4 chainy, 30s poll      │ │
+│  │ auto-refresh│  │ 1xbit odds   │  │                         │ │
 │  └──────┬──────┘  └──────┬───────┘  └──────────┬──────────────┘ │
 │         │ WS             │ WS                   │ reqwest        │
 └─────────┼────────────────┼──────────────────────┼────────────────┘
-          │                │                      │
           ▼                ▼                      ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                     FEED HUB (Rust, tokio)                      │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ WS Server (port 8080)                                      │ │
-│  │ FeedEnvelope → LiveMatchPayload / OddsPayload              │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ State: HashMap<String, LiveMatchState>                      │ │
-│  │        HashMap<OddsKey, OddsState>                          │ │
-│  │ OddsKey = { match_key, bookmaker }                          │ │
-│  │ match_key = "cs2::team_a_vs_team_b" (alphabetical)          │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ Azuro Poller (azuro_poller.rs)                              │ │
-│  │ GraphQL → parse → inject as azuro_polygon/azuro_gnosis      │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ HTTP Server (port 8081)                                     │ │
-│  │ GET /health | /state | /opportunities                       │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │ SQLite (WAL) + JSONL logs                                   │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
-          │
-          ▼
+│  WS 8080 + HTTP 8081 + SQLite + Azuro poller                    │
+└──────────────────────────────┬───────────────────────────────────┘
+                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                   OPPORTUNITIES ENGINE                           │
-│                                                                  │
-│  For each fused match (live + odds from ≥1 bookmaker):           │
-│                                                                  │
-│  1. SCORE_MOMENTUM:                                              │
-│     score_diff ≥ 3 && implied_prob > 40% → fair estimate +15%    │
-│     → edge > 3% triggers opportunity                             │
-│                                                                  │
-│  2. TIGHT_SPREAD_UNDERDOG:                                       │
-│     spread < 3% && underdog_odds > 2.5 → +5% fair value          │
-│                                                                  │
-│  3. ARB_CROSS_BOOK: ← PRIMARY PROFIT SOURCE                     │
-│     1/odds_A_team1 + 1/odds_B_team2 < 1.0                       │
-│     Example: 1xbit t1@2.10 + azuro_polygon t2@2.05              │
-│     → arb = 1/2.10 + 1/2.05 = 0.964 → 3.6% guaranteed profit   │
-│                                                                  │
-│  Sorted by edge_pct descending                                   │
-└──────────────────────────────────────────────────────────────────┘
-          │
-          ▼ (future)
+│                     ALERT BOT (Rust, tokio)                     │
+│  Telegram alerts + YES/NO reply handling + confidence scoring   │
+└──────────────────────────────┬───────────────────────────────────┘
+                               ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                   EXECUTION LAYER (TODO)                         │
-│                                                                  │
-│  Azuro: EIP712 signature → Relayer → Polygon smart contract      │
-│  Wallet: USDC on Polygon                                         │
-│  Risk: Max stake per bet, kelly criterion sizing                 │
-│  Alerts: Telegram bot notifications                              │
+│                EXECUTOR (Node.js, viem, @azuro-org/toolkit)     │
+│  Port 3030 — LIVE MODE — on-chain bet/cashout na Polygon        │
+│  Wallet: 0x8226D38e... | 33.77 USDT | UNLIMITED allowance      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -89,60 +42,58 @@
 ## Implementační fáze
 
 ### ✅ PHASE 1 — Data Infrastructure (HOTOVO)
-
 - [x] WS server (tokio-tungstenite) na portu 8080
 - [x] HTTP API server na portu 8081
 - [x] FeedEnvelope parsing (v1, live_match/odds/heartbeat)
 - [x] SQLite persistence s WAL mode
 - [x] JSONL event logging
-- [x] Staleness cleanup (120s cutoff)
-- [x] Heartbeat summary (10s interval)
+- [x] Staleness cleanup (120s)
 
 ### ✅ PHASE 2 — Browser Scraping (HOTOVO)
-
-- [x] HLTV Tampermonkey scraper v2+ (URL slug parsing, TextNode walker)
-- [x] Bo3.gg odds scraper v3 (TreeWalker, multi-bookmaker, 36-43 entries)
+- [x] HLTV v3: auto-refresh, stale detection, countdown, Refresh Now button
+- [x] Bo3.gg v3: TreeWalker, multi-bookmaker, 36-43 entries
 - [x] WS connection to Feed Hub
 - [x] Order-independent match_key normalization
 
 ### ✅ PHASE 3 — Opportunities Engine (HOTOVO)
-
 - [x] score_momentum detection
-- [x] tight_spread_underdog detection
-- [x] arb_cross_book detection (multi-bookmaker)
+- [x] odds_anomaly detection (formerly tight_spread_underdog)
+- [x] arb_cross_book detection (disabled in alerts, covered by odds_anomaly)
 - [x] /opportunities HTTP endpoint
 - [x] Edge sorting (descending)
 
 ### ✅ PHASE 4 — Azuro Integration (HOTOVO)
-
 - [x] Platform research: SX Bet ❌, Polymarket ❌, Overtime ❌, Azuro ✅
-- [x] GraphQL subgraph query design (CS2 sport slug, Created status, active conditions)
-- [x] `azuro_poller.rs` — Rust-native poller module
-- [x] Polygon + Gnosis dual-chain polling (30s interval)
-- [x] Azuro odds parsing (fixed-point 10^12 → decimal)
-- [x] Team extraction (participants + title fallback)
-- [x] Match winner condition extraction (2-outcome filter)
-- [x] Injection into FeedHubState as `azuro_polygon` / `azuro_gnosis`
-- [x] DB logging of Azuro odds
-- [x] Cross-platform arb: 1xbit vs azuro works automatically
+- [x] `azuro_poller.rs` — 4 chainy (Polygon, Gnosis, Base, Chiliz)
+- [x] CS2 match_winner parsing s conditionId + outcomeId propagací
+- [x] Injection jako `azuro_polygon` / `azuro_base` etc.
 
-### 🔄 PHASE 5 — Execution Layer (NEXT)
+### ✅ PHASE 5 — Alert Bot (HOTOVO)
+- [x] Telegram bot s numbered alerts (#1, #2, ...)
+- [x] Confidence scoring (0-100)
+- [x] YES parser: `3 YES $5`, `3 YES`, `YES $5`, `YES`
+- [x] Executor HTTP integration
+- [x] Dry-run vs LIVE detection
+- [x] Active bets tracking
 
-- [ ] Polygon wallet setup (USDC)
-- [ ] ethers-rs / alloy crate pro EIP712 signing
-- [ ] Azuro Relayer API integration
-- [ ] Bet placement flow: detect arb → sign → submit → confirm
+### ✅ PHASE 6 — Execution Layer (HOTOVO — LIVE)
+- [x] Node.js executor sidecar (`executor/index.js`)
+- [x] Azuro V3 bet placement via `@azuro-org/toolkit` + `viem`
+- [x] Polygon wallet setup (USDT)
+- [x] USDT approval for Azuro Relayer (UNLIMITED)
+- [x] /bet, /cashout, /approve, /balance, /health endpoints
+- [x] DRY-RUN mode (bez PRIVATE_KEY)
+- [x] LIVE mode s reálným private key
+- [x] RPC: `https://1rpc.io/matic`
+
+### 📋 PHASE 7 — Optimization (NEXT)
+- [ ] Azuro WebSocket live odds (`wss://streams.onchainfeed.org`)
+- [ ] Team name fuzzy matching cross-platform
 - [ ] Kelly criterion stake sizing
 - [ ] Max loss per day limity
-- [ ] Telegram alert bot
-
-### 📋 PHASE 6 — Optimization
-
-- [ ] Azuro WebSocket live odds (`wss://streams.onchainfeed.org`) místo 30s polling
-- [ ] Team name fuzzy matching cross-platform
-- [ ] Azuro liquidity extraction z subgraph
-- [ ] Multi-chain optimization (Polygon vs Gnosis vs Base — nejnižší fees)
-- [ ] Historical arb edge tracking + profitability reporting
+- [ ] Multi-chain optimization (Polygon vs Base fees)
+- [ ] Historical profitability tracking + reporting
+- [ ] Azuro liquidity extraction pro lepší sizing
 
 ---
 
@@ -150,26 +101,11 @@
 
 | Soubor | Účel |
 |--------|------|
-| `src/feed_hub.rs` | Hlavní binary — WS + HTTP server, opportunities engine |
-| `src/azuro_poller.rs` | Azuro GraphQL poller (Polygon + Gnosis) |
-| `src/feed_db.rs` | SQLite persistence (WAL mode) |
-| `userscripts/hltv_live_scraper.user.js` | HLTV Tampermonkey scraper v2+ |
+| `src/feed_hub.rs` | Feed Hub binary — WS + HTTP + opportunities |
+| `src/azuro_poller.rs` | Azuro GraphQL poller (4 chainy) |
+| `src/feed_db.rs` | SQLite persistence |
+| `src/bin/alert_bot.rs` | Telegram alert bot + executor |
+| `executor/index.js` | Node.js executor (Azuro on-chain) |
+| `userscripts/hltv_live_scraper.user.js` | HLTV scraper v3 |
 | `userscripts/odds_scraper.user.js` | Bo3.gg odds scraper v3 |
-| `crates/logger/` | JSONL event logging |
-| `crates/arb_detector/` | SX Bet cache (legacy, deprecated) |
-| `crates/esports_monitor/` | GosuGamers/VLR.gg scrapers (legacy) |
-| `crates/prediction_engine/` | Match prediction (legacy) |
-
----
-
-## Klíčové endpointy
-
-| Endpoint | Popis |
-|----------|-------|
-| `ws://0.0.0.0:8080/feed` | WS ingest (Tampermonkey → Feed Hub) |
-| `http://0.0.0.0:8081/health` | Health check |
-| `http://0.0.0.0:8081/state` | Current state (live + odds) |
-| `http://0.0.0.0:8081/opportunities` | Detected arb/value opportunities |
-| Azuro Polygon subgraph | `https://thegraph.onchainfeed.org/.../azuro-api-polygon-v3` |
-| Azuro Gnosis subgraph | `https://thegraph.onchainfeed.org/.../azuro-api-gnosis-v3` |
-| Azuro WebSocket | `wss://streams.onchainfeed.org/v1/streams/feed` |
+| `crates/logger/` | JSONL logging |

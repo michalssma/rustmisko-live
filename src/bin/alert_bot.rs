@@ -1142,24 +1142,40 @@ async fn main() -> Result<()> {
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let state = br.state.as_deref().unwrap_or("?");
 
-                                                            active_bets.push(ActiveBet {
-                                                                alert_id: aid,
-                                                                bet_id: bet_id.to_string(),
-                                                                match_key: anomaly.match_key.clone(),
-                                                                team1: anomaly.team1.clone(),
-                                                                team2: anomaly.team2.clone(),
-                                                                value_team: value_team.to_string(),
-                                                                amount_usd: amount,
-                                                                odds: azuro_odds,
-                                                                placed_at: Utc::now().to_rfc3339(),
-                                                                condition_id: condition_id.clone(),
-                                                                outcome_id: outcome_id.clone(),
-                                                                graph_bet_id: None,
-                                                                token_id: None,
-                                                            });
+                                                            let is_dry_run = state == "DRY-RUN" || bet_id.starts_with("dry-");
 
-                                                            let _ = tg_send_message(&client, &token, chat_id,
-                                                                &format!(
+                                                            // Don't track dry-run bets as active
+                                                            if !is_dry_run {
+                                                                active_bets.push(ActiveBet {
+                                                                    alert_id: aid,
+                                                                    bet_id: bet_id.to_string(),
+                                                                    match_key: anomaly.match_key.clone(),
+                                                                    team1: anomaly.team1.clone(),
+                                                                    team2: anomaly.team2.clone(),
+                                                                    value_team: value_team.to_string(),
+                                                                    amount_usd: amount,
+                                                                    odds: azuro_odds,
+                                                                    placed_at: Utc::now().to_rfc3339(),
+                                                                    condition_id: condition_id.clone(),
+                                                                    outcome_id: outcome_id.clone(),
+                                                                    graph_bet_id: None,
+                                                                    token_id: None,
+                                                                });
+                                                            }
+
+                                                            let msg = if is_dry_run {
+                                                                format!(
+                                                                    "🧪 <b>DRY-RUN #{}</b> (SIMULACE)\n\n\
+                                                                     {} @ {:.2} | ${:.2}\n\n\
+                                                                     ⚠️ Bet NEBYL odeslán on-chain!\n\
+                                                                     Executor běží bez PRIVATE_KEY.\n\
+                                                                     Pro reálné bety nastav v terminálu:\n\
+                                                                     <code>$env:PRIVATE_KEY=\"0x...\"</code>\n\
+                                                                     a restartuj executor.",
+                                                                    aid, value_team, azuro_odds, amount
+                                                                )
+                                                            } else {
+                                                                format!(
                                                                     "✅ <b>BET PLACED #{}</b>\n\n\
                                                                      {} @ {:.2} | ${:.2}\n\
                                                                      Bet ID: <code>{}</code>\n\
@@ -1168,7 +1184,9 @@ async fn main() -> Result<()> {
                                                                     aid, value_team, azuro_odds, amount,
                                                                     bet_id, state, CASHOUT_MIN_PROFIT_PCT
                                                                 )
-                                                            ).await;
+                                                            };
+
+                                                            let _ = tg_send_message(&client, &token, chat_id, &msg).await;
                                                         }
                                                     }
                                                     Err(e) => {

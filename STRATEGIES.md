@@ -1,161 +1,90 @@
 # RustMiskoLive — Projednané strategie
 
-# Naposledy aktualizováno: 2026-02-25
-
-# Stav: AZURO PROTOCOL = PRIMÁRNÍ EXECUTION PLATFORMA
+Aktualizováno: 2026-02-24
+Stav: **AZURO PROTOCOL = LIVE EXECUTION PLATFORMA**
 
 ---
 
-## ✅ AKTIVNÍ STRATEGIE
+## ✅ AKTIVNÍ STRATEGIE (LIVE)
 
-### ✅ Azuro Protocol (Cross-Platform CS2 Arb) → THE WINNING STRATEGY
+### ✅ Azuro Protocol (Cross-Platform CS2 Arb) — LIVE EXECUTION
 
-**Status: INTEGROVÁNO A PRODUKČNÍ (Azuro poller v feed_hub)**
+**Status: LIVE — reálné sázky na Polygon**
 
-Decentralizovaný on-chain bookmaker na Polygon/Gnosis/Base. **MASIVNÍ CS2 pokrytí** — desítky zápasů denně s live odds.
+Decentralizovaný on-chain bookmaker na Polygon. **MASIVNÍ CS2 pokrytí** — desítky zápasů denně.
 
 **Proč Azuro vyhrává:**
-- **NO KYC** — wallet-only, žádná registrace, žádné geo-blocky
-- **Polygon USDC** — nízké gas fees, rychlé transakce
-- **GraphQL API** — structured data, žádný DOM scraping, spolehlivé
-- **AMM pool** — odds driven by liquidity pool, ne bookmaker
-- **Cross-platform arb** — porovnáváme 1xbit/hltv odds vs azuro on-chain odds
-- **Automated execution** — EIP712 signature → Relayer → on-chain bet placement
+- **NO KYC** — wallet-only, žádné geo-blocky
+- **Polygon USDT** — nízké gas fees
+- **GraphQL API** — structured data, spolehlivé
+- **AMM pool** — odds driven by liquidity pool
+- **Cross-platform arb** — 1xbit/hltv odds vs azuro on-chain odds
+- **Automated execution** — EIP712 → Relayer → on-chain
 
 **Technické detaily:**
-- Subgraph Polygon: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3`
-- Subgraph Gnosis: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-gnosis-v3`
-- WebSocket live: `wss://streams.onchainfeed.org/v1/streams/feed`
-- CS2 sport: `id: 1061`, `slug: cs2`
-- Odds format: fixed-point `value / 10^12` → decimal
-- Frontend: bookmaker.xyz
-- Dokumentace: gem.azuro.org
+- Subgraph: `thegraph-1.onchainfeed.org` (data-feed)
+- CS2 sport: `id: 1061`
+- RPC: `https://1rpc.io/matic`
+- Wallet: `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00`
+- Balance: 33.77 USDT
+- Relayer: UNLIMITED allowance
 
 **Implementováno v kódu:**
-- `src/azuro_poller.rs` — GraphQL poller, 30s interval
-- Injektuje do FeedHubState jako `bookmaker: "azuro_polygon"` / `"azuro_gnosis"`
-- Cross-book arb detection funguje automaticky v `build_opportunities()`
+- `src/azuro_poller.rs` — GraphQL poller, 30s interval, 4 chainy
+- `executor/index.js` — Node.js bet/cashout execution
+- `src/bin/alert_bot.rs` — Telegram alerts + YES→bet flow
 
 ---
 
-### ✅ Tampermonkey + Feed Hub (Data Fusion)
+### ✅ Tampermonkey + Feed Hub (Data Fusion) — LIVE
 
 **Status: PRODUKČNÍ**
 
-Browser-based scraping + Rust WS server = nejspolehlivější combo pro live esport data.
-- HLTV scraper v2+ (live matches + featured odds)
-- Bo3.gg odds scraper v3 (multi-bookmaker, 36-43 entries per scan)
+- HLTV scraper v3 (auto-refresh, stale detection)
+- Bo3.gg odds scraper v3 (multi-bookmaker)
 - Feed Hub: WS 8080 + HTTP 8081
 
 ---
 
-## ❌ ZAMÍTNUTO / VYŠETŘENO A ZAVRŽENO
+## ❌ ZAMÍTNUTO
 
-### ❌ SX Bet (Esports Oracle Lag)
-
-**ZAMÍTNUTO: ZERO CS2 markets**
-
-Původně označeno jako "THE WINNING STRATEGY" — ALE API vyšetření ukázalo:
-- sportId=9 ("E Sports") má POUZE LoL LPL (2 zápasy: Weibo vs IG, Bilibili vs NiP)
-- **ŽÁDNÉ CS2 markets. Vůbec.**
-- Oracle lag strategie (10-25 min) je teoreticky validní, ale bez CS2 marketů nepoužitelná
-
-**Verdikt:** SX Bet je mrtvý pro naše účely. Azuro ho kompletně nahradil.
-
----
+### ❌ SX Bet
+**ZAMÍTNUTO: ZERO CS2 markets.** Pouze LoL LPL (2 zápasy).
 
 ### ❌ Polymarket
-
-**ZAMÍTNUTO: ZERO esports**
-
-Events API prozkoumáno s tagy esports/gaming/cs2 — vrací POUZE:
-- Politika (Biden, Trump, Starmer)
-- Geopolitika (Ukraine/Russia)
-- Sporty (FIFA WC 2026, NHL, NBA)
-- Jediný historický esports market: LoL Worlds 2020 (uzavřen, $84K volume)
-
-**Verdikt:** Polymarket nemá a nebude mít per-match esports betting.
-
----
+**ZAMÍTNUTO: ZERO esports.** Pouze politika/geopolitika.
 
 ### ❌ Overtime / Thales
-
-**ZAMÍTNUTO: DEPRECATED**
-
-API endpointy nefunkční. Projekt patrně migoval nebo ukončil provoz.
-
----
+**ZAMÍTNUTO: DEPRECATED.** API nefunkční.
 
 ### ❌ Betfair Exchange
-
-**BLOKOVÁNO: CZ geoblocking**
-
-Betfair.com i developer.betfair.com hlásí "Czech Republic unavailable".
-Stream API je technicky ideální pro in-play lag arb, ale bez přístupu nepoužitelné.
-
-**Co by pomohlo:** UK VPN + UK legal entity. Risk: ToS Section 6.3 zakazuje VPN.
-
----
+**BLOKOVÁNO: CZ geoblocking.** Vyžaduje UK VPN + UK entity.
 
 ### ❌ Smarkets
-
-**BLOKOVÁNO: CZ 404**
-
-smarkets.com/register vrací 404 z CZ. 2% commission by byla ideální pro arb.
-
----
+**BLOKOVÁNO: CZ 404.**
 
 ### ❌ Pinnacle API
-
-**BLOKOVÁNO: 401 bez auth**
-
-Free read-only API vyžaduje funded account pro přihlašovací údaje.
+**BLOKOVÁNO: 401 bez auth.**
 
 ---
 
-### ❌ OddsPortal / Tipsport
-
-**ZAMÍTNUTO: nestabilní scraping / interní API bez dokumentace**
-
----
-
-## 🟡 BUDOUCÍ ROZŠÍŘENÍ
+## 📋 BUDOUCÍ ROZŠÍŘENÍ
 
 ### 🟡 Azuro WebSocket (Live Odds Stream)
+`wss://streams.onchainfeed.org/v1/streams/feed` — sub-second odds místo 30s polling.
 
-**Status: Endpoint známý, neimplementováno**
+### 🟡 Kelly Criterion Stake Sizing
+Automatický výpočet optimální velikosti sázky na základě edge a bankrollu.
 
-`wss://streams.onchainfeed.org/v1/streams/feed` — sub-second odds updates místo 30s polling.
-Implementovat až po ověření základního polling flow.
-
-### 🟡 Azuro Bet Execution
-
-**Status: API prostudováno, neimplementováno**
-
-EIP712 signing → Relayer submission. Vyžaduje:
-1. Polygon wallet s USDC
-2. ethers-rs nebo alloy pro signing
-3. Relayer API integration
-
-### 🟡 odds-api.io (Small League Mispricing)
-
-**Status: API key k dispozici, neotestováno**
-
-```
-ODDSAPI_KEY=edf29a96be1a0f82a5f2507494e05f88d4d1508912fd54d2878c187767247b13
-```
-
-100 req/h free tier. Endpoint `/arbitrage-bets` vrací hotové arb příležitosti.
+### 🟡 Multi-Chain Optimization
+Porovnání fees: Polygon vs Base vs Gnosis — automatický výběr nejlevnějšího chainu.
 
 ---
 
-## Závěr: Aktuální priorita
+## Závěr
 
 ```
-PRIMÁRNÍ:  Azuro Protocol × Tampermonkey odds → cross-platform CS2 arb
-SEKUNDÁRNÍ: Azuro WebSocket pro real-time + wallet execution
-TERCIÁRNÍ: odds-api.io pro doplňkové small-league mispricing
+PRIMÁRNÍ:  Azuro Protocol × Tampermonkey odds → LIVE cross-platform CS2 arb
+LIVE:      33.77 USDT na Polygon, executor běží, alerty fungují
+NEXT:      WebSocket live odds + Kelly criterion sizing
 ```
-
-Azuro je JEDINÁ viable crypto platforma pro CS2 per-match betting.
-Systém je architektonicky hotový, zbývá execution layer.
