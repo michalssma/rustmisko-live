@@ -73,13 +73,15 @@ Hlavním cílem je **cross-platform arbitráž** mezi tradičními bookery (1xbi
    - `arb_cross_book`: **cross-bookmaker arbitrage** (best odds from 2 bookies < 100%)
    - Historically detected: 21.89%, 5.91%, 2.91%, 2.72% edge signals
 
-4. **Azuro Protocol integration** (NOVÉ!)
+4. **Azuro Protocol integration** (OPRAVENO 2026-02-24)
    - `azuro_poller.rs` — Rust-native GraphQL poller
-   - Polluje Polygon + Gnosis subgraphs každých 30s
+   - Používá **data-feed subgraph** (`thegraph-1.onchainfeed.org`) — NE client subgraph!
+   - Polluje 4 chainy paralelně: Polygon, Gnosis, Base, Chiliz (každých 30s)
    - Parsuje CS2 hry s aktivními podmínkami (match_winner market)
-   - Konvertuje Azuro fixed-point odds (10^12) na decimální
-   - Injektuje jako `bookmaker: "azuro_polygon"` / `"azuro_gnosis"` do FeedHubState
-   - Cross-platform arb detection funguje automaticky (1xbit vs azuro)
+   - Odds jsou v decimálním formátu přímo ze subgraphu (NENÍ potřeba dělit 10^12)
+   - Injektuje jako `bookmaker: "azuro_polygon"` / `"azuro_base"` atd.
+   - **RUNTIME OVĚŘENO**: 26 CS2 her (10 live, 16 prematch), 21 odds v /state
+   - **ARB DETEKCE FUNGUJE**: 16.73% edge na cs2::csdiilit_vs_los_kogutos (1xbit vs azuro_polygon)
 
 ---
 
@@ -99,9 +101,13 @@ Hlavním cílem je **cross-platform arbitráž** mezi tradičními bookery (1xbi
 - **Typ**: Decentralizovaný on-chain bookmaker (AMM pool)
 - **Chains**: Polygon (USDC), Gnosis, Base
 - **KYC**: ŽÁDNÉ — wallet-only přístup
-- **API**: GraphQL subgraph (The Graph)
-  - Polygon: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-polygon-v3`
-  - Gnosis: `https://thegraph.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-api-gnosis-v3`
+- **API**: GraphQL subgraph (The Graph) — **POZOR: 2 typy subgraphů!**
+  - **Data-feed** (SPRÁVNÝ, aktuální data): `thegraph-1.onchainfeed.org`
+    - Polygon: `https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon`
+    - Base: `https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base`
+    - Gnosis: `https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-gnosis`
+    - Chiliz: `https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz`
+  - **Client** (NEPOUŽÍVAT, stale data z květen 2025): `thegraph.onchainfeed.org`
 - **WebSocket**: `wss://streams.onchainfeed.org/v1/streams/feed` (live odds stream)
 - **Frontend**: bookmaker.xyz
 - **CS2 turnaje**: CCT, ESL Challenger, PGL Bucharest, BetBoom RUSH B, NODWIN Clutch, European Pro League
