@@ -21,6 +21,8 @@
 
 ### **Milník 0.3: Rust feed fusion PoC** 🔄
 - [ ] Potvrdit příjem dat z browser feedu do Rust listeneru
+- [ ] Spustit `feed-hub` WS ingest (`ws://<ip>:8080/feed`) pro Lenovo/Zebra JSON stream
+- [ ] Gating pro odds (likvidita/spread/stale) + event logy (`LIVE_FUSION_READY`)
 - [ ] Zavést normalizaci match identity (team aliases + deduplikace)
 - [ ] Prokázat, že systém umí zobrazit: "co je live" + "kde je live odds"
 - [ ] Uložit replay log pro pozdější tuning edge detekce

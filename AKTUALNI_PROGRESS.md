@@ -16,6 +16,8 @@ Nejvyšší priorita je zprovoznit na tomto Win11 zařízení **permanentní bro
 3. **Browser fallback vrstva** je implementována a připravená na další hardening
 4. **Roadmap + Decisions** přepnuté na "Phase 0 first" workflow
 
+Pozn.: "MATCH_RESOLVED" eventy jsou užitečné pro oracle-lag strategii (po konci). Phase 0 PoC je ale primárně o **LIVE dění + LIVE kurzech** (in-play), tj. kontinuální live update stream.
+
 ### Co děláme teď (bez odboček)
 
 1. Nastavení always-on browser procesu (po rebootu se sám zvedne)
