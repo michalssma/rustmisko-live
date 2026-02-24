@@ -85,12 +85,14 @@
   - `feed-hub` (WS server)
   - `feed_ws_send_test` (lokální WS klient, pošle `live_match` + `odds` + `heartbeat`)
   - `feed_db_stats` (rychlý výpis row countů z DB)
+  - HTTP endpoint v `feed-hub`: `GET /state` (JSON snapshot), `GET /health`
 
 **Repro příkazy (PowerShell):**
 ```powershell
 $env:RUST_LOG="info"
 $env:FEED_DB_PATH="data/feed.db"
 $env:FEED_HUB_BIND="127.0.0.1:8080"
+$env:FEED_HTTP_BIND="127.0.0.1:8081"
 cargo run --bin feed-hub
 ```
 
@@ -104,6 +106,12 @@ Kontrola DB:
 ```powershell
 $env:FEED_DB_PATH="data/feed.db"
 cargo run --bin feed_db_stats
+```
+
+Rychlý náhled bez DB (HTTP):
+```powershell
+$ProgressPreference='SilentlyContinue'
+(Invoke-WebRequest -Uri 'http://127.0.0.1:8081/state' -TimeoutSec 10 -UseBasicParsing).Content
 ```
 
 **Očekávané minimum:**

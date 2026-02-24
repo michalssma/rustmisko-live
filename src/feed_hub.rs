@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
@@ -195,6 +196,143 @@ fn gate_odds(odds: &OddsPayload, seen_at: DateTime<Utc>) -> (bool, String) {
     }
 
     (true, "ok".to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HttpLiveItem {
+    match_key: String,
+    source: String,
+    seen_at: String,
+    payload: LiveMatchPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HttpOddsItem {
+    match_key: String,
+    source: String,
+    seen_at: String,
+    payload: OddsPayload,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct HttpStateResponse {
+    ts: String,
+    connections: usize,
+    live_items: usize,
+    odds_items: usize,
+    fused_ready: usize,
+    fused_keys: Vec<String>,
+    live: Vec<HttpLiveItem>,
+    odds: Vec<HttpOddsItem>,
+}
+
+async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
+    let connections = *state.connections.read().await;
+    let live_map = state.live.read().await;
+    let odds_map = state.odds.read().await;
+
+    let live_items = live_map.len();
+    let odds_items = odds_map.len();
+
+    let mut fused_keys = Vec::new();
+    for k in odds_map.keys() {
+        if live_map.contains_key(k) {
+            fused_keys.push(k.clone());
+        }
+        if fused_keys.len() >= 50 {
+            break;
+        }
+    }
+
+    let fused_ready = fused_keys.len();
+
+    let mut live = Vec::new();
+    for (k, v) in live_map.iter() {
+        live.push(HttpLiveItem {
+            match_key: k.clone(),
+            source: v.source.clone(),
+            seen_at: v.seen_at.to_rfc3339(),
+            payload: v.payload.clone(),
+        });
+        if live.len() >= 50 {
+            break;
+        }
+    }
+
+    let mut odds = Vec::new();
+    for (k, v) in odds_map.iter() {
+        odds.push(HttpOddsItem {
+            match_key: k.clone(),
+            source: v.source.clone(),
+            seen_at: v.seen_at.to_rfc3339(),
+            payload: v.payload.clone(),
+        });
+        if odds.len() >= 50 {
+            break;
+        }
+    }
+
+    HttpStateResponse {
+        ts: Utc::now().to_rfc3339(),
+        connections,
+        live_items,
+        odds_items,
+        fused_ready,
+        fused_keys,
+        live,
+        odds,
+    }
+}
+
+async fn handle_http_connection(mut stream: TcpStream, state: FeedHubState) -> Result<()> {
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).await.context("http read")?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let first_line = req.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    let (status_line, content_type, body) = match (method, path) {
+        ("GET", "/health") => ("HTTP/1.1 200 OK", "text/plain; charset=utf-8", "ok".to_string()),
+        ("GET", "/state") => {
+            let snap = build_state_snapshot(&state).await;
+            let json = serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string());
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", json)
+        }
+        _ => (
+            "HTTP/1.1 404 Not Found",
+            "text/plain; charset=utf-8",
+            "not found".to_string(),
+        ),
+    };
+
+    let resp = format!(
+        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.as_bytes().len(),
+        body
+    );
+    stream.write_all(resp.as_bytes()).await.context("http write")?;
+    Ok(())
+}
+
+async fn start_http_server(state: FeedHubState, bind: SocketAddr) -> Result<()> {
+    let listener = TcpListener::bind(bind).await.context("http bind")?;
+    info!("feed-hub http listening on http://{} (GET /health, /state)", bind);
+
+    loop {
+        let (stream, peer) = listener.accept().await.context("http accept")?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_http_connection(stream, state).await {
+                debug!("http handler err {}: {}", peer, e);
+            }
+        });
+    }
 }
 
 async fn handle_socket(
@@ -395,6 +533,18 @@ async fn main() -> Result<()> {
     let db_path = std::env::var("FEED_DB_PATH").unwrap_or_else(|_| "data/feed.db".to_string());
     info!("feed-hub DB: {}", db_path);
     let db_tx = spawn_db_writer(DbConfig { path: db_path });
+
+    // Minimal HTTP read-only state endpoint
+    {
+        let http_bind = std::env::var("FEED_HTTP_BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string());
+        let http_addr: SocketAddr = http_bind.parse().context("Invalid FEED_HTTP_BIND")?;
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = start_http_server(state, http_addr).await {
+                warn!("http server stopped: {e}");
+            }
+        });
+    }
 
     // Heartbeat summary
     {
