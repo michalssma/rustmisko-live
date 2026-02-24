@@ -3,3 +3,4 @@
 *.jsonl
 logs/
 data/*.db
+data/*.db*
