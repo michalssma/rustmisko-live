@@ -69,6 +69,9 @@ async fn main() -> Result<()> {
     let monitor = EsportsMonitor::new("logs", poll_interval_secs);
     let arb = ArbDetector::new("logs", true);
 
+    // Spustit STRATZ WebSocket na dotu 2
+    monitor.start_stratz_ws().await;
+
     info!("⏳ WARMUP: Čekám 15s aby SX Bet cache background thread zmapoval trhy...");
     sleep(Duration::from_secs(15)).await;
     arb.debug_print_cache().await;
@@ -101,6 +104,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        sleep(Duration::from_secs(poll_interval_secs)).await;
+        let current_interval = if monitor.is_any_match_live() {
+            3 // 🚀 Sniper mode!
+        } else {
+            poll_interval_secs // Běžný audit timing
+        };
+
+        sleep(Duration::from_secs(current_interval)).await;
     }
 }

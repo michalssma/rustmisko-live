@@ -1,0 +1,13 @@
+    Checking arb_detector v0.1.0 (C:\RustMiskoLive\crates\arb_detector)
+error: cannot find macro `debug` in this scope
+   --> crates\arb_detector\src\lib.rs:322:9
+    |
+322 |         debug!("Azuro ping: Žádný Azuro market momentálně není mapován pro {}", home);
+    |         ^^^^^
+    |
+help: consider importing this macro
+    |
+  1 + use tracing::debug;
+    |
+
+error: could not compile `arb_detector` (lib) due to 1 previous error

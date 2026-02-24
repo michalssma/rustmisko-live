@@ -1,0 +1,14 @@
+    Checking esports_monitor v0.1.0 (C:\RustMiskoLive\crates\esports_monitor)
+error[E0599]: no method named `cookie_store` found for struct `ClientBuilder` in the current scope
+  --> crates\esports_monitor\src\lib.rs:76:18
+   |
+74 |               client: reqwest::Client::builder()
+   |  _____________________-
+75 | |                 .default_headers(headers)
+76 | |                 .cookie_store(true) // Persistent cloudflare cookies
+   | |                 -^^^^^^^^^^^^ method not found in `ClientBuilder`
+   | |_________________|
+   |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `esports_monitor` (lib) due to 1 previous error

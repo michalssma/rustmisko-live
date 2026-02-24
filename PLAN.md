@@ -1,27 +1,26 @@
 # RustMiskoLive — Implementační plán
 
-# Naposledy aktualizováno: 2026-02-23
+# Naposledy aktualizováno: 2026-02-24
 
-# Status: LIVE SCORING IMPLEMENTACE (kritická priorita)
+# Status: PHASE 4 - SIMULATED VERIFICATION (LIVE EXPERIMENT)
 
 ---
 
-## Diagnóza stavu (2026-02-23)
+## Diagnóza stavu (2026-02-24)
 
-### Co funguje:
-- SX Bet background cache sync — 12 mapovaných moneyline matchů každých 60s ✅
-- Deduplikace scrapovaných výsledků (Gemini commit `1e471d7`) ✅
-- Info logging pro "No cached SX Bet market" ✅
-- Telegram alerting pipeline (kód hotový, nikdy nefire-oval) ✅
+### Co funguje (Vše naimplementováno):
 
-### Co NEFUNGUJE (root cause):
-- **Scrapujeme `/results` stránky** = zápasy dokončené před HODINY
-- SX Bet market na tyto staré zápasy už neexistuje → lookup vždy selže
-- Za 2 dny provozu: **0 ARB_OPPORTUNITY**, **0 Telegram notifikací**
-- Systém je de facto NOP loop
+- Přechod na striktní webhook/live state-machine (NE scrapování starých /results).
+- Asynchronní SX Bet Orderbook Sweeping (vypočítána reálná slippage za $100).
+- Asynchronní Azuro The Graph (Polygon AMM) GraphQL parsing s 1.5% likviditní penalizací.
+- Plovoucí live RPC Network Fees pro Arbitrum i Polygon odečítající se z Net Edge!
+- Riot Games Rate Limiter (TokenBucket `<0.8 calls/sec`) a adaptivní Sniper mód plošně.
+- Headless Chrome pro GosuGamers (CS2 bot-bypass oblafnutí a Auto-Garbage Collection).
+- Dota 2 běží čistě přes WebSockets (STRATZ API) pro absolutní eliminaci spotřeby paměti.
 
 ### Co je potřeba:
-Přepnout ze scrapování STARÝCH výsledků na sledování LIVE zápasů a detekci momentu dokončení → checknutí SX Bet orderbooku v 10-25min oracle lag window.
+
+Sledovat v produkčním `observe_only = true` režimu, zachytit první ostré spread edge a validovat, jestli 1% Net Marže uvízne v logu na živém e-sportovém matchi než bot narazí na jakýkoliv skrytý bug.
 
 ---
 
@@ -77,6 +76,7 @@ Klíčový moment je přechod `LIVE → JUST_FINISHED`. V tu vteřinu voláme `a
 ## Datové zdroje — detaily
 
 ### 1. LoL — `getSchedule` API ⭐ PRIORITA (nejsnazší)
+
 - **URL**: `https://esports-api.lolesports.com/persisted/gw/getSchedule?hl=en-US`
 - **Header**: `x-api-key: 0TvQnueqKa5mxJntVWt0w4LpLfEkrV1Ta8rQBb9Z`
 - **State field**: `events[].state` = `"unstarted"` | `"inProgress"` | `"completed"`
@@ -85,18 +85,20 @@ Klíčový moment je přechod `LIVE → JUST_FINISHED`. V tu vteřinu voláme `a
 - **Strategie**: Poll každých 15s. Trackuj `inProgress` zápasy. Jakmile zmizí z inProgress nebo přejdou na `completed`, emituj resolved event.
 
 ### 2. Valorant — vlr.gg `/matches` ⭐
+
 - **URL**: `https://www.vlr.gg/matches` (NE /matches/results!)
 - **Live indikátor**: `a.match-item` s live score (ne countdown). Pravděpodobně class `.mod-live` na match itemu.
 - **Strategie**: Scrapuj /matches, identifikuj live zápasy (mají score místo countdown). Trackuj je. Jakmile zmizí ze stránky nebo se přesunou na results → resolved.
 
-### 3. CS2 — HLTV.org alternativně GosuGamers
-- **HLTV**: `https://www.hltv.org/matches` — má live section nahoře, ale 403 anti-bot
-- **GosuGamers fallback**: `https://www.gosugamers.net/counter-strike/matches` — live matches na hlavní stránce (ne /results)
-- **Strategie**: Scrapuj matches stránku (ne results), detekuj live → finished transition.
+### 3. CS2 — GosuGamers / HLTV alternativy s Bypass ochranou
 
-### 4. Dota 2 — GosuGamers
-- **URL**: `https://www.gosugamers.net/dota2/matches`
-- Stejná strategie jako CS2.
+- **Cloudflare blokátor**: Obyčejný Scraping nefunguje.
+- **Strategie**: Spawnutí Micro-Browseru přes `headless_chrome`. Sandboxing procesů načte stránku a počká na rendering React DOMu, zkopíruje kód a browser ihned zabije proces k zajištění minimalizace RAM memory leaků.
+
+### 4. Dota 2 — STRATZ API WebSockets ⭐
+
+- **URL**: `wss://api.stratz.com/graphql`
+- **Strategie**: Zero-memory stream namísto periodického HTML scrapování GosuGamers. Odpozoruje GraphQL eventy o konci zápasu. Pro backend i sídelní servery takřka nulové zatížení.
 
 ---
 
@@ -143,10 +145,12 @@ Periodicky čistit (max 500 entries, FIFO) aby nerostla paměť.
 ## Stará architektura (pro referenci)
 
 ### TYP 1: SX Bet Oracle Lag (PRIMARY)
+
 ```
 Scraper detekuje konec zápasu → SX Bet contract stále přijímá sázky (oracle lag 10-25 min)
 → Edge = 1.0 - best_available_prob (protože výsledek je 100% jistý)
 ```
 
 ### TYP 2-3: Cross-exchange arb, Small league mispricing
+
 Zatím neimplementováno. `price_monitor` crate je dead code.

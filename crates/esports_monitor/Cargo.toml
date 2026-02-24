@@ -14,3 +14,7 @@ chrono = { workspace = true }
 anyhow = { workspace = true }
 scraper = "0.19"
 regex = "1.10"
+governor = "0.10.4"
+tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
+futures-util = "0.3.32"
+headless_chrome = "1.0.21"

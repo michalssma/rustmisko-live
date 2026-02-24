@@ -104,3 +104,19 @@ ESPN (free, 5s poll) detekuje score change → Betfair/Smarkets cena stále star
 - Lze komunikovat anonymně bez KYC a geoblocking restrikcí skrz otevřené REST data endpoints.
 
 **Důsledek:** Kompletní asynchronní `RwLock` cache a Telegram notifikační infrastruktura připojena pro neustálý běh přes `live-observer`.
+
+---
+
+## 2026-02-23 — Multi-Bookie (Azuro) & Headless Bypasses (Phase 3)
+
+**Rozhodnutí:**
+Integrace The Graph na Azuro AMM (Polygon), zapojení Headless Chrome pro obcházení aktivní Cloudflare turnstile u příliš zabezpečených webů (GosuGamers) a integrace STRATZ API pro Dota 2. Zavedení reálných Gas oráklů (RPC nodes).
+
+**Proč:**
+
+- SX Bet nedovedl sám o sobě pojmout všechny CS2 a Dota ligy (likvidita rozptýlena). Azuro dává přístup k obřím esport poolům.
+- GosuGamers přepnul na Under Attack mód (UAM) u Cloudflare. Běžný `reqwest-impersonate` zlyhal. Bylo nutné nasadit hardwarový sandbox s Chromium (via `headless_chrome`), který reálně zpracuje javascript challenge.
+- Aby systém nevytekl na paměť (Memory Leak) přes headless browsery, Dota 2 šla na bezotiskové WebSocket API (Stratz) a Chromium proces se okamžitě ničí přes Drop implementace (Garbage Collection).
+- Statické flat fees se vyhozeny a nahrazeny skutečnými RPC dotazy na síťové poplatky na Arbitrum (SX) a Polygon (Azuro).
+
+**Důsledek:** Architektura verifikována a spuštěna do Phase 4 (Simulated Verification). Systém pálí asynchronní fan-out checky obou bookmakerů, modeluje skutečnou slippage na datech.

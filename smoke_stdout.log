@@ -1,0 +1,37 @@
+[2m2026-02-23T12:09:15.561954Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m === RustMiskoLive Observer — LIVE SCORING ACTIVE ===
+[2m2026-02-23T12:09:15.562565Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m Mode: OBSERVE ONLY (no trades)
+[2m2026-02-23T12:09:15.562914Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m Strategy: Live match state machine → SX Bet oracle lag detection
+[2m2026-02-23T12:09:15.563262Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m Logs: ./logs/
+[2m2026-02-23T12:09:15.563925Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m Acquired single-instance lock.
+[2m2026-02-23T12:09:15.564266Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m Live poll interval: 15s
+[2m2026-02-23T12:09:15.565095Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m ⏳ WARMUP: Čekám 15s aby SX Bet cache background thread zmapoval trhy...
+[2m2026-02-23T12:09:16.192008Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m Background sync: Found 64 active SX Bet e-sports leagues.
+[2m2026-02-23T12:09:30.575328Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m --- CURRENT SX BET CACHE DUMP (10 items) ---
+[2m2026-02-23T12:09:30.576206Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: weibogaming_vs_invictusgaming -> SX Event ID: L18002668
+[2m2026-02-23T12:09:30.576651Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: ninjasinpyjamas_vs_bilibiligaming -> SX Event ID: L18002822
+[2m2026-02-23T12:09:30.576798Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: bilibiligaming_vs_ninjasinpyjamas -> SX Event ID: L18002822
+[2m2026-02-23T12:09:30.576980Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: jdgaming_vs_topesports -> SX Event ID: L18002417
+[2m2026-02-23T12:09:30.577100Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: bnkfearx_vs_dpluskia -> SX Event ID: L18104492
+[2m2026-02-23T12:09:30.577214Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: dpluskia_vs_bnkfearx -> SX Event ID: L18104492
+[2m2026-02-23T12:09:30.577316Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: topesports_vs_jdgaming -> SX Event ID: L18002417
+[2m2026-02-23T12:09:30.577487Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: anyoneslegend_vs_teamwe -> SX Event ID: L18002667
+[2m2026-02-23T12:09:30.577659Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: teamwe_vs_anyoneslegend -> SX Event ID: L18002667
+[2m2026-02-23T12:09:30.577815Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m MAPPED: invictusgaming_vs_weibogaming -> SX Event ID: L18002668
+[2m2026-02-23T12:09:30.578006Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m 🚀 READY: Spouštím live scoring loop.
+[2m2026-02-23T12:09:30.578169Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m --- Live poll cycle ---
+[2m2026-02-23T12:09:33.475834Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: ground zero gaming vs mindfreak (counterstrike)
+[2m2026-02-23T12:09:33.476792Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: heroic academy vs xi esport (counterstrike)
+[2m2026-02-23T12:09:33.477204Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: sashi esport vs phantom esports (counterstrike)
+[2m2026-02-23T12:09:33.477445Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: arcred vs omega (counterstrike)
+[2m2026-02-23T12:09:33.477654Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: ex ruby vs ww team (counterstrike)
+[2m2026-02-23T12:09:33.477906Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: qwentry vs oxuji esports (counterstrike)
+[2m2026-02-23T12:09:33.478172Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: sinners esports vs ecstatic (counterstrike)
+[2m2026-02-23T12:09:33.478523Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: fuzos vs ex zero tenacity (counterstrike)
+[2m2026-02-23T12:09:33.478859Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: masonic vs bc game esports (counterstrike)
+[2m2026-02-23T12:09:33.479212Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: gamerlegion vs illwill (counterstrike)
+[2m2026-02-23T12:09:34.018244Z[0m [32m INFO[0m [2mesports_monitor[0m[2m:[0m 🔴 LIVE detekován: mouz vs betboom team (dota2)
+[2m2026-02-23T12:09:49.038468Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m --- Live poll cycle ---
+[2m2026-02-23T12:09:50.224454Z[0m [32m INFO[0m [2marb_detector[0m[2m:[0m Background sync completed: Cached 9 mapped SX Bet moneyline matches.
+[2m2026-02-23T12:10:05.289228Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m --- Live poll cycle ---
+[2m2026-02-23T12:10:21.521713Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m --- Live poll cycle ---
+[2m2026-02-23T12:10:37.915249Z[0m [32m INFO[0m [2mlive_observer[0m[2m:[0m --- Live poll cycle ---

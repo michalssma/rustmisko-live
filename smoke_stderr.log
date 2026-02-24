@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.26s
+     Running `target\debug\live-observer.exe`
+error: process didn't exit successfully: `target\debug\live-observer.exe` (exit code: 0xffffffff)
