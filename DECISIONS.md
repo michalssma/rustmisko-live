@@ -120,3 +120,53 @@ Integrace The Graph na Azuro AMM (Polygon), zapojení Headless Chrome pro obchá
 - Statické flat fees se vyhozeny a nahrazeny skutečnými RPC dotazy na síťové poplatky na Arbitrum (SX) a Polygon (Azuro).
 
 **Důsledek:** Architektura verifikována a spuštěna do Phase 4 (Simulated Verification). Systém pálí asynchronní fan-out checky obou bookmakerů, modeluje skutečnou slippage na datech.
+
+---
+
+## 2026-02-24 — Priorita: Phase 0 Persistent Browser Node (Win11)
+
+**Rozhodnutí:** Nejdřív dokončit PoC na tomto domácím Win11 zařízení (24/7), kde browser běží trvale, session loginy jsou ručně potvrzené a Rust ingestuje live data z více zdrojů.
+
+**Proč:**
+
+- Aktuální bottleneck není model, ale stabilní dostupnost live dat (challenge stránky, anti-bot)
+- Rychlé škálování bez důkazu datové stability by zvyšovalo riziko a debug chaos
+- Hardware + ruční onboarding účtů je teď nejrychlejší cesta k funkčnímu end-to-end PoC
+
+**Důsledek:**
+
+- Fáze "profit/scale" je odložena až po splnění Phase 0 KPI (uptime, lag, consensus, join quality)
+- Dokumentace a daily status se řídí podle Phase 0 milestone checků
+
+---
+
+## 2026-02-24 — Stop/Go pravidlo před navyšováním stake
+
+**Rozhodnutí:** Žádné navýšení kapitálu ani rozšíření na Android node bez splněných metrik kvality feedu.
+
+**Stop/Go metriky:**
+
+- Feed uptime ≥ 98% (24h)
+- p95 lag < 2s
+- Konsensus mezi feedy ≥ 80%
+- False join rate < 5%
+
+**Důsledek:**
+
+- Micro-live testy mohou běžet, ale scaling je podmíněný datovým důkazem, ne pocitem.
+
+---
+
+## 2026-02-24 — Finanční cíl je směr, ne garance
+
+**Rozhodnutí:** Cíl 2k USD/měsíc je pracovní target, ne garantovaný výsledek.
+
+**Proč:**
+
+- Reálný výsledek závisí na EV po fees/slippage, fill rate a tail risk událostech
+- Přecenění jistoty by vedlo k předčasnému risku
+
+**Důsledek:**
+
+- Reporting bude uvádět měřené KPI a net výsledky po nákladech
+- Strategická rozhodnutí se dělají na datech z replay/live logu

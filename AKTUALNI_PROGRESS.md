@@ -1,9 +1,36 @@
 # AKTUALNI_PROGRESS — handoff pro Sonneta
 
-Aktualizováno: 2026-02-23
+Aktualizováno: 2026-02-24
 Repo: RustMiskoLive (`C:\RustMiskoLive`)
 
-## 🚀 STAV: LIVE SCORING IMPLEMENTOVÁNO
+## 🚀 STAV: PHASE 0 STARTOVÁNA (PERSISTENT BROWSER NODE)
+
+### Aktuální priorita
+
+Nejvyšší priorita je zprovoznit na tomto Win11 zařízení **permanentní browser runtime** (manual login + persistent sessions), ze kterého Rust ingestuje live data napříč esport zdroji a bookie odds. Profit/scaling řešíme až po datovém PoC.
+
+### Co už je ověřeno dnes (2026-02-24)
+
+1. **HLTV test binárka běží stabilně** (`cargo run --bin hltv-test`)
+2. **HTTP requesty na HLTV endpointy** vrací 403 (anti-bot), takže čistý reqwest scraping není dostačující
+3. **Browser fallback vrstva** je implementována a připravená na další hardening
+4. **Roadmap + Decisions** přepnuté na "Phase 0 first" workflow
+
+### Co děláme teď (bez odboček)
+
+1. Nastavení always-on browser procesu (po rebootu se sám zvedne)
+2. Ruční přihlášení na cílové stránky (esport live data + kurzy)
+3. Rust feed fusion proof: systém musí ukázat „co je live“ + „kde je live odds"
+4. Ukládání replay logu pro kalibraci a ladění
+
+### Exit criteria pro přechod na scaling
+
+- Feed uptime ≥ 98% za 24h
+- p95 lag < 2s
+- Konsensus feedů ≥ 80%
+- False join rate < 5%
+
+Dokud není tohle splněné, navyšování stake ani rozšíření na další node není priorita.
 
 ### Co se změnilo (2026-02-23)
 

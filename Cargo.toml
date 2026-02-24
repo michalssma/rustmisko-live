@@ -3,7 +3,10 @@ members = [
     ".",
     "crates/price_monitor",
     "crates/arb_detector",
-    "crates/logger", "crates/esports_monitor",
+    "crates/logger",
+    "crates/esports_monitor",
+    "crates/hltv_scraper",
+    "crates/prediction_engine",  # Přidáno prediction engine
 ]
 resolver = "2"
 
@@ -28,6 +31,14 @@ edition = "2021"
 name = "live-observer"
 path = "src/main.rs"
 
+[[bin]]
+name = "hltv-test"
+path = "src/hltv_test.rs"
+
+[[bin]]
+name = "ultra-live"
+path = "src/ultra_live.rs"
+
 [dependencies]
 tokio              = { workspace = true }
 dotenv             = { workspace = true }
@@ -38,3 +49,5 @@ fd-lock            = { workspace = true }
 esports_monitor    = { path = "crates/esports_monitor" }
 arb_detector       = { path = "crates/arb_detector" }
 logger             = { path = "crates/logger" }
+hltv_scraper       = { path = "crates/hltv_scraper" }
+prediction_engine  = { path = "crates/prediction_engine" }
