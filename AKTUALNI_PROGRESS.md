@@ -1,199 +1,146 @@
 # AKTUALNI_PROGRESS — handoff pro Sonneta
 
-Aktualizováno: 2026-02-24
-Repo: RustMiskoLive (`C:\RustMiskoLive`)
+Aktualizováno: **2026-02-25**  
+Repo: RustMiskoLive (`C:\RustMiskoLive`)  
+Git: **v4.4.0** (f932f2b)
 
-## 🔴 STAV: LIVE PRODUKCE — REÁLNÉ PENÍZE NA POLYGON
+## 🟢 STAV: LIVE PRODUKCE — SYSTÉM FUNGUJE, BALANCE ROSTE
 
-### Aktuální priorita
-
-Systém je **PLNĚ FUNKČNÍ a LIVE** — detekuje CS2 arbitráže, posílá Telegram alerty, a po potvrzení (YES) reálně sází na Azuro Protocol (Polygon, USDT). **Executor běží v LIVE režimu s reálnou peněženkou.**
-
----
-
-### Architektura (aktuální — PRODUKCE)
-
-```
-┌─────────────────────────────┐
-│   TAMPERMONKEY USERSCRIPTS  │
-│                             │
-│  HLTV scraper v3            │──── live matches + featured odds
-│  (499 lines, auto-refresh)  │     → WS → Feed Hub
-│                             │
-│  Bo3.gg odds scraper v3     │──── multi-bookmaker odds (1xbit)
-│  (496 lines, TreeWalker)    │     → WS → Feed Hub
-└──────────┬──────────────────┘
-           │ WebSocket (port 8080)
-           ▼
-┌─────────────────────────────┐
-│  FEED HUB (Rust, tokio)     │
-│                             │
-│  WS ingest → parse → store  │
-│  Azuro GraphQL poller ←─────│──── polls Polygon+Gnosis subgraphs
-│  match_key() normalization  │     every 30s for CS2 on-chain odds
-│  OddsKey{match_key,bookie}  │
-│  Staleness cleanup (120s)   │
-│                             │
-│  HTTP API (port 8081):      │
-│    /health, /state, /opps   │
-└──────────┬──────────────────┘
-           │
-           ▼
-┌─────────────────────────────┐
-│  ALERT BOT (Rust, tokio)    │
-│                             │
-│  Polls /opportunities 10s   │
-│  Telegram alerts s #ID      │
-│  Confidence scoring 0-100   │
-│  Reply: "YES $5" → executor │
-│  Auto-cashout tracking      │
-│  Dry-run vs LIVE detection  │
-└──────────┬──────────────────┘
-           │ HTTP POST
-           ▼
-┌─────────────────────────────┐
-│  EXECUTOR (Node.js, viem)   │
-│  Port 3030 — LIVE MODE      │
-│                             │
-│  /bet    → Azuro on-chain   │
-│  /cashout → early cashout   │
-│  /approve → USDT allowance  │
-│  /balance → wallet balance  │
-│  /health  → system status   │
-│                             │
-│  Wallet: 0x8226D38e...      │
-│  Balance: 33.77 USDT        │
-│  Chain: Polygon (137)       │
-│  Relayer: UNLIMITED approve │
-└─────────────────────────────┘
-```
-
----
-
-### Co je hotovo a LIVE v produkci
-
-1. **Feed Hub** — WS server + HTTP API
-   - Multi-bookmaker `OddsKey {match_key, bookmaker}` architektura
-   - Order-independent `match_key()` normalizace
-   - SQLite persistence (WAL mode) + JSONL logging
-   - Staleness cleanup (120s)
-   - Porty: WS 8080, HTTP 8081
-
-2. **HLTV Tampermonkey scraper v3** (auto-refresh)
-   - Auto-refresh každé 3 min (prevence stale DOM)
-   - Stale detection (90s bez změny → early refresh)
-   - Finished match detection (score ≥13)
-   - "Refresh Now" button + countdown timer
-   - sessionStorage pro preservování sent count
-
-3. **Bo3.gg odds scraper v3** — TreeWalker, multi-bookmaker
-
-4. **Azuro Protocol integration** — `azuro_poller.rs`
-   - 4 chainy: Polygon, Gnosis, Base, Chiliz (30s poll)
-   - CS2 games s aktivními podmínkami (match_winner market)
-   - Injektuje jako `azuro_polygon` / `azuro_base` etc.
-
-5. **Opportunities Engine** — 3 detekční typy:
-   - `score_momentum` — live score ahead, odds lagging
-   - `odds_anomaly` — tight spread + underdog value
-   - `arb_cross_book` — cross-platform arb (DISABLED v alertech, covered by odds_anomaly)
-
-6. **Alert Bot** (`src/bin/alert_bot.rs`) — Telegram bot
-   - Numbered alerts (#1, #2, ...) s confidence score
-   - YES parser: `3 YES $5`, `3 YES`, `YES $5`, `YES` (latest)
-   - Dry-run vs LIVE detection v Telegram zprávách
-   - Active bets tracking + auto-cashout
-
-7. **Executor Sidecar** (`executor/index.js`) — Node.js
-   - **LIVE MODE** — reálné on-chain transakce na Polygon
-   - Azuro V3 bet placement přes `@azuro-org/toolkit` + `viem`
-   - Endpoints: /bet, /cashout, /approve, /balance, /health
-   - RPC: `https://1rpc.io/matic`
-   - Wallet: `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00`
-   - Balance: **33.77 USDT**
-   - Relayer allowance: **UNLIMITED** (approved tx: `0x48cec4ba...`)
-   - Podporuje i DRY-RUN mód (bez PRIVATE_KEY)
-
----
-
-### Wallet & On-Chain Info
-
-| Položka | Hodnota |
+### Čísla
+| Metrika | Hodnota |
 |---------|---------|
-| Wallet | `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00` |
-| Chain | Polygon (137) |
-| USDT Contract | `0xc2132D05D31c914a87C6611C10748AEb04B58e8F` |
-| USDT Balance | 33.77 |
-| POL Balance | ~2.09 (gas) |
-| Azuro LP | `0x0FA7FB5407eA971694652E6E16C12A52625DE1b8` |
-| Azuro Relayer | `0x8dA05c0021e6b35865FDC959c54dCeF3A4AbBa9d` |
-| Relayer Allowance | UNLIMITED |
-| RPC | `https://1rpc.io/matic` |
+| **USDT Balance** | **$38.74** (bylo $33.77 před 24h) |
+| **Sázky dnes** | 5× CS2, $2 stake každá |
+| **Výsledky** | 2× Won, 2× Lost, 1× Canceled |
+| **Claim stav** | ✅ $10.93 claimováno (tx: 0x07352dd...) |
+| **Live matches** | ~100-180 (FlashScore multisport) |
+| **Azuro odds** | ~40 kurzů (cs2, football, tennis, basketball) |
+| **Fused pairs** | ~19-50 |
+| **Příležitosti** | ~50-120 (ARB + score momentum) |
 
 ---
 
-### Platformy — vyšetřeno
+### Architektura (PRODUKCE v4.4.0)
 
-| Platforma   | CS2 coverage | Status |
-|-------------|-------------|--------|
-| **Azuro**   | ✅ MASIVNÍ   | **INTEGROVÁNO + LIVE EXECUTION** |
-| SX Bet      | ❌ ŽÁDNÉ     | Pouze LoL LPL. Zero CS2. |
-| Polymarket  | ❌ ŽÁDNÉ     | Zero esports. |
-| Overtime    | ❌ DEPRECATED | Nefunkční. |
+```
+Chrome Tabs (Tampermonkey)
+  ├── flashscore_multisport_scraper.user.js v3.0
+  │     → 7 sports: tennis, football, basketball, hockey, esports, baseball, handball
+  │     → URL-based sport detection (cs-go/ → cs2, dota-2/ → dota-2) [v4.4.0 FIX]
+  ├── tipsport_odds_scraper.user.js v2.1
+  │     → ~7-14 kurzů (bookmaker: "tipsport")
+  │
+  └─── WebSocket ws://127.0.0.1:8080 → Feed Hub
+                                          │
+                         ┌────────────────┴───────────────────┐
+                         │  FEED HUB (Rust, port 8081)        │
+                         │  match_key() normalizace            │
+                         │  esports→cs2 fallback [v4.4.0 FIX]  │
+                         │  Staleness TTL: 120s                │
+                         │  gate_odds: liquidity≥500, stale≤10s│
+                         └────────────────┬───────────────────┘
+                                          │ /state poll 10s
+                         ┌────────────────┴───────────────────┐
+                         │  ALERT BOT (Rust, background)       │
+                         │  find_score_edges() — cs2/tennis    │
+                         │  find_odds_anomalies() — ARB        │
+                         │  AUTO-BET: edge≥15%, HIGH conf      │
+                         │  AUTO-CLAIM: 60s ticker [v4.4.0]    │
+                         │  TOKEN_ID: betId discovery [FIX]    │
+                         └────────────────┬───────────────────┘
+                                          │ POST /bet, /claim
+                         ┌────────────────┴───────────────────┐
+                         │  EXECUTOR (Node.js, port 3030)      │
+                         │  @azuro-org/toolkit LIVE            │
+                         │  RPC fallback: 4× Polygon RPC       │
+                         │  Wallet: 0x8226D38e...              │
+                         │  USDT (USDT0) on Polygon            │
+                         └────────────────────────────────────┘
+```
 
 ---
 
-### Co systém REÁLNĚ dělá teď
+### Procesy (aktuálně běží)
+| Proces | Port | PID | Spuštěn |
+|--------|------|-----|---------|
+| feed-hub | :8080/:8081 | ~21628 | 19:36 |
+| alert_bot | — | ~29076 | 22:xx |
+| node (executor) | :3030 | ~36636 | 21:56 |
 
-```
-Continuous loop (LIVE):
-  1. Tampermonkey scrapers → WS → Feed Hub (live matches + odds)
-  2. Azuro poller → GraphQL → Feed Hub (on-chain CS2 odds)
-  3. Alert bot polluje /opportunities každých 10s
-  4. Detekce edge → Telegram alert (#N, confidence, doporučení)
-  5. Miša odpoví "YES $5" → executor POST /bet → ON-CHAIN Azuro bet
-  6. Transakce na Polygon → sledovatelné na polygonscan.com
-  7. Auto-cashout monitoring aktivních betů
+---
+
+### KRITICKÉ OPRAVY v4.4.0 (2026-02-25)
+
+#### BUG #1 — tokenId vs betId (KRITICKÝ — peníze se nezaobratily!)
+- **Problém:** Azuro toolkit.getBet() vrací `betId: 220860` (číslo), alert_bot hledal `tokenId` (string)
+- **Důsledek:** Všechny sázky byly "Settled" na chainu, ale alert_bot to neviděl → nezclaimoval
+- **Fix:** Obě cesty (cashout + claim) nyní čtou `betId` s u64→string konverzí
+
+#### BUG #2 — State "Settled" nerozpoznán
+- **Problém:** is_settled kontroloval jen "Resolved"/"Canceled", Azuro vrací "Settled"
+- **Fix:** Přidáno "Settled" do match armu
+
+#### BUG #3 — Startup recovery s "?" tokenId
+- **Problém:** pending_claims.txt ukládal "?" jako tokenId → po restartu se "?" načetl jako validní → PATH A failoval
+- **Fix:** "?" nebo prázdný string → None → PATH B discovery
+
+#### BUG #4 — esports ↔ cs2 sport mismatch (silently dropped CS2 matches!)
+- **Problém:** FlashScore posílá sport="esports", Azuro má sport="cs2" → match_key nikdy neodpovídal
+- **Fix A:** feed_hub fuse loop zkouší esports_alts = ["cs2","dota-2","league-of-legends","valorant"]
+- **Fix B:** FlashScore scraper detectSportFromURL() kontroluje /cs-go/, /dota-2/ PŘED /esports/
+
+#### BUG #5 — RPC reliability
+- **Fix:** executor/index.js používá viem `fallback([4× Polygon RPC])` s rank=true
+
+---
+
+### Konfigurace (LIVE)
+```bash
+feed-hub:   FEED_DB_PATH=data/feed.db
+alert_bot:  TELEGRAM_BOT_TOKEN=7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk
+            TELEGRAM_CHAT_ID=6458129071
+            FEED_HUB_URL=http://127.0.0.1:8081
+            EXECUTOR_URL=http://127.0.0.1:3030
+executor:   PRIVATE_KEY=0x34fb468...  (Polygon USDT wallet)
+            CHAIN_ID=137
 ```
 
 ---
 
-### Jak spustit (kompletní)
+### Datové soubory
+| Soubor | Obsah | Stav |
+|--------|-------|------|
+| `data/bet_history.txt` | 5 sázek (dedup ochrana) | ✅ |
+| `data/pending_claims.txt` | vyčištěno po claimu | ✅ prázdný |
+| `logs/2026-02-25.jsonl` | aplikační logy | — |
 
-```powershell
-# Terminal 1: Feed Hub
-$env:RUST_LOG="info"
-$env:FEED_DB_PATH="data/feed.db"
-$env:FEED_HUB_BIND="0.0.0.0:8080"
-$env:FEED_HTTP_BIND="0.0.0.0:8081"
-cargo run --bin feed-hub
+---
 
-# Terminal 2: Executor (LIVE)
-cd executor
-$env:PRIVATE_KEY="0x..."  # Polygon private key
-$env:PORT="3030"
-$env:RPC_URL="https://1rpc.io/matic"
-node index.js
-
-# Terminal 3: Alert Bot
-$env:RUST_LOG="info"
-$env:TELEGRAM_BOT_TOKEN="7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk"
-$env:TELEGRAM_CHAT_ID="6458129071"
-$env:FEED_HUB_URL="http://127.0.0.1:8081"
-$env:EXECUTOR_URL="http://127.0.0.1:3030"
-.\target\debug\alert_bot.exe
-
-# Chrome: HLTV scraper v3 + Bo3.gg odds scraper v3 v Tampermonkey
+### Auto-bet konfigurace
+```rust
+AUTO_BET_ENABLED = true
+AUTO_BET_STAKE = 2.0  // $2 per bet
+AUTO_BET_MIN_EDGE_PCT = 15.0  // min 15% edge
+AUTO_BET_MIN_ODDS = 1.15
+AUTO_BET_MAX_ODDS = 3.50
+AUTO_BET_MAX_PER_SESSION = 10
+CASHOUT_CHECK_SECS = 30
+CLAIM_CHECK_SECS = 60
 ```
 
-### Budoucí vylepšení
+---
 
-1. **Azuro WebSocket** — `wss://streams.onchainfeed.org` pro sub-second odds (místo 30s polling)
-2. **Team name fuzzy matching** — cross-platform normalizace
-3. **Kelly criterion** — automatický stake sizing
-4. **Multi-chain optimization** — Polygon vs Base vs Gnosis fees
-5. **Azuro liquidity parsing** — lepší confidence skóre
+### Známé problémy / Sledovat
+- Chrome tabs musí být otevřeny manuálně po restartu PC
+- FlashScore "esports" tab na general URL stále posílá fotbalové/basketbalové týmy jako esports
+  → Řešení: otevřít specificky `flashscore.com/esports/cs-go/` pro CS2 data
+- Fused=50 = živý count opportunities, ne hard cap
 
-### Poznámka k pravdivosti
+---
 
-Tento soubor popisuje přesný stav systému k 2026-02-24. Systém je LIVE s reálnými penězi. Každý YES = on-chain transakce.
+### NEXT STEPS (viz EDGE_NAPADY.md + IMPLEMENTACNI_ROADMAP.md)
+1. **Fortuna.cz scraper** — okamžitě
+2. **Football score model** v alert_bot
+3. **Betfair Exchange scraper** — velká likvidita
+
+

@@ -68,6 +68,14 @@
 
   function detectSportFromURL() {
     const path = window.location.pathname.toLowerCase();
+    // Check esports sub-types FIRST (more specific paths win over generic /esports/)
+    if (path.includes('/cs-go/') || path.includes('/cs2/') || path.includes('/counter-strike/')) return 'cs2';
+    if (path.includes('/dota-2/') || path.includes('/dota2/')) return 'dota-2';
+    if (path.includes('/league-of-legends/') || path.includes('/lol/')) return 'league-of-legends';
+    if (path.includes('/valorant/')) return 'valorant';
+    if (path.includes('/starcraft/')) return 'starcraft';
+    if (path.includes('/king-of-glory/') || path.includes('/kog/')) return 'king-of-glory';
+    // Then check generic sport paths
     for (const [key, sport] of Object.entries(SPORT_MAP)) {
       if (path.startsWith(`/${key}/`) || path === `/${key}`) {
         return sport;

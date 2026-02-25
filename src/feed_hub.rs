@@ -412,7 +412,22 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
     let mut opportunities = Vec::new();
 
     for (match_key, live) in live_map.iter() {
-        let Some(odds_list) = odds_by_match.get(match_key.as_str()) else {
+        // Try alternate sport prefixes for esports (FlashScore sends 'esports',
+        // Azuro uses 'cs2', 'dota-2', etc.) — try all variants
+        let esports_alts: &[&str] = &["cs2", "dota-2", "league-of-legends", "valorant"];
+        let odds_list_opt = odds_by_match.get(match_key.as_str())
+            .or_else(|| {
+                if match_key.starts_with("esports::") {
+                    let tail = &match_key["esports::".len()..];
+                    esports_alts.iter().find_map(|alt| {
+                        let alt_key = format!("{}::{}", alt, tail);
+                        odds_by_match.get(alt_key.as_str())
+                    })
+                } else {
+                    None
+                }
+            });
+        let Some(odds_list) = odds_list_opt else {
             continue;
         };
 
