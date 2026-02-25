@@ -1,17 +1,17 @@
-//! Azuro Protocol — data-feed subgraph poller pro CS2 odds
+//! Azuro Protocol — MULTI-SPORT data-feed subgraph poller
 //!
 //! Používáme **data-feed** subgraph (thegraph-1.onchainfeed.org) který má:
 //! - Aktuální hry (Live, Prematch) s odds v decimálním formátu
 //! - Pole `state` (ne `status`), `conditions` s `outcomes.currentOdds`
-//! - Pokrytí: Polygon, Gnosis, Base, Chiliz
+//! - Pokrytí: Polygon, Base (Gnosis+Chiliz mrtvé = 0 games)
 //!
 //! Client subgraph (thegraph.onchainfeed.org) je zastaralý a data nevrací!
 //!
 //! Endpointy data-feed (production):
 //!   Polygon: https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon
-//!   Gnosis:  https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-gnosis
 //!   Base:    https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base
-//!   Chiliz:  https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz
+//!
+//! Sporty: cs2, tennis, football, basketball, dota-2, mma
 
 use chrono::Utc;
 use serde::Deserialize;
@@ -87,14 +87,14 @@ struct AzuroOutcome {
 // ====================================================================
 
 /// Data-feed subgraphs — tyto mají aktuální hry a odds!
+/// Gnosis + Chiliz = 0 games (mrtvé), pollujeme jen Polygon + Base
 const AZURO_FEED_POLYGON: &str =
     "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon";
-const AZURO_FEED_GNOSIS: &str =
-    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-gnosis";
 const AZURO_FEED_BASE: &str =
     "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base";
-const AZURO_FEED_CHILIZ: &str =
-    "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz";
+
+/// All sports we poll
+const AZURO_SPORTS: &[&str] = &["cs2", "tennis", "football", "basketball", "dota-2", "mma"];
 
 /// Poll interval — faster for score-edge detection!
 const AZURO_POLL_INTERVAL_SECS: u64 = 15;
@@ -149,6 +149,19 @@ fn build_cs2_query() -> String {
 
 fn build_tennis_query() -> String {
     build_sport_query("tennis")
+}
+
+/// Map sport slug → bookmaker.xyz URL path segment
+fn sport_url_segment(sport: &str) -> &'static str {
+    match sport {
+        "cs2" => "esports/cs2",
+        "tennis" => "sports/tennis",
+        "football" => "sports/football",
+        "basketball" => "sports/basketball",
+        "dota-2" => "esports/dota-2",
+        "mma" => "sports/mma",
+        _ => "sports/other",
+    }
 }
 
 // ====================================================================
@@ -206,11 +219,11 @@ struct ParsedCondition {
     market: String,
 }
 
-/// Known Azuro outcome IDs for CS2 markets (from dictionaries)
-/// Match Winner: 6995 (team1), 6996 (team2) — or generic 10009/10010
-/// Map 1 Winner: 7009 (team1), 7010 (team2)
-/// Map 2 Winner: 7011 (team1), 7012 (team2)
-/// Map 3 Winner: 7013 (team1), 7014 (team2)
+/// Known Azuro outcome IDs for various sports (from dictionaries)
+/// CS2: Match Winner 6995/6996, Map Winners 7009-7014
+/// Tennis: Match Winner 6977/6978
+/// Generic: 10009/10010, 7/8
+/// Football/Basketball/MMA/Dota2: various per-sport IDs — treated as match_winner
 fn classify_market_by_outcome_ids(oid1: &str, oid2: &str) -> String {
     match (oid1, oid2) {
         // CS2 Match Winner
@@ -224,36 +237,43 @@ fn classify_market_by_outcome_ids(oid1: &str, oid2: &str) -> String {
         ("6977", "6978") | ("6978", "6977") => "match_winner".to_string(),
         // Generic 2-way (H1/H2)
         ("7", "8") | ("8", "7") => "match_winner".to_string(),
-        // Fallback: treat any unknown 2-outcome condition as potential winner market
+        // Fallback: treat any 2-outcome condition as match_winner
+        // Different sports use different outcome IDs — we accept them all
+        // and rely on deduplication (first condition per game = primary market)
         _ => {
-            // Check if both IDs are small numbers (selection IDs for winner markets)
             let n1: u64 = oid1.parse().unwrap_or(99999);
             let n2: u64 = oid2.parse().unwrap_or(99999);
-            // Outcome IDs 6995-7014 are CS2 winner markets
+            // CS2 range: try to identify specific map markets
             if (6995..=7014).contains(&n1) && (6995..=7014).contains(&n2) {
-                // Try to figure out which map
                 let min_id = n1.min(n2);
                 match min_id {
                     7009 => "map1_winner".to_string(),
                     7011 => "map2_winner".to_string(),
                     7013 => "map3_winner".to_string(),
-                    6995 => "match_winner".to_string(),
                     _ => "match_winner".to_string(),
                 }
             } else {
-                "unknown_2way".to_string()
+                // Accept as match_winner — works for basketball, MMA, football 2-way,
+                // dota-2, and any future sport. First 2-way condition on Azuro is
+                // typically the primary winner market.
+                debug!("unknown outcome IDs {}/{} — accepting as match_winner", oid1, oid2);
+                "match_winner".to_string()
             }
         }
     }
 }
 
 /// Extract ALL 2-way winner conditions from a game (match winner + map winners)
+/// For each game, only ONE match_winner is kept (first = primary market on Azuro).
+/// CS2 map winners (map1/map2/map3) are kept separately.
 fn extract_all_winner_odds(game: &AzuroGame) -> Vec<ParsedCondition> {
     let mut results = Vec::new();
     let conditions = match game.conditions.as_ref() {
         Some(c) => c,
         None => return results,
     };
+
+    let mut has_match_winner = false;
 
     for cond in conditions {
         let cond_state = cond.state.as_deref().unwrap_or("");
@@ -295,9 +315,12 @@ fn extract_all_winner_odds(game: &AzuroGame) -> Vec<ParsedCondition> {
                 oid2.as_deref().unwrap_or(""),
             );
 
-            // Skip unknown/non-winner markets (totals, handicaps, odd/even)
-            if market == "unknown_2way" {
-                continue;
+            // Only keep ONE match_winner per game (first found = primary)
+            if market == "match_winner" {
+                if has_match_winner {
+                    continue; // Skip duplicate match_winner conditions
+                }
+                has_match_winner = true;
             }
 
             results.push(ParsedCondition {
@@ -434,7 +457,7 @@ async fn poll_subgraph(
 
 pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
     info!(
-        "azuro data-feed poller starting — polling every {}s for CS2+Tennis odds (Polygon+Gnosis+Base+Chiliz)",
+        "azuro data-feed poller starting — polling every {}s for 6 sports (Polygon+Base)",
         AZURO_POLL_INTERVAL_SECS
     );
 
@@ -453,26 +476,41 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         let mut total_live = 0usize;
         let mut total_prematch = 0usize;
         let mut total_map_markets = 0usize;
-        let mut total_tennis = 0usize;
+        let mut sport_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-        // Poll CS2 + Tennis on all 4 chains in parallel
-        let (cs2_poly, cs2_gno, cs2_base, cs2_chz,
-             ten_poly, ten_gno, ten_base, ten_chz) = tokio::join!(
+        // Poll ALL sports on Polygon + Base in parallel (12 queries)
+        // Gnosis + Chiliz are dead (0 games) — skip them to save latency
+        let (
+            cs2_poly, cs2_base,
+            ten_poly, ten_base,
+            fb_poly, fb_base,
+            bb_poly, bb_base,
+            dota_poly, dota_base,
+            mma_poly, mma_base,
+        ) = tokio::join!(
             poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "cs2"),
-            poll_subgraph(&client, AZURO_FEED_GNOSIS, "gnosis", "cs2"),
             poll_subgraph(&client, AZURO_FEED_BASE, "base", "cs2"),
-            poll_subgraph(&client, AZURO_FEED_CHILIZ, "chiliz", "cs2"),
             poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "tennis"),
-            poll_subgraph(&client, AZURO_FEED_GNOSIS, "gnosis", "tennis"),
             poll_subgraph(&client, AZURO_FEED_BASE, "base", "tennis"),
-            poll_subgraph(&client, AZURO_FEED_CHILIZ, "chiliz", "tennis"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "football"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "football"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "basketball"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "basketball"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "dota-2"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "dota-2"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "mma"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "mma"),
         );
 
-        // Merge results — dedup by match_key+market (prefer polygon > gnosis > base > chiliz)
+        // Merge results — dedup by match_key+market (prefer polygon > base)
         let mut seen_keys = std::collections::HashSet::new();
         let all_results = [
-            cs2_poly, cs2_gno, cs2_base, cs2_chz,
-            ten_poly, ten_gno, ten_base, ten_chz,
+            cs2_poly, cs2_base,
+            ten_poly, ten_base,
+            fb_poly, fb_base,
+            bb_poly, bb_base,
+            dota_poly, dota_base,
+            mma_poly, mma_base,
         ];
 
         for result in &all_results {
@@ -495,9 +533,7 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
                 if game.market.starts_with("map") {
                     total_map_markets += 1;
                 }
-                if sport == "tennis" {
-                    total_tennis += 1;
-                }
+                *sport_counts.entry(sport.clone()).or_insert(0) += 1;
 
                 let bookmaker_name = if game.market == "match_winner" {
                     format!("azuro_{}", result.chain)
@@ -506,11 +542,7 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
                     format!("azuro_{}_{}", result.chain, game.market)
                 };
 
-                let url_path = if sport == "tennis" {
-                    format!("https://bookmaker.xyz/sports/tennis/{}", game.game_id)
-                } else {
-                    format!("https://bookmaker.xyz/esports/cs2/{}", game.game_id)
-                };
+                let url_path = format!("https://bookmaker.xyz/{}/{}", sport_url_segment(sport), game.game_id);
 
                 let payload = OddsPayload {
                     sport: sport.clone(),
@@ -566,9 +598,13 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         }
 
         if total_injected > 0 {
+            let sport_summary: String = sport_counts.iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
             info!(
-                "azuro poll OK: {} games injected ({} live, {} prematch, {} map markets, {} tennis)",
-                total_injected, total_live, total_prematch, total_map_markets, total_tennis
+                "azuro poll OK: {} total ({} live, {} prematch, {} map mkts) [{}]",
+                total_injected, total_live, total_prematch, total_map_markets, sport_summary
             );
         } else {
             debug!("azuro poll: 0 games with odds right now");

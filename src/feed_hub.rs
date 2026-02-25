@@ -178,6 +178,64 @@ impl FeedHubState {
     }
 }
 
+/// For tennis: extract SURNAME portion for cross-platform matching.
+/// FlashScore format: "Blanchet U." → "blanchet"
+/// Azuro format: "Ugo Blanchet" → "blanchet"
+/// Handles particles: "De Stefano S." → "destefano", "Samira De Stefano" → "destefano"
+fn normalize_tennis_name(name: &str) -> String {
+    let name = name.trim();
+    let parts: Vec<&str> = name.split_whitespace().collect();
+
+    if parts.len() <= 1 {
+        // Single word — just lowercase + alphanumeric
+        return name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
+    }
+
+    // Detect FlashScore format: last part is an INITIAL (has period)
+    // e.g. "Blanchet U.", "De Stefano S.", "Rakhimova K."
+    // Must contain period — "Ce" (2-letter surname) is NOT an initial!
+    let last = parts.last().unwrap();
+    let last_clean: String = last.chars().filter(|c| c.is_alphanumeric()).collect();
+    let is_initial = (last.contains('.') && last_clean.len() <= 2)
+        || last_clean.len() <= 1;
+
+    if is_initial && parts.len() >= 2 {
+        // FlashScore format: surname = all parts except last (initial)
+        let surname: String = parts[..parts.len() - 1]
+            .join("")
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        return surname;
+    }
+
+    // Azuro format: "Firstname [particles] Surname"
+    // Take last word + any preceding particles (de, van, von, da, di, del, ...)
+    let particles = ["de", "van", "von", "da", "di", "del", "le", "la", "el", "al", "bin", "mc"];
+    let mut surname_start = parts.len() - 1;
+    while surname_start > 1 {
+        let prev: String = parts[surname_start - 1]
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect();
+        if particles.contains(&prev.as_str()) {
+            surname_start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let surname: String = parts[surname_start..]
+        .join("")
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+    surname
+}
+
 fn normalize_name(name: &str) -> String {
     // Strip ALL non-alphanumeric chars so "Thunder Downunder" == "THUNDERdOWNUNDER"
     let mut s: String = name.to_lowercase()
@@ -225,11 +283,16 @@ fn normalize_name(name: &str) -> String {
 }
 
 fn match_key(sport: &str, team1: &str, team2: &str) -> String {
-    let a = normalize_name(team1);
-    let b = normalize_name(team2);
+    let sport_lower = sport.to_lowercase();
+    // Tennis uses surname-only matching (FlashScore "Blanchet U." ↔ Azuro "Ugo Blanchet")
+    let (a, b) = if sport_lower == "tennis" {
+        (normalize_tennis_name(team1), normalize_tennis_name(team2))
+    } else {
+        (normalize_name(team1), normalize_name(team2))
+    };
     // Sort alphabetically so team order doesn't matter for matching
     let (first, second) = if a <= b { (a, b) } else { (b, a) };
-    format!("{}::{}_vs_{}", sport.to_lowercase(), first, second)
+    format!("{}::{}_vs_{}", sport_lower, first, second)
 }
 
 fn parse_ts(ts: &Option<String>) -> DateTime<Utc> {

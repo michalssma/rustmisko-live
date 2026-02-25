@@ -385,6 +385,69 @@ fn tennis_score_to_win_prob(leading_sets: i32, losing_sets: i32) -> Option<f64> 
     }
 }
 
+/// Football goal score → estimated match win probability for the LEADING team.
+///
+/// Conservative estimates (we DON'T know how much time is left —
+/// FlashScore sends goals, not minutes). The earlier the goal, the less
+/// certain the outcome, so we stay conservative:
+///   - 1-0 → ~62% (could easily equalize)
+///   - 2-0 → ~85% (dominant but not impossible to come back)
+///   - 3-0 → ~96% (almost certain)
+///   - 2-1 → ~68%
+///   - 3-1 → ~90%
+fn football_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
+    if leading <= losing { return None; }
+    let diff = leading - losing;
+    let total = leading + losing;
+
+    // Only bet when there's clear goal advantage
+    if diff < 1 { return None; }
+
+    // If either team has 4+ goals we're likely late in game → stronger signal
+    match diff {
+        1 => {
+            // Single goal lead
+            if total >= 3 {
+                // Late-scoring game (e.g. 2-1, 3-2) → ~68%
+                Some(0.68)
+            } else {
+                // Early single goal (1-0) → conservative 62%
+                Some(0.62)
+            }
+        }
+        2 => {
+            // 2 goal lead (2-0, 3-1, 4-2)
+            if total >= 4 {
+                Some(0.90) // 3-1 or 4-2 → very strong
+            } else {
+                Some(0.85) // 2-0 → strong but early
+            }
+        }
+        _ => Some(0.96), // 3+ goal lead → near-certain
+    }
+}
+
+/// Dota-2 kill score → estimated win probability.
+/// Kill leads in Dota-2 correlate with gold/XP advantage.
+/// Requires significant lead to be actionable (kills swing fast).
+///   - 5-9 kill lead: ~60-65%
+///   - 10-14: ~72%
+///   - 15+: ~82%
+fn dota2_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
+    if leading <= losing { return None; }
+    let diff = leading - losing;
+    let total = leading + losing;
+
+    // Need substantial kill lead AND enough kills total (early game is volatile)
+    if diff < 5 || total < 10 { return None; }
+
+    match diff {
+        5..=9 => Some(0.62),
+        10..=14 => Some(0.72),
+        _ => Some(0.82), // 15+ kills ahead
+    }
+}
+
 /// Detect score-based edges: HLTV live score says one team leads,
 /// but Azuro odds haven't adjusted yet → BET on the leading team!
 fn find_score_edges(
@@ -479,6 +542,11 @@ fn find_score_edges(
         // Get expected win probability from score
         // Use sport-specific probability model
         let is_tennis = match_key.starts_with("tennis::");
+        let is_football = match_key.starts_with("football::");
+        let is_dota2 = match_key.starts_with("dota-2::");
+        let is_basketball = match_key.starts_with("basketball::");
+        let is_mma = match_key.starts_with("mma::");
+
         let expected_prob = if is_tennis {
             // Tennis: scores are SET counts (0-2)
             match tennis_score_to_win_prob(leading_maps, losing_maps) {
@@ -489,6 +557,32 @@ fn find_score_edges(
                     continue;
                 }
             }
+        } else if is_football {
+            // Football: goal-based advantage
+            match football_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: football score not actionable",
+                        match_key, s1, s2);
+                    continue;
+                }
+            }
+        } else if is_dota2 {
+            // Dota-2: kill lead
+            match dota2_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: dota-2 score not actionable (diff={}, total={})",
+                        match_key, s1, s2, leading_maps - losing_maps, s1 + s2);
+                    continue;
+                }
+            }
+        } else if is_basketball || is_mma {
+            // Basketball: point leads are too volatile without quarter/time info
+            // MMA: round scores don't reliably predict winner
+            info!("  ⏭️ {} {}-{}: {} score model not supported (skipping)",
+                match_key, s1, s2, if is_basketball { "basketball" } else { "mma" });
+            continue;
         } else {
             // CS2: scores can be round-level or map-level
             match score_to_win_prob(leading_maps, losing_maps) {
