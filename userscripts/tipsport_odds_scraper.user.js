@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Tipsport → Feed Hub Odds Scraper
 // @namespace    rustmisko
-// @version      2.0
-// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub as reference odds for anomaly detection (generic DOM v2)
+// @version      2.1
+// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub — generic DOM v2.1 with text cleanup
 // @author       RustMisko
 // @match        https://www.tipsport.cz/*
 // @match        https://m.tipsport.cz/*
@@ -181,19 +181,24 @@
     let candidateCount = 0;
 
     for (const link of allLinks) {
-      const rawText = link.textContent.trim();
+      const rawText = link.textContent.trim().replace(/\s+/g, ' ');
 
       // Quick filters
-      if (rawText.length < 5 || rawText.length > 150) continue;
-      if (rawText.includes('\n') || rawText.includes('\r')) continue;
+      if (rawText.length < 5 || rawText.length > 300) continue;
 
       // Must contain " - " separator (team1 - team2)
       const dashIdx = rawText.indexOf(' - ');
       if (dashIdx < 2) continue;
 
+      // Strip Tipsport garbage BEFORE team name extraction
+      // Tipsport <a> tags wrap entire match row: "Team1 - Team2 0:0 2.pol - 55.min 1.03 15.00 60.00"
+      const cleanedText = stripTipsportGarbage(rawText);
+      if (cleanedText !== rawText) dbg(`Stripped: "${rawText.substring(0,80)}" → "${cleanedText}"`);
+      if (!cleanedText || cleanedText.indexOf(' - ') < 2) continue;
+
       // Also accept " – " (en-dash)
       let t1, t2;
-      const dashMatch = rawText.match(/^(.+?)\s*[-–]\s*(.+)$/);
+      const dashMatch = cleanedText.match(/^(.+?)\s*[-–]\s*(.+)$/);
       if (!dashMatch) continue;
       t1 = cleanName(dashMatch[1]);
       t2 = cleanName(dashMatch[2]);
@@ -202,7 +207,9 @@
       if (t1.toLowerCase() === t2.toLowerCase()) continue;
 
       // Skip league/header links (contain comma + sport name like "Liga mistrů, Fotbal - muži")
-      if (rawText.includes(',') && /fotbal|tenis|hokej|basket/i.test(rawText)) continue;
+      if (cleanedText.includes(',') && /fotbal|tenis|hokej|basket|esport/i.test(cleanedText)) continue;
+      // Skip "muži"/"ženy" league headers
+      if (/\s*-\s*(muži|ženy|women|men)/i.test(cleanedText)) continue;
 
       // Deduplicate
       const key = `${t1.toLowerCase()}|${t2.toLowerCase()}`;
@@ -318,6 +325,39 @@
     return values;
   }
 
+  /**
+   * Strip Tipsport garbage from <a> link text.
+   * Tipsport wraps entire match rows in <a> tags, so textContent is like:
+   *   "Atalanta Bergamo - Dortmund (odv.)2:02. pol. - 55.min (2:0, 0:0)1.0315.0060.00+53"
+   *   "Rinderknech Arthur - Draper Jack1:02.set - 7:5, 3:3 (*30:00)11.5122.53+25"
+   *   "KUUSAMO.gg - Partizan EsportZa 13 minut11.8021.90+3"
+   *
+   * We find the EARLIEST cut point where score/status/odds garbage starts.
+   */
+  function stripTipsportGarbage(text) {
+    const cutPatterns = [
+      /\d{1,2}:\d{1,2}/,                    // Score: "0:0", "2:3", "22:36"
+      /\d\.\s*(pol|set|min|čt|mapa|kolo)/i,  // Period: "2.pol", "1.set"
+      /Za\s+\d+/i,                           // Prematch: "Za 13 minut"
+      /Kurzy\s/i,                            // "Kurzy nejsou..."
+      /Událost\s/i,                          // "Událost skončila..."
+      /Lepší\s+ze/i,                         // "Lepší ze 3"
+      /Přestávka/i,                          // Half-time
+      /\d{2,}[,.]\d{2}/,                     // Odds values: "11.50", "118.00"
+      /\+\d{2,}/,                            // Bet count: "+53", "+25"
+    ];
+
+    let minIdx = text.length;
+    for (const pattern of cutPatterns) {
+      const m = text.match(pattern);
+      if (m && m.index < minIdx) {
+        minIdx = m.index;
+      }
+    }
+
+    return text.substring(0, minIdx).trim();
+  }
+
   function cleanName(text) {
     if (!text) return "";
     return text
@@ -424,10 +464,10 @@
 
   function init() {
     const sport = detectTipsportSport();
-    log(`💰 Tipsport Odds Scraper v2.0 (Generic DOM)`);
+    log(`💰 Tipsport Odds Scraper v2.1 (Generic DOM + text cleanup)`);
     log(`Page: ${window.location.href}`);
     log(`Sport: ${sport || "unknown"}`);
-    log(`Strategy: Find <a> links with 'Team - Team' pattern, walk up DOM for odds`);
+    log(`Strategy: Find <a> links with 'Team - Team', strip scores/status garbage, walk up DOM for odds`);
 
     createPanel();
     connectWS();
