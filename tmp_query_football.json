@@ -1,0 +1,1 @@
+{"query":"{ games(where:{sport_:{slug:\"football\"}},first:1,orderBy:startsAt,orderDirection:desc){gameId title conditions(first:10){conditionId outcomes{outcomeId sortOrder}}} }"}

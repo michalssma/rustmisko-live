@@ -84,7 +84,7 @@
   function detectSportFromElement(el) {
     if (!el) return null;
 
-    // Walk up to find sport header
+    // Strategy 1: Check parent/ancestor with sport info
     const header = el.closest('.event__header, [class*="sportName"], [class*="event__title"]');
     if (header) {
       const text = header.textContent.toLowerCase();
@@ -93,11 +93,37 @@
       }
     }
 
-    // Check data attributes
+    // Strategy 2: Walk BACKWARDS through siblings to find sport header
+    // FlashScore main page: [sport header div] [match] [match] [sport header] [match]...
+    let sibling = el.previousElementSibling;
+    let maxWalk = 50; // Don't walk too far
+    while (sibling && maxWalk-- > 0) {
+      const cls = sibling.className || "";
+      if (cls.includes("event__header") || cls.includes("sportName") || cls.includes("event__title")) {
+        const text = sibling.textContent.toLowerCase();
+        for (const [key, sport] of Object.entries(SPORT_MAP)) {
+          if (text.includes(key)) return sport;
+        }
+        break; // Found a header but no sport match — stop walking
+      }
+      sibling = sibling.previousElementSibling;
+    }
+
+    // Strategy 3: Check data attributes
     const sportAttr = el.getAttribute("data-sport") || el.closest("[data-sport]")?.getAttribute("data-sport");
     if (sportAttr) {
       const normalized = sportAttr.toLowerCase();
       return SPORT_MAP[normalized] || normalized;
+    }
+
+    // Strategy 4: Check icon classes (FlashScore uses sport icons)
+    const iconEl = el.querySelector('[class*="icon--"], [class*="sport-icon"]') ||
+                   el.closest('[class*="icon--"]');
+    if (iconEl) {
+      const cls = iconEl.className.toLowerCase();
+      for (const [key, sport] of Object.entries(SPORT_MAP)) {
+        if (cls.includes(key)) return sport;
+      }
     }
 
     return null;
@@ -275,9 +301,16 @@
     const team1 = cleanTeamName(participants[0].textContent);
     const team2 = cleanTeamName(participants[1].textContent);
     if (!team1 || !team2) return null;
+    // Skip if both teams are identical (DOM parsing bug on some pages)
+    if (team1 === team2) return null;
 
     // Detect sport for this row
     const sport = detectSportFromElement(row) || pageSport || "unknown";
+    // Skip unknown sport — we can't match it to Azuro without sport classification
+    if (sport === "unknown") {
+      dbg(`Skipping unknown sport: ${team1} vs ${team2}`);
+      return null;
+    }
 
     // === SCORE EXTRACTION ===
     // FlashScore uses different score layouts per sport:
