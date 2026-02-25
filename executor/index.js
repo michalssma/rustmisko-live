@@ -611,7 +611,15 @@ app.post('/check-payout', async (req, res) => {
       claimable: payoutUsd > 0,
     });
   } catch (e) {
-    res.status(500).json({ error: e.message, tokenId });
+    // viewPayout reverts for unresolved bets — return pending status
+    res.json({
+      tokenId,
+      payout: '0',
+      payoutUsd: 0,
+      claimable: false,
+      pending: true,
+      reason: 'Bet not yet resolved (viewPayout reverted)',
+    });
   }
 });
 

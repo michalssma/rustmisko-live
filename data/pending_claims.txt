@@ -1,0 +1,3 @@
+220794|legacy-1|condition_1709527711|pending|2.0|1.88|2026-02-22
+220802|legacy-2|condition_1709527711|pending|2.0|1.88|2026-02-22
+220826|legacy-3|condition_1709527711|pending|2.0|1.88|2026-02-22

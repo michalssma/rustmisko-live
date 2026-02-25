@@ -1131,6 +1131,42 @@ async fn main() -> Result<()> {
         }
     }
 
+    // === PENDING CLAIMS: persist token IDs for bets waiting to be claimed ===
+    let pending_claims_path = "data/pending_claims.txt";
+    // Format per line: tokenId|betId|matchKey|valueTeam|amountUsd|odds|timestamp
+    // Load on startup → add to active_bets for auto-claim monitoring
+    if Path::new(pending_claims_path).exists() {
+        if let Ok(contents) = std::fs::read_to_string(pending_claims_path) {
+            for line in contents.lines() {
+                let parts: Vec<&str> = line.split('|').collect();
+                if parts.len() >= 6 {
+                    let token_id = parts[0].to_string();
+                    let bet_id = parts[1].to_string();
+                    let match_key = parts[2].to_string();
+                    let value_team = parts[3].to_string();
+                    let amount_usd: f64 = parts[4].parse().unwrap_or(2.0);
+                    let odds: f64 = parts[5].parse().unwrap_or(1.5);
+                    active_bets.push(ActiveBet {
+                        alert_id: 0,
+                        bet_id: bet_id.clone(),
+                        match_key: match_key.clone(),
+                        team1: value_team.clone(),
+                        team2: "?".to_string(),
+                        value_team: value_team.clone(),
+                        amount_usd,
+                        odds,
+                        placed_at: "loaded".to_string(),
+                        condition_id: String::new(),
+                        outcome_id: String::new(),
+                        graph_bet_id: None,
+                        token_id: Some(token_id),
+                    });
+                }
+            }
+            info!("📋 Loaded {} pending claims from file", active_bets.len());
+        }
+    }
+
     // If no chat_id, wait for user to send /start
     if chat_id.is_none() {
         info!("No TELEGRAM_CHAT_ID set. Waiting for /start message from user...");
@@ -1387,6 +1423,16 @@ async fn main() -> Result<()> {
                                                                     graph_bet_id: None,
                                                                     token_id: None,
                                                                 });
+                                                                // Persist pending claim (tokenId discovered later via /bet/:id)
+                                                                if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                    .create(true).append(true)
+                                                                    .open(pending_claims_path) {
+                                                                    use std::io::Write;
+                                                                    let _ = writeln!(f, "?|{}|{}|{}|{}|{}|{}",
+                                                                        bet_id, edge.match_key,
+                                                                        leading_team, stake, azuro_odds,
+                                                                        Utc::now().to_rfc3339());
+                                                                }
                                                             }
 
                                                             let result_msg = if is_dry_run {
@@ -1582,6 +1628,62 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // === PATH A: If we have tokenId already, check payout directly ===
+                    if let Some(tid) = &bet.token_id {
+                        let payout_body = serde_json::json!({ "tokenId": tid });
+                        let payout_resp = match client.post(format!("{}/check-payout", executor_url))
+                            .json(&payout_body).send().await {
+                            Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                            Err(_) => None,
+                        };
+
+                        if let Some(pr) = payout_resp {
+                            let claimable = pr.get("claimable").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let pending = pr.get("pending").and_then(|v| v.as_bool()).unwrap_or(false);
+                            let payout_usd = pr.get("payoutUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                            if pending {
+                                // Bet not yet resolved on chain — skip for now
+                                continue;
+                            }
+
+                            if claimable && payout_usd > 0.0 {
+                                // WON or CANCELED — claim it!
+                                let result = if payout_usd > bet.amount_usd * 1.1 { "Won" } else { "Canceled" };
+                                tokens_to_claim.push(tid.clone());
+                                claim_details.push((
+                                    bet.alert_id,
+                                    bet.team1.clone(),
+                                    bet.team2.clone(),
+                                    bet.value_team.clone(),
+                                    bet.amount_usd,
+                                    bet.odds,
+                                    result.to_string(),
+                                ));
+                                settled_bet_ids.insert(bet.bet_id.clone());
+                                bets_to_remove.push(bet.bet_id.clone());
+                                total_wagered += bet.amount_usd;
+                            } else {
+                                // payout = 0 and not pending = LOST
+                                total_wagered += bet.amount_usd;
+                                let loss_msg = format!(
+                                    "❌ <b>PROHRA</b>\n\n\
+                                     {} vs {}\n\
+                                     Sázka: <b>{}</b> @ {:.2} — ${:.2}\n\
+                                     Výsledek: <b>PROHRA</b> — -${:.2}",
+                                    bet.team1, bet.team2,
+                                    bet.value_team, bet.odds, bet.amount_usd,
+                                    bet.amount_usd
+                                );
+                                let _ = tg_send_message(&client, &token, chat_id, &loss_msg).await;
+                                settled_bet_ids.insert(bet.bet_id.clone());
+                                bets_to_remove.push(bet.bet_id.clone());
+                            }
+                        }
+                        continue;
+                    }
+
+                    // === PATH B: No tokenId yet — check via /bet/:id API ===
                     // Query bet status from executor
                     let status_resp = match client.get(format!("{}/bet/{}", executor_url, bet.bet_id))
                         .send().await {
@@ -1598,6 +1700,17 @@ async fn main() -> Result<()> {
                     if bet.token_id.is_none() {
                         if let Some(tid) = status.get("tokenId").and_then(|v| v.as_str()) {
                             bet.token_id = Some(tid.to_string());
+                            // Update pending_claims file with real tokenId
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true)
+                                .open(pending_claims_path) {
+                                use std::io::Write;
+                                let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}",
+                                    tid, bet.bet_id, bet.match_key,
+                                    bet.value_team, bet.amount_usd, bet.odds,
+                                    Utc::now().to_rfc3339());
+                            }
+                            info!("🔍 Discovered tokenId {} for bet {}", tid, bet.bet_id);
                         }
                     }
 
@@ -1742,6 +1855,21 @@ async fn main() -> Result<()> {
 
                 // Remove settled bets from active list
                 active_bets.retain(|b| !bets_to_remove.contains(&b.bet_id));
+
+                // Rewrite pending_claims file with remaining active bets only
+                if !bets_to_remove.is_empty() {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true).write(true).truncate(true)
+                        .open(pending_claims_path) {
+                        use std::io::Write;
+                        for bet in &active_bets {
+                            let tid = bet.token_id.as_deref().unwrap_or("?");
+                            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+                                tid, bet.bet_id, bet.match_key,
+                                bet.value_team, bet.amount_usd, bet.odds);
+                        }
+                    }
+                }
             }
 
             // === Check Telegram for user replies ===
