@@ -246,7 +246,7 @@ fn normalize_name(name: &str) -> String {
     // Strip common prefixes that differ between sources
     // HLTV: "Nemesis", Azuro: "Team Nemesis" → both → "nemesis"
     // Also: "Clan X" vs "X", "FC X" vs "X"
-    let prefixes = ["team", "clan", "fc", "pro"];
+    let prefixes = ["team", "clan", "fc", "pro", "cf", "ac", "as", "cd", "rc", "rcd", "sd", "ud"];
     for prefix in &prefixes {
         if s.len() > prefix.len() + 2 && s.starts_with(prefix) {
             s = s[prefix.len()..].to_string();
@@ -254,13 +254,21 @@ fn normalize_name(name: &str) -> String {
         }
     }
 
-    // Strip common CS2 org suffixes that differ between sources
-    // HLTV: "Ground Zero", Azuro: "Ground Zero Gaming" → both → "groundzero"
-    // HLTV: "Cybershoke", Azuro: "CYBERSHOKE Esports" → both → "cybershoke"
+    // Strip common suffixes that differ between sources
+    // "Newells Old Boys" → "newells", "Celtic FC" → "celtic", "Corinthians SP" → "corinthians"
+    // "Corinthians MG" → "corinthians", "Flamengo RJ" → "flamengo"
     let suffixes = ["gaming", "esports", "esport", "gg", "club", "org",
-                    "academy", "rising", "fe"];
+                    "academy", "rising", "fe",
+                    // Club suffixes
+                    "fc", "cf", "sc", "ac",
+                    // Brazilian state abbreviations (appear in Azuro names)
+                    "sp", "mg", "rj", "rs", "ba", "pr", "ce", "go", "pe",
+                    // Other common suffixes
+                    "oldboys", "united", "city", "wanderers",
+                    // Azuro specific
+                    "whitecapsfc", "whitecaps"];
     for suffix in &suffixes {
-        if s.len() > suffix.len() + 2 && s.ends_with(suffix) {
+        if s.len() > suffix.len() + 3 && s.ends_with(suffix) {
             s.truncate(s.len() - suffix.len());
             break;
         }
