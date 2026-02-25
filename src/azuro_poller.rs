@@ -96,8 +96,8 @@ const AZURO_FEED_BASE: &str =
 const AZURO_FEED_CHILIZ: &str =
     "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-chiliz";
 
-/// Poll interval
-const AZURO_POLL_INTERVAL_SECS: u64 = 30;
+/// Poll interval — faster for score-edge detection!
+const AZURO_POLL_INTERVAL_SECS: u64 = 15;
 
 /// GraphQL query — data-feed schema (state, not status; Active conditions)
 fn build_cs2_query() -> String {
@@ -212,8 +212,14 @@ fn extract_match_winner_odds(game: &AzuroGame) -> Option<(f64, f64, Option<Strin
 
             if let (Some(o1), Some(o2)) = (odds1, odds2) {
                 let cond_id = cond.id.clone();
-                let oid1 = out1.and_then(|o| o.id.clone());
-                let oid2 = out2.and_then(|o| o.id.clone());
+                // Subgraph outcome IDs are "conditionId_outcomeId" (e.g. "...768_7011")
+                // Azuro toolkit needs just the numeric outcomeId part ("7011")
+                let oid1 = out1.and_then(|o| o.id.as_ref().map(|id| {
+                    id.rsplit('_').next().unwrap_or(id).to_string()
+                }));
+                let oid2 = out2.and_then(|o| o.id.as_ref().map(|id| {
+                    id.rsplit('_').next().unwrap_or(id).to_string()
+                }));
                 return Some((o1, o2, cond_id, oid1, oid2));
             }
         }
@@ -440,3 +446,4 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         tokio::time::sleep(Duration::from_secs(AZURO_POLL_INTERVAL_SECS)).await;
     }
 }
+// force-rebuild

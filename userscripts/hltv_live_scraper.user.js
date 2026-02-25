@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HLTV → Feed Hub Live Scraper
 // @namespace    rustmisko
-// @version      3.0
-// @description  Scrapes live CS2 matches from HLTV + auto-refresh to prevent stale data
+// @version      3.1
+// @description  Scrapes live CS2 matches from HLTV + auto-refresh + SAFE odds extraction
 // @author       RustMisko
 // @match        https://www.hltv.org/matches*
 // @match        https://www.hltv.org/live*
@@ -236,16 +236,28 @@
         score2 = scoreNums[1];
       }
 
-      // Extract HLTV featured odds — use TextNode walker (more reliable than linkText regex)
+      // Extract HLTV featured odds — SAFE version
+      // Only look within the match link itself or 1 parent level up.
+      // NEVER walk up 5 levels — that picks up odds from neighboring matches!
       let hltvOdds1 = null, hltvOdds2 = null;
       let hltvBookmaker = null;
-      // Walk up from the match link to find odds containers
-      let oddsContainer = link;
-      for (let up = 0; up < 5; up++) {
-        if (!oddsContainer.parentElement) break;
-        oddsContainer = oddsContainer.parentElement;
-        // Find text nodes that are EXACTLY decimal odds numbers
-        const walker = document.createTreeWalker(oddsContainer, NodeFilter.SHOW_TEXT);
+
+      // Strategy: Look for odds WITHIN the link element first, then 1 parent up.
+      // Validate: the container must NOT contain multiple match links (= not a parent section).
+      const oddsSearchTargets = [link];
+      if (link.parentElement) oddsSearchTargets.push(link.parentElement);
+      if (link.parentElement && link.parentElement.parentElement)
+        oddsSearchTargets.push(link.parentElement.parentElement);
+
+      for (const container of oddsSearchTargets) {
+        // Safety: if this container has multiple match links, skip it (too broad)
+        const matchLinksInContainer = container.querySelectorAll("a[href*='/matches/']");
+        if (matchLinksInContainer.length > 1) {
+          dbg(`Skipping odds container (has ${matchLinksInContainer.length} match links)`);
+          continue;
+        }
+
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
         const foundOdds = [];
         while (walker.nextNode()) {
           const text = walker.currentNode.textContent.trim();
@@ -254,17 +266,22 @@
             if (val >= 1.01 && val <= 30.0) foundOdds.push(val);
           }
         }
-        if (foundOdds.length >= 2) {
-          hltvOdds1 = foundOdds[foundOdds.length - 2];
-          hltvOdds2 = foundOdds[foundOdds.length - 1];
-          // Try to detect bookmaker name (20bet, ggbet, etc.)
-          const containerText = oddsContainer.textContent || "";
+        if (foundOdds.length === 2) {
+          // Exactly 2 odds = perfect, assign team1/team2
+          hltvOdds1 = foundOdds[0];
+          hltvOdds2 = foundOdds[1];
+          const containerText = container.textContent || "";
           if (containerText.toLowerCase().includes("20bet")) hltvBookmaker = "20bet";
           else if (containerText.toLowerCase().includes("ggbet")) hltvBookmaker = "ggbet";
           else if (containerText.toLowerCase().includes("1xbit")) hltvBookmaker = "1xbit";
           else if (containerText.toLowerCase().includes("betway")) hltvBookmaker = "betway";
           else hltvBookmaker = "hltv-featured";
           break;
+        }
+        // If >2 odds found, ambiguous — skip this level, don't use
+        if (foundOdds.length > 2) {
+          dbg(`Ambiguous odds (${foundOdds.length} numbers) in container, skipping`);
+          continue;
         }
       }
 

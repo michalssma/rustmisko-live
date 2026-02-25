@@ -30,7 +30,7 @@ import { polygon, gnosis, base } from 'viem/chains';
 
 const PORT = parseInt(process.env.EXECUTOR_PORT || '3030');
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '137');
-const RPC_URL = process.env.RPC_URL || 'https://polygon-rpc.com';
+const RPC_URL = process.env.RPC_URL || 'https://polygon-bor-rpc.publicnode.com';
 
 // Private key — optional, dry-run mode if not set
 const RAW_KEY = process.env.PRIVATE_KEY;
@@ -306,12 +306,21 @@ app.post('/bet', async (req, res) => {
   }
 
   try {
-    const amountRaw = BigInt(Math.round(parseFloat(amount) * (10 ** contracts.betTokenDecimals)));
-    const minOddsRaw = minOdds ? BigInt(Math.round(parseFloat(minOdds) * 1e12)) : 0n;
+    // amount and minOdds arrive ALREADY in raw format from alert_bot
+    // amount: USDT with 6 decimals (e.g. "1000000" = $1)
+    // minOdds: odds × 1e12 (e.g. "1054500000000" = 1.0545 odds)
+    const amountRaw = BigInt(amount);
+    const minOddsRaw = minOdds ? BigInt(minOdds) : 0n;
     const nonce = BigInt(Date.now());
     const expiresAt = Math.floor(Date.now() / 1000) + 300; // 5 min expiry
 
-    console.log(`🎰 Placing bet: condition=${conditionId} outcome=${outcomeId} amount=$${amount} minOdds=${minOdds || 'any'}`);
+    // Safety: strip conditionId_ prefix from outcomeId if present (subgraph format)
+    let cleanOutcomeId = outcomeId;
+    if (typeof cleanOutcomeId === 'string' && cleanOutcomeId.includes('_')) {
+      cleanOutcomeId = cleanOutcomeId.split('_').pop();
+      console.log(`🔧 Stripped outcomeId prefix: ${outcomeId} → ${cleanOutcomeId}`);
+    }
+    console.log(`🎰 Placing bet: condition=${conditionId} outcome=${cleanOutcomeId} amount=$${amount} minOdds=${minOdds || 'any'}`);
 
     if (toolkit) {
       // === Official toolkit path ===
@@ -329,7 +338,7 @@ app.post('/bet', async (req, res) => {
 
       const bet = {
         conditionId: conditionId.toString(),
-        outcomeId: outcomeId.toString(),
+        outcomeId: cleanOutcomeId.toString(),
         minOdds: minOddsRaw.toString(),
         amount: amountRaw.toString(),
         nonce: nonce.toString(),
@@ -341,9 +350,10 @@ app.post('/bet', async (req, res) => {
         bet,
       });
 
-      const signature = await walletClient.signTypedData(typedData);
+      const signature = await account.signTypedData(typedData);
 
       const result = await toolkit.createBet({
+        account: account.address,
         clientData,
         bet,
         signature,
@@ -575,6 +585,120 @@ app.post('/check-cashout', async (req, res) => {
 });
 
 // ============================================================
+// POST /check-payout — check claimable payout for a token ID
+// ============================================================
+
+app.post('/check-payout', async (req, res) => {
+  const { tokenId } = req.body;
+  if (!tokenId) {
+    return res.status(400).json({ error: 'Missing: tokenId' });
+  }
+  if (DRY_RUN) {
+    return res.json({ tokenId, payout: '0', payoutUsd: 0, claimable: false, mode: 'DRY-RUN' });
+  }
+  try {
+    const payout = await publicClient.readContract({
+      address: contracts.lp,
+      abi: toolkit ? toolkit.lpAbi : parseAbi(['function viewPayout(address,uint256) view returns (uint128)']),
+      functionName: 'viewPayout',
+      args: [contracts.core, BigInt(tokenId)],
+    });
+    const payoutUsd = Number(payout) / (10 ** contracts.betTokenDecimals);
+    res.json({
+      tokenId,
+      payout: payout.toString(),
+      payoutUsd,
+      claimable: payoutUsd > 0,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, tokenId });
+  }
+});
+
+// ============================================================
+// POST /claim — withdraw payouts for settled bets
+// ============================================================
+
+app.post('/claim', async (req, res) => {
+  const { tokenIds } = req.body;
+  if (!tokenIds || !Array.isArray(tokenIds) || tokenIds.length === 0) {
+    return res.status(400).json({ error: 'Missing: tokenIds (array of token IDs)' });
+  }
+  if (DRY_RUN) {
+    return res.json({ status: 'dry-run', message: 'Simulace — claim neodesláno', tokenIds });
+  }
+  try {
+    const abi = toolkit ? toolkit.lpAbi : parseAbi([
+      'function withdrawPayout(address,uint256)',
+      'function withdrawPayouts(address,uint256[])',
+      'function viewPayout(address,uint256) view returns (uint128)',
+    ]);
+
+    // First check which tokens have claimable payouts
+    const claimable = [];
+    let totalPayout = 0;
+    for (const tid of tokenIds) {
+      try {
+        const p = await publicClient.readContract({
+          address: contracts.lp, abi,
+          functionName: 'viewPayout',
+          args: [contracts.core, BigInt(tid)],
+        });
+        const usd = Number(p) / (10 ** contracts.betTokenDecimals);
+        if (usd > 0) {
+          claimable.push(BigInt(tid));
+          totalPayout += usd;
+        }
+      } catch (_) { /* skip */ }
+    }
+
+    if (claimable.length === 0) {
+      return res.json({ status: 'nothing', message: 'No claimable payouts', tokenIds });
+    }
+
+    console.log(`💰 Claiming ${claimable.length} bets, total ~$${totalPayout.toFixed(2)}`);
+
+    // Batch withdraw
+    const { request } = await publicClient.simulateContract({
+      account,
+      address: contracts.lp,
+      abi,
+      functionName: claimable.length === 1 ? 'withdrawPayout' : 'withdrawPayouts',
+      args: claimable.length === 1
+        ? [contracts.core, claimable[0]]
+        : [contracts.core, claimable],
+    });
+
+    const hash = await walletClient.writeContract(request);
+    console.log(`📤 Claim TX: ${hash}`);
+
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    console.log(`✅ Claim confirmed: status=${receipt.status} gas=${receipt.gasUsed}`);
+
+    // Get updated balance
+    const balance = await publicClient.readContract({
+      address: contracts.betToken,
+      abi: ERC20_ABI,
+      functionName: 'balanceOf',
+      args: [account.address],
+    });
+    const balanceUsd = formatUnits(balance, contracts.betTokenDecimals);
+
+    res.json({
+      status: 'ok',
+      txHash: hash,
+      claimed: claimable.length,
+      totalPayoutUsd: totalPayout,
+      newBalanceUsd: balanceUsd,
+      blockNumber: receipt.blockNumber.toString(),
+    });
+  } catch (e) {
+    console.error(`❌ Claim error: ${e.message}`);
+    res.status(500).json({ error: e.message, details: e.stack });
+  }
+});
+
+// ============================================================
 // Start
 // ============================================================
 
@@ -583,5 +707,5 @@ app.listen(PORT, '127.0.0.1', () => {
   console.log(`   Mode: ${DRY_RUN ? '\uD83E\uDDEA DRY-RUN (simulace)' : '\uD83D\uDD25 LIVE (on-chain)'}`);
   console.log(`   Chain: ${chain.name} (${CHAIN_ID})`);
   if (!DRY_RUN) console.log(`   Wallet: ${account.address}`);
-  console.log(`   Endpoints: /health /bet /cashout /check-cashout /active-bets\n`);
+  console.log(`   Endpoints: /health /bet /cashout /check-cashout /check-payout /claim /active-bets\n`);
 });

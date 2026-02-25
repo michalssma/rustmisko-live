@@ -179,13 +179,23 @@ impl FeedHubState {
 }
 
 fn normalize_name(name: &str) -> String {
-    name.to_lowercase()
+    // Strip ALL non-alphanumeric chars so "Thunder Downunder" == "THUNDERdOWNUNDER"
+    let mut s: String = name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+        .filter(|c| c.is_alphanumeric())
+        .collect();
+
+    // Strip common CS2 org suffixes that differ between sources
+    // HLTV: "Ground Zero", Azuro: "Ground Zero Gaming" → both → "groundzero"
+    // HLTV: "Cybershoke", Azuro: "CYBERSHOKE Esports" → both → "cybershoke"
+    let suffixes = ["gaming", "esports", "esport"];
+    for suffix in &suffixes {
+        if s.len() > suffix.len() + 2 && s.ends_with(suffix) {
+            s.truncate(s.len() - suffix.len());
+            break;
+        }
+    }
+    s
 }
 
 fn match_key(sport: &str, team1: &str, team2: &str) -> String {
@@ -204,8 +214,9 @@ fn parse_ts(ts: &Option<String>) -> DateTime<Utc> {
 }
 
 fn gate_odds(odds: &OddsPayload, seen_at: DateTime<Utc>) -> (bool, String) {
-    let liquidity_ok = odds.liquidity_usd.map_or(false, |l| l >= 2000.0);
-    let spread_ok = odds.spread_pct.map_or(false, |s| s <= 1.5);
+    // null = ok (Azuro doesn't always send liquidity/spread)
+    let liquidity_ok = odds.liquidity_usd.map_or(true, |l| l >= 500.0);
+    let spread_ok = odds.spread_pct.map_or(true, |s| s <= 5.0);
 
     let age = Utc::now().signed_duration_since(seen_at);
     let stale_ok = age.num_seconds().abs() <= 10;
@@ -332,16 +343,20 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
             let implied2 = 1.0 / odds.odds_team2 * 100.0;
 
             // === SCORE MOMENTUM DETECTION ===
-            // If team1 is significantly ahead on score, but odds still favor team2
+            // If team1 is ahead on score, but odds still imply lower prob
             // → potential value on team1 (odds haven't adjusted to live situation)
             let score_diff = score1 - score2;
 
-            // CS2: Bo3 map scores matter. Being up 2-0 in maps = huge advantage
-            // Also round scores: 13-5 on a map means domination
-            if score_diff >= 3 && implied1 > 40.0 {
-                // team1 is dominating but odds think it's somewhat close
-                // Fair estimate: team1 should have higher prob than implied
-                let fair1 = (implied1 + 15.0_f64).min(95.0);
+            // CS2 Bo3 MAP scores: 1-0 = won first map (~68% win prob)
+            // Even +1 map lead is significant for score edge!
+            if score_diff >= 1 && implied1 < 75.0 {
+                // team1 is leading maps but odds haven't fully adjusted
+                // Score-implied fair probability: 1-0 → 68%, 2-0 → 95%
+                let fair1 = match score_diff {
+                    1 => 68.0_f64,
+                    2 => 95.0,
+                    _ => (implied1 + 15.0).min(95.0),
+                };
                 let edge = fair1 - implied1;
                 if edge > 3.0 {
                     opportunities.push(Opportunity {
@@ -365,8 +380,12 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
                 }
             }
 
-            if score_diff <= -3 && implied2 > 40.0 {
-                let fair2 = (implied2 + 15.0_f64).min(95.0);
+            if score_diff <= -1 && implied2 < 75.0 {
+                let fair2 = match score_diff.abs() {
+                    1 => 68.0_f64,
+                    2 => 95.0,
+                    _ => (implied2 + 15.0).min(95.0),
+                };
                 let edge = fair2 - implied2;
                 if edge > 3.0 {
                     opportunities.push(Opportunity {
