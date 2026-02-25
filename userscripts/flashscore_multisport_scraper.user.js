@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         FlashScore → Feed Hub MULTI-SPORT Scraper v2
+// @name         FlashScore → Feed Hub MULTI-SPORT Scraper v3
 // @namespace    rustmisko
-// @version      2.0
-// @description  Scrapes ALL live matches from FlashScore (tennis, football, basketball, hockey, etc.), sends to Feed Hub via WebSocket
+// @version      3.0
+// @description  Scrapes ALL live matches from FlashScore using generic DOM detection (no CSS class dependency). Supports tennis, football, basketball, esports, etc.
 // @author       RustMisko
 // @match        https://www.flashscore.com/*
 // @match        https://www.flashscore.cz/*
@@ -14,31 +14,28 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 5000; // 5s — universal for all sports
+  const SCAN_INTERVAL_MS = 5000;
   const RECONNECT_MS = 3000;
   const HEARTBEAT_MS = 15000;
   const SOURCE_NAME = "flashscore-multi";
   const DEBUG = true;
-
-  // Auto-refresh to keep DOM fresh (10 min — longer for multi-sport)
-  const AUTO_REFRESH_MS = 10 * 60 * 1000;
+  const AUTO_REFRESH_MS = 10 * 60 * 1000; // 10 min
 
   let ws = null;
   let connected = false;
   let sentCount = 0;
+  let matchCount = 0;
   let scanTimer = null;
   let hbTimer = null;
-  let lastScanHash = "";
 
   const PREFIX = "[FS→Hub]";
   function log(...args) { console.log(PREFIX, ...args); }
   function dbg(...args) { if (DEBUG) console.log(PREFIX, "[DBG]", ...args); }
 
   // ====================================================================
-  // SPORT DETECTION
+  // SPORT DETECTION — URL-first, reliable
   // ====================================================================
 
-  // FlashScore sport slug → our protocol sport name
   const SPORT_MAP = {
     "tennis":     "tennis",
     "tenis":      "tennis",
@@ -62,88 +59,20 @@
     "dota-2":     "dota-2",
     "csgo":       "cs2",
     "cs2":        "cs2",
-    "cs:go":      "cs2",
     "counter-strike": "cs2",
     "lol":        "league-of-legends",
     "league-of-legends": "league-of-legends",
+    "table-tennis": "table-tennis",
+    "badminton":  "badminton",
   };
 
-  /**
-   * Detect sport from URL, breadcrumb, or event header
-   */
   function detectSportFromURL() {
-    const url = window.location.href.toLowerCase();
+    const path = window.location.pathname.toLowerCase();
     for (const [key, sport] of Object.entries(SPORT_MAP)) {
-      if (url.includes(`/${key}/`) || url.includes(`/${key}?`)) {
+      if (path.startsWith(`/${key}/`) || path === `/${key}`) {
         return sport;
       }
     }
-    return null;
-  }
-
-  function detectSportFromElement(el) {
-    if (!el) return null;
-
-    // Strategy 1: Check parent/ancestor with sport info
-    const header = el.closest('.event__header, [class*="sportName"], [class*="event__title"]');
-    if (header) {
-      const text = header.textContent.toLowerCase();
-      for (const [key, sport] of Object.entries(SPORT_MAP)) {
-        if (text.includes(key)) return sport;
-      }
-    }
-
-    // Strategy 2: Walk BACKWARDS through siblings to find sport header
-    // FlashScore main page: [sport header div] [match] [match] [sport header] [match]...
-    let sibling = el.previousElementSibling;
-    let maxWalk = 50; // Don't walk too far
-    while (sibling && maxWalk-- > 0) {
-      const cls = sibling.className || "";
-      if (cls.includes("event__header") || cls.includes("sportName") || cls.includes("event__title")) {
-        const text = sibling.textContent.toLowerCase();
-        for (const [key, sport] of Object.entries(SPORT_MAP)) {
-          if (text.includes(key)) return sport;
-        }
-        break; // Found a header but no sport match — stop walking
-      }
-      sibling = sibling.previousElementSibling;
-    }
-
-    // Strategy 3: Check data attributes
-    const sportAttr = el.getAttribute("data-sport") || el.closest("[data-sport]")?.getAttribute("data-sport");
-    if (sportAttr) {
-      const normalized = sportAttr.toLowerCase();
-      return SPORT_MAP[normalized] || normalized;
-    }
-
-    // Strategy 4: Check icon classes (FlashScore uses sport icons)
-    const iconEl = el.querySelector('[class*="icon--"], [class*="sport-icon"]') ||
-                   el.closest('[class*="icon--"]');
-    if (iconEl) {
-      const cls = iconEl.className.toLowerCase();
-      for (const [key, sport] of Object.entries(SPORT_MAP)) {
-        if (cls.includes(key)) return sport;
-      }
-    }
-
-    return null;
-  }
-
-  function getPageSport() {
-    // 1. URL-based
-    const urlSport = detectSportFromURL();
-    if (urlSport) return urlSport;
-
-    // 2. Heading / breadcrumb
-    const heading = document.querySelector('.heading__title, .breadcrumb, [class*="heading"]');
-    if (heading) {
-      const text = heading.textContent.toLowerCase();
-      for (const [key, sport] of Object.entries(SPORT_MAP)) {
-        if (text.includes(key)) return sport;
-      }
-    }
-
-    // 3. Main page — unknown/mixed
     return null;
   }
 
@@ -162,22 +91,21 @@
       max-height: 300px; overflow-y: auto;
     `;
     panel.innerHTML = `
-      <div style="font-weight:bold; margin-bottom: 4px;">🏆 Multi-Sport → Feed Hub v2</div>
+      <div style="font-weight:bold; margin-bottom: 4px;">🏆 Multi-Sport → Feed Hub v3</div>
       <div id="fs-status" style="color: #fa0;">⏳ Connecting...</div>
       <div id="fs-sport" style="margin-top: 2px; color: #aaa;">Sport: detecting...</div>
-      <div id="fs-matches" style="margin-top: 4px; color: #aaa; max-height: 150px; overflow-y: auto;">Scanning...</div>
+      <div id="fs-matches" style="margin-top: 4px; color: #aaa; white-space: pre-wrap; max-height: 180px; overflow-y: auto;">Scanning...</div>
       <div id="fs-sent" style="margin-top: 2px; color: #888;">Sent: 0</div>
     `;
     document.body.appendChild(panel);
-    return panel;
   }
 
-  function updatePanel(status, sport, matches, sent) {
+  function updatePanel(status, sport, matchesText, sent) {
     const el = (id) => document.getElementById(id);
     if (el("fs-status")) el("fs-status").textContent = status;
-    if (el("fs-sport")) el("fs-sport").textContent = `Sport: ${sport || "all/unknown"}`;
-    if (el("fs-matches")) el("fs-matches").textContent = matches;
-    if (el("fs-sent")) el("fs-sent").textContent = `Sent: ${sent}`;
+    if (el("fs-sport")) el("fs-sport").textContent = `Sport: ${sport || "detecting..."}`;
+    if (el("fs-matches")) el("fs-matches").textContent = matchesText;
+    if (el("fs-sent")) el("fs-sent").textContent = `Sent: ${sent} | Live: ${matchCount}`;
   }
 
   // ====================================================================
@@ -185,28 +113,25 @@
   // ====================================================================
   function connectWS() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
-
     log("Connecting to", WS_URL);
     ws = new WebSocket(WS_URL);
 
     ws.onopen = () => {
       connected = true;
       log("✅ Connected to Feed Hub");
-      updatePanel("✅ Connected", getPageSport(), "Scanning...", sentCount);
+      updatePanel("✅ Connected", detectSportFromURL(), "Scanning...", sentCount);
       startScanning();
       startHeartbeat();
     };
-
     ws.onclose = (e) => {
       connected = false;
-      log("❌ Disconnected:", e.code, e.reason);
-      updatePanel("❌ Disconnected", getPageSport(), "Reconnecting...", sentCount);
+      log("❌ Disconnected:", e.code);
+      updatePanel("❌ Disconnected", detectSportFromURL(), "Reconnecting...", sentCount);
       stopScanning();
       stopHeartbeat();
       setTimeout(connectWS, RECONNECT_MS);
     };
-
-    ws.onerror = (e) => { log("WS error:", e); };
+    ws.onerror = () => {};
     ws.onmessage = (e) => { dbg("Server:", e.data); };
   }
 
@@ -220,50 +145,105 @@
   function startHeartbeat() {
     stopHeartbeat();
     hbTimer = setInterval(() => {
-      if (connected) {
-        sendJSON({ v: 1, type: "heartbeat", source: SOURCE_NAME, ts: new Date().toISOString() });
-      }
+      if (connected) sendJSON({ v: 1, type: "heartbeat", source: SOURCE_NAME, ts: new Date().toISOString() });
     }, HEARTBEAT_MS);
   }
   function stopHeartbeat() { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } }
 
   // ====================================================================
-  // SCANNING — FlashScore DOM extraction (MULTI-SPORT)
+  // GENERIC DOM SCANNING — v3.0
   // ====================================================================
+  /**
+   * FlashScore DOM strategy (works regardless of CSS class names):
+   *
+   * Strategy 1: Elements with id starting with "g_1_" = LIVE matches on FlashScore
+   *   FlashScore uses: g_1_ = live, g_2_ = finished, g_3_ = not started
+   *
+   * Strategy 2: Elements with class containing "event__match" + "live"
+   *
+   * Strategy 3: Generic scan of container divs with participant + score patterns
+   */
 
   function scanAllLiveMatches() {
     const matches = [];
-    const pageSport = getPageSport();
+    const seen = new Set();
+    const pageSport = detectSportFromURL();
 
-    // Find all live match rows
-    const liveRows = document.querySelectorAll(
-      '.event__match--live, .event__match--oneLine--live, [class*="event__match"][class*="live"]'
-    );
+    // === STRATEGY 1: g_1_ IDs (FlashScore standard for live matches) ===
+    const gLiveEls = document.querySelectorAll('[id^="g_1_"]');
+    dbg(`Strategy 1: ${gLiveEls.length} g_1_ elements`);
+    for (const el of gLiveEls) {
+      const match = tryExtractMatch(el, pageSport, seen);
+      if (match) matches.push(match);
+    }
 
-    for (const row of liveRows) {
-      try {
-        const match = extractMatchFromRow(row, pageSport);
-        if (match) {
-          matches.push(match);
+    // === STRATEGY 2: BEM class patterns ===
+    if (matches.length === 0) {
+      const bemLive = document.querySelectorAll(
+        '[class*="event__match"][class*="live"], [class*="event__match--live"]'
+      );
+      dbg(`Strategy 2a: ${bemLive.length} event__match--live elements`);
+      for (const el of bemLive) {
+        const match = tryExtractMatch(el, pageSport, seen);
+        if (match) matches.push(match);
+      }
+
+      // Also try ALL event__match elements and filter for live
+      if (matches.length === 0) {
+        const allBem = document.querySelectorAll('[class*="event__match"]');
+        dbg(`Strategy 2b: ${allBem.length} event__match elements`);
+        for (const el of allBem) {
+          if (isLiveElement(el)) {
+            const match = tryExtractMatch(el, pageSport, seen);
+            if (match) matches.push(match);
+          }
         }
-      } catch (e) {
-        dbg("Error extracting match:", e);
       }
     }
 
-    // Fallback: if on a specific sport page, check all rows for live indicators
-    if (matches.length === 0 && pageSport) {
-      const allRows = document.querySelectorAll('.event__match, [id^="g_1_"]');
-      for (const row of allRows) {
-        try {
-          if (isLiveRow(row)) {
-            const match = extractMatchFromRow(row, pageSport);
-            if (match) {
-              matches.push(match);
-            }
+    // === STRATEGY 3: Find divs with "participant" children + score ===
+    if (matches.length === 0) {
+      dbg("Strategy 3: looking for participant elements...");
+      const participantEls = document.querySelectorAll(
+        '[class*="participant"], [class*="team"], [class*="player"]'
+      );
+      dbg(`Found ${participantEls.length} participant-like elements`);
+
+      // Walk up to find match containers
+      const containers = new Set();
+      for (const el of participantEls) {
+        let parent = el.parentElement;
+        for (let i = 0; i < 4; i++) {
+          if (!parent || parent === document.body) break;
+          // A match row container should have 2+ participant children
+          const parts = parent.querySelectorAll('[class*="participant"], [class*="team"], [class*="player"]');
+          if (parts.length >= 2) {
+            containers.add(parent);
+            break;
           }
-        } catch (e) {
-          dbg("Error in fallback scan:", e);
+          parent = parent.parentElement;
+        }
+      }
+      dbg(`Strategy 3: ${containers.size} potential containers`);
+      for (const el of containers) {
+        if (isLiveElement(el)) {
+          const match = tryExtractMatch(el, pageSport, seen);
+          if (match) matches.push(match);
+        }
+      }
+    }
+
+    // === STRATEGY 4: Last resort — find ALL <a> pairs that look like team matchups ===
+    if (matches.length === 0) {
+      dbg("Strategy 4: link-based scan...");
+      const allLinks = document.querySelectorAll('a[href*="/match/"], a[href*="/game/"]');
+      dbg(`Found ${allLinks.length} match/game links`);
+      for (const link of allLinks) {
+        const container = link.closest('div, tr, li, article') || link.parentElement;
+        if (!container) continue;
+        if (isLiveElement(container)) {
+          const match = tryExtractMatch(container, pageSport, seen);
+          if (match) matches.push(match);
         }
       }
     }
@@ -271,96 +251,195 @@
     return matches;
   }
 
-  function isLiveRow(row) {
-    const classes = row.className || "";
-    if (classes.includes("live")) return true;
+  /**
+   * Try to extract a live match from a DOM element.
+   */
+  function tryExtractMatch(el, pageSport, seen) {
+    const names = findParticipants(el);
+    if (names.length < 2) return null;
 
-    const stageEl = row.querySelector('.event__stage, .event__stage--live, [class*="stage"]');
-    if (stageEl) {
-      const text = stageEl.textContent.trim().toLowerCase();
-      if (text && !text.includes("finished") && !text.includes("ended")
-        && !text.includes("after") && !text.includes("final")
-        && !text.includes("postp") && !text.includes("cancel")) {
-        return true;
+    const team1 = cleanTeamName(names[0]);
+    const team2 = cleanTeamName(names[1]);
+
+    if (!team1 || !team2 || team1.length < 2 || team2.length < 2) return null;
+    if (team1.toLowerCase() === team2.toLowerCase()) return null;
+
+    const key = `${team1.toLowerCase()}|${team2.toLowerCase()}`;
+    if (seen.has(key)) return null;
+    seen.add(key);
+
+    const scores = extractScores(el);
+    const sport = pageSport || "unknown";
+    if (sport === "unknown") {
+      dbg(`Skip unknown sport: ${team1} vs ${team2}`);
+      return null;
+    }
+
+    return {
+      team1, team2,
+      score1: scores.score1,
+      score2: scores.score2,
+      status: scores.status || "Live",
+      sport,
+    };
+  }
+
+  /**
+   * Find participant/team name texts within a container.
+   */
+  function findParticipants(container) {
+    const names = [];
+
+    // Method 1: Elements with "participant" in class
+    const partEls = container.querySelectorAll('[class*="participant"]');
+    if (partEls.length >= 2) {
+      for (const el of partEls) {
+        const text = getCleanText(el);
+        if (isNameLike(text)) names.push(text);
+      }
+      if (names.length >= 2) return names.slice(0, 2);
+      names.length = 0; // Reset if not enough
+    }
+
+    // Method 2: Elements with "team" or "player" in class
+    const teamEls = container.querySelectorAll('[class*="team"], [class*="player"]');
+    if (teamEls.length >= 2) {
+      for (const el of teamEls) {
+        const text = getCleanText(el);
+        if (isNameLike(text)) names.push(text);
+      }
+      if (names.length >= 2) return names.slice(0, 2);
+      names.length = 0;
+    }
+
+    // Method 3: Direct child <a> or <span> with name-like text
+    const inlineEls = container.querySelectorAll('a, span');
+    for (const el of inlineEls) {
+      if (el.children.length > 3) continue; // Skip containers with many children
+      const text = getCleanText(el);
+      if (text.length >= 3 && text.length <= 40 && isNameLike(text)) {
+        // Avoid adding the same name twice
+        if (!names.includes(text)) names.push(text);
+        if (names.length >= 2) return names.slice(0, 2);
       }
     }
 
-    const timerEl = row.querySelector('.icon--clock, .eventTimer, [class*="timer"], [class*="clock"]');
-    if (timerEl) return true;
+    return names;
+  }
+
+  function getCleanText(el) {
+    // Get text, preferring direct text content over nested element text
+    let direct = '';
+    for (const child of el.childNodes) {
+      if (child.nodeType === 3) direct += child.textContent;
+    }
+    direct = direct.trim();
+    if (direct && direct.length >= 2) return direct;
+
+    // Fallback: if element has no deep children, use full textContent
+    if (el.querySelectorAll('*').length <= 2) {
+      return el.textContent.trim();
+    }
+    return direct || '';
+  }
+
+  function isNameLike(text) {
+    if (!text || text.length < 2 || text.length > 50) return false;
+    if (!/[a-zA-ZÀ-ž]/.test(text)) return false;
+    if (/^\d+[:\-\.]\d+$/.test(text)) return false;
+    if (/^\d+$/.test(text)) return false;
+    if (/^(live|finished|after|half|set|quarter|period|inning|round|game|break|postp|cancel|FT|HT|AET|Pen|AP|ET|OT)$/i.test(text)) return false;
+    return true;
+  }
+
+  /**
+   * Check if element represents a LIVE match.
+   */
+  function isLiveElement(el) {
+    const cls = (el.className || "").toLowerCase();
+    const id = (el.id || "").toLowerCase();
+
+    // FlashScore ID convention: g_1_ = live
+    if (id.startsWith("g_1_")) return true;
+    if (id.startsWith("g_2_") || id.startsWith("g_3_") || id.startsWith("g_4_")) return false;
+
+    // Class-based
+    if (cls.includes("--live") || cls.includes("live")) return true;
+
+    // Content-based
+    const txt = el.textContent;
+
+    // Finished indicators (exclude these)
+    if (/(finished|ended|FT|AET|Final|After OT|After Pen|Cancelled|Postponed|Awarded|Walkover|WO|Retired|Abandoned)/i.test(txt)) {
+      // But check if it's just a small part — could have multiple matches
+      const finEls = el.querySelectorAll('[class*="stage"], [class*="status"]');
+      for (const fin of finEls) {
+        if (/(finished|ended|FT|Final)/i.test(fin.textContent)) return false;
+      }
+    }
+
+    // Live time indicators
+    if (/\d+'/.test(txt)) return true; // Football minutes: "45'"
+    if (/(1st|2nd|3rd|4th|5th)\s*(set|half|quarter|period|map|OT)/i.test(txt)) return true;
+    if (/[12345]\.\s*(set|pol|čtvrt|mapa|třet)/i.test(txt)) return true;
+    if (/přestávka|half[\s-]*time|break|pause/i.test(txt)) return true;
+
+    // Clock/timer elements
+    if (el.querySelector('[class*="clock"], [class*="timer"], [class*="stage--live"], [class*="blink"]')) return true;
 
     return false;
   }
 
-  function extractMatchFromRow(row, pageSport) {
-    // Team names
-    const participants = row.querySelectorAll(
-      '.event__participant, [class*="participant"], .event__participant--home, .event__participant--away'
-    );
-    if (participants.length < 2) return null;
-
-    const team1 = cleanTeamName(participants[0].textContent);
-    const team2 = cleanTeamName(participants[1].textContent);
-    if (!team1 || !team2) return null;
-    // Skip if both teams are identical (DOM parsing bug on some pages)
-    if (team1 === team2) return null;
-
-    // Detect sport for this row
-    const sport = detectSportFromElement(row) || pageSport || "unknown";
-    // Skip unknown sport — we can't match it to Azuro without sport classification
-    if (sport === "unknown") {
-      dbg(`Skipping unknown sport: ${team1} vs ${team2}`);
-      return null;
-    }
-
-    // === SCORE EXTRACTION ===
-    // FlashScore uses different score layouts per sport:
-    //   Tennis: sets (main score) + games (parts)
-    //   Football: goals (main score) + halftime
-    //   Basketball: total points (main) + quarters (parts)
-
-    // Main score (total / sets won)
-    const scoreEls = row.querySelectorAll('.event__score, [class*="event__score"]');
+  /**
+   * Extract scores from a match container.
+   */
+  function extractScores(el) {
     let score1 = 0, score2 = 0;
-    if (scoreEls.length >= 2) {
-      score1 = parseInt(scoreEls[0].textContent.trim()) || 0;
-      score2 = parseInt(scoreEls[1].textContent.trim()) || 0;
+    let status = "Live";
+
+    // Priority 1: Elements with "score" in class
+    const scoreEls = el.querySelectorAll('[class*="score"]');
+    const scoreValues = [];
+    for (const sel of scoreEls) {
+      // Only leaf-ish elements
+      if (sel.querySelectorAll('[class*="score"]').length > 0) continue;
+      const num = parseInt(sel.textContent.trim());
+      if (!isNaN(num) && num >= 0 && num < 999) {
+        scoreValues.push(num);
+      }
+    }
+    if (scoreValues.length >= 2) {
+      score1 = scoreValues[0];
+      score2 = scoreValues[1];
     }
 
-    // Period/set/quarter scores
-    const partEls = row.querySelectorAll('.event__part, [class*="event__part"]');
-    const partScores = [];
-    for (let i = 0; i < partEls.length; i += 2) {
-      if (i + 1 < partEls.length) {
-        const s1 = parseInt(partEls[i].textContent.trim()) || 0;
-        const s2 = parseInt(partEls[i + 1].textContent.trim()) || 0;
-        partScores.push(`${s1}-${s2}`);
+    // Priority 2: Regex fallback
+    if (score1 === 0 && score2 === 0) {
+      const scoreMatch = el.textContent.match(/(\d{1,3})\s*[-:–]\s*(\d{1,3})/);
+      if (scoreMatch) {
+        score1 = parseInt(scoreMatch[1]) || 0;
+        score2 = parseInt(scoreMatch[2]) || 0;
       }
     }
 
-    // Game status
-    const stageEl = row.querySelector('.event__stage, .event__stage--live, [class*="stage"]');
-    const status = stageEl ? stageEl.textContent.trim() : "Live";
+    // Status extraction
+    const stageEl = el.querySelector('[class*="stage"], [class*="status"], [class*="period"]');
+    if (stageEl) {
+      const text = stageEl.textContent.trim();
+      if (text.length > 0 && text.length < 50) {
+        status = text;
+      }
+    }
 
-    // Match ID
-    const matchId = row.id || row.getAttribute("data-id") || `${team1}_${team2}`;
-
-    return {
-      team1,
-      team2,
-      score1,   // Main score (sets for tennis, goals for football, etc.)
-      score2,
-      partScores,
-      status,
-      sport,
-      matchId,
-    };
+    return { score1, score2, status };
   }
 
   function cleanTeamName(text) {
     if (!text) return "";
     return text
-      .replace(/\(\d+\)/g, "")    // Remove seeding "(1)"
-      .replace(/\(W\)/gi, "")      // Remove "(W)" women marker
+      .replace(/\(\d+\)/g, "")    // Remove seeding
+      .replace(/\(W\)/gi, "")     // Remove women marker
+      .replace(/^\d+\.\s*/, "")   // Remove ranking
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -388,19 +467,6 @@
   }
 
   // ====================================================================
-  // ODDS SCRAPING (from FlashScore odds comparison)
-  // ====================================================================
-  // FlashScore sometimes shows odds from bookmakers — we can scrape those
-  // as additional reference data for odds anomaly detection.
-  // This is a bonus feature — not all pages show odds.
-
-  function scrapeVisibleOdds(matches) {
-    // On match detail pages, FlashScore shows odds from various bookmakers.
-    // Currently we only send live_match data; odds scraping is for future use.
-    // TODO: Implement odds scraping from FlashScore comparison tables
-  }
-
-  // ====================================================================
   // SCAN LOOP
   // ====================================================================
 
@@ -409,15 +475,11 @@
     doScan();
     scanTimer = setInterval(doScan, SCAN_INTERVAL_MS);
   }
-
-  function stopScanning() {
-    if (scanTimer) { clearInterval(scanTimer); scanTimer = null; }
-  }
+  function stopScanning() { if (scanTimer) { clearInterval(scanTimer); scanTimer = null; } }
 
   function doScan() {
     const matches = scanAllLiveMatches();
-    const hash = JSON.stringify(matches.map(m => `${m.sport}:${m.team1}:${m.team2}:${m.score1}:${m.score2}`));
-
+    matchCount = matches.length;
     let sentThisScan = 0;
     const sportCounts = {};
 
@@ -430,22 +492,28 @@
     }
 
     const statusText = connected ? "✅ Connected" : "❌ Disconnected";
-    const pageSport = getPageSport();
+    const pageSport = detectSportFromURL();
 
     const matchInfo = matches.length > 0
       ? matches.slice(0, 10).map(m =>
-          `[${m.sport}] ${m.team1} ${m.score1}-${m.score2} ${m.team2}`
+          `${m.team1} ${m.score1}-${m.score2} ${m.team2}`
         ).join("\n") + (matches.length > 10 ? `\n...+${matches.length - 10} more` : "")
       : "No live matches found";
 
-    const sportSummary = Object.entries(sportCounts).map(([s, c]) => `${s}:${c}`).join(", ");
+    updatePanel(statusText, pageSport, matchInfo, sentCount);
 
-    updatePanel(statusText, pageSport || sportSummary, matchInfo, sentCount);
-
-    if (matches.length > 0 || hash !== lastScanHash) {
+    if (matches.length > 0) {
+      const sportSummary = Object.entries(sportCounts).map(([s, c]) => `${s}:${c}`).join(", ");
       log(`Scan: ${matches.length} live [${sportSummary}], sent ${sentThisScan}`);
+    } else {
+      // Debug: report what DOM elements we see
+      const g1 = document.querySelectorAll('[id^="g_1_"]').length;
+      const g2 = document.querySelectorAll('[id^="g_2_"]').length;
+      const evMatch = document.querySelectorAll('[class*="event__match"]').length;
+      const partEl = document.querySelectorAll('[class*="participant"]').length;
+      const scoreEl = document.querySelectorAll('[class*="score"]').length;
+      dbg(`DOM: g_1_=${g1} g_2_=${g2} event__match=${evMatch} participant=${partEl} score=${scoreEl}`);
     }
-    lastScanHash = hash;
   }
 
   // ====================================================================
@@ -464,26 +532,17 @@
   // ====================================================================
 
   function init() {
-    const pageSport = getPageSport();
-    log(`🏆 FlashScore Multi-Sport Scraper v2.0`);
+    const pageSport = detectSportFromURL();
+    log(`🏆 FlashScore Multi-Sport Scraper v3.0 (Generic DOM)`);
     log(`Page: ${window.location.href}`);
     log(`Detected sport: ${pageSport || "all/mixed"}`);
+    log(`Strategy: g_1_ IDs → BEM classes → participant elements → link scan`);
 
     createPanel();
     connectWS();
     scheduleAutoRefresh();
-
-    if (!pageSport) {
-      log("📋 Main page detected — will scrape ALL visible live matches");
-      log("  For best results, navigate to a specific sport:");
-      log("  Tennis:     flashscore.com/tennis/");
-      log("  Football:   flashscore.com/football/");
-      log("  Basketball: flashscore.com/basketball/");
-      log("  Esports:    flashscore.com/esports/");
-    }
   }
 
-  // Wait for page to settle
   if (document.readyState === "complete") {
     setTimeout(init, 1500);
   } else {
