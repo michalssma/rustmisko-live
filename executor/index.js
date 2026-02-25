@@ -20,7 +20,7 @@
  */
 
 import express from 'express';
-import { createWalletClient, createPublicClient, http, parseAbi, formatUnits } from 'viem';
+import { createWalletClient, createPublicClient, http, fallback, parseAbi, formatUnits } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon, gnosis, base } from 'viem/chains';
 
@@ -31,6 +31,14 @@ import { polygon, gnosis, base } from 'viem/chains';
 const PORT = parseInt(process.env.EXECUTOR_PORT || '3030');
 const CHAIN_ID = parseInt(process.env.CHAIN_ID || '137');
 const RPC_URL = process.env.RPC_URL || 'https://polygon-bor-rpc.publicnode.com';
+
+// Multiple RPC endpoints for reliability (fallback chain)
+const RPC_URLS = [
+  RPC_URL,
+  'https://polygon-rpc.com',
+  'https://rpc.ankr.com/polygon',
+  'https://polygon.drpc.org',
+];
 
 // Private key — optional, dry-run mode if not set
 const RAW_KEY = process.env.PRIVATE_KEY;
@@ -81,15 +89,17 @@ if (!contracts) {
 const account = DRY_RUN ? null : privateKeyToAccount(PRIVATE_KEY);
 const chain = CHAIN_ID === 137 ? polygon : CHAIN_ID === 100 ? gnosis : base;
 
+const rpcTransport = fallback(RPC_URLS.map(url => http(url)), { rank: true });
+
 const walletClient = DRY_RUN ? null : createWalletClient({
   account,
   chain,
-  transport: http(RPC_URL),
+  transport: rpcTransport,
 });
 
 const publicClient = createPublicClient({
   chain,
-  transport: http(RPC_URL),
+  transport: rpcTransport,
 });
 
 if (DRY_RUN) {

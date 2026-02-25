@@ -1399,12 +1399,18 @@ async fn main() -> Result<()> {
             for line in contents.lines() {
                 let parts: Vec<&str> = line.split('|').collect();
                 if parts.len() >= 6 {
-                    let token_id = parts[0].to_string();
+                    let token_id_raw = parts[0].to_string();
                     let bet_id = parts[1].to_string();
                     let match_key = parts[2].to_string();
                     let value_team = parts[3].to_string();
                     let amount_usd: f64 = parts[4].parse().unwrap_or(2.0);
                     let odds: f64 = parts[5].parse().unwrap_or(1.5);
+                    // "?" means tokenId not yet discovered — set to None so PATH B will discover it
+                    let token_id = if token_id_raw == "?" || token_id_raw.is_empty() {
+                        None
+                    } else {
+                        Some(token_id_raw)
+                    };
                     active_bets.push(ActiveBet {
                         alert_id: 0,
                         bet_id: bet_id.clone(),
@@ -1418,7 +1424,7 @@ async fn main() -> Result<()> {
                         condition_id: String::new(),
                         outcome_id: String::new(),
                         graph_bet_id: None,
-                        token_id: Some(token_id),
+                        token_id,
                     });
                 }
             }
@@ -1805,9 +1811,16 @@ async fn main() -> Result<()> {
                             // Try to get bet status from executor to discover token_id
                             if let Ok(resp) = client.get(format!("{}/bet/{}", executor_url, bet.bet_id)).send().await {
                                 if let Ok(status) = resp.json::<serde_json::Value>().await {
-                                    if let Some(tid) = status.get("tokenId").and_then(|v| v.as_str()) {
-                                        bet.token_id = Some(tid.to_string());
-                                        tid.to_string()
+                                    // Azuro toolkit returns "betId" (number) not "tokenId" (string)
+                                    let discovered_tid = status.get("tokenId").and_then(|v| v.as_str().map(|s| s.to_string()))
+                                        .or_else(|| status.get("betId").and_then(|v| {
+                                            v.as_u64().map(|n| n.to_string())
+                                                .or_else(|| v.as_str().map(|s| s.to_string()))
+                                        }));
+                                    if let Some(tid) = discovered_tid {
+                                        info!("🔍 Discovered tokenId {} for bet {} (cashout)", tid, bet.bet_id);
+                                        bet.token_id = Some(tid.clone());
+                                        tid
                                     } else if let Some(gid) = status.get("graphBetId").and_then(|v| v.as_str()) {
                                         bet.graph_bet_id = Some(gid.to_string());
                                         continue; // still no tokenId
@@ -1961,9 +1974,15 @@ async fn main() -> Result<()> {
                     };
 
                     // Update token_id if discovered
+                    // Azuro toolkit returns "betId" (number like 220860) not "tokenId" (string)
                     if bet.token_id.is_none() {
-                        if let Some(tid) = status.get("tokenId").and_then(|v| v.as_str()) {
-                            bet.token_id = Some(tid.to_string());
+                        let discovered_tid = status.get("tokenId").and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .or_else(|| status.get("betId").and_then(|v| {
+                                v.as_u64().map(|n| n.to_string())
+                                    .or_else(|| v.as_str().map(|s| s.to_string()))
+                            }));
+                        if let Some(tid) = discovered_tid {
+                            bet.token_id = Some(tid.clone());
                             // Update pending_claims file with real tokenId
                             if let Ok(mut f) = std::fs::OpenOptions::new()
                                 .create(true).append(true)
@@ -1983,7 +2002,7 @@ async fn main() -> Result<()> {
 
                     // Check if bet is settled
                     let is_settled = match state {
-                        "Resolved" | "Canceled" => true,
+                        "Resolved" | "Canceled" | "Settled" => true,
                         _ => !result.is_empty() && (result == "Won" || result == "Lost" || result == "Canceled"),
                     };
 
