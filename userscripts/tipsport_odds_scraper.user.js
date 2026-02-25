@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Tipsport → Feed Hub Odds Scraper
 // @namespace    rustmisko
-// @version      1.0
-// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub as reference odds for anomaly detection
+// @version      2.0
+// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub as reference odds for anomaly detection (generic DOM v2)
 // @author       RustMisko
 // @match        https://www.tipsport.cz/*
 // @match        https://m.tipsport.cz/*
@@ -160,177 +160,172 @@
   function stopHeartbeat() { if (hbTimer) { clearInterval(hbTimer); hbTimer = null; } }
 
   // ====================================================================
-  // TIPSPORT SCRAPING
+  // TIPSPORT SCRAPING — Generic DOM approach v2.0
   // ====================================================================
-
   /**
-   * Tipsport DOM structure (may vary, we try multiple selectors):
-   *
-   * Live matches typically in a table/list with:
-   *   - Match name (team1 - team2)
-   *   - "1" / "X" / "2" odds buttons
-   *   - Live indicator (score, clock, "LIVE" badge)
-   *
-   * Selectors may include:
-   *   .o-match, .m-matchRow, .o-event, [data-testid*="match"]
-   *   .o-odd__value, .m-odds__odd, [class*="odd"]
-   *
-   * We try multiple strategies to handle DOM changes.
+   * Instead of relying on specific CSS classes (which change with Tipsport updates),
+   * we use a generic approach:
+   *   1. Find all <a> links with "Team1 - Team2" text pattern
+   *   2. Walk up the DOM to find the match container with odds values
+   *   3. Extract odds from leaf elements matching decimal number pattern
+   * This works regardless of Tipsport's CSS class naming.
    */
 
   function scanTipsportMatches() {
     const matches = [];
     const sport = detectTipsportSport();
+    const seen = new Set();
 
-    // Strategy 1: Modern Tipsport layout
-    const matchRows = document.querySelectorAll(
-      '.o-match, .m-matchRow, .o-event, [class*="match-row"], [class*="eventRow"], [data-testid*="match"], tr[class*="match"]'
-    );
+    // Find all <a> links that look like match names: "Team1 - Team2"
+    const allLinks = document.querySelectorAll('a');
+    let candidateCount = 0;
 
-    for (const row of matchRows) {
-      try {
-        const match = extractTipsportMatch(row, sport);
-        if (match && match.hasOdds) {
-          matches.push(match);
-        }
-      } catch (e) {
-        dbg("Error extracting Tipsport match:", e);
+    for (const link of allLinks) {
+      const rawText = link.textContent.trim();
+
+      // Quick filters
+      if (rawText.length < 5 || rawText.length > 150) continue;
+      if (rawText.includes('\n') || rawText.includes('\r')) continue;
+
+      // Must contain " - " separator (team1 - team2)
+      const dashIdx = rawText.indexOf(' - ');
+      if (dashIdx < 2) continue;
+
+      // Also accept " – " (en-dash)
+      let t1, t2;
+      const dashMatch = rawText.match(/^(.+?)\s*[-–]\s*(.+)$/);
+      if (!dashMatch) continue;
+      t1 = cleanName(dashMatch[1]);
+      t2 = cleanName(dashMatch[2]);
+
+      if (!t1 || !t2 || t1.length < 2 || t2.length < 2) continue;
+      if (t1.toLowerCase() === t2.toLowerCase()) continue;
+
+      // Skip league/header links (contain comma + sport name like "Liga mistrů, Fotbal - muži")
+      if (rawText.includes(',') && /fotbal|tenis|hokej|basket/i.test(rawText)) continue;
+
+      // Deduplicate
+      const key = `${t1.toLowerCase()}|${t2.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidateCount++;
+
+      // Walk up DOM to find the match container with odds
+      const rowInfo = findMatchRowData(link);
+      if (!rowInfo || !rowInfo.hasOdds) {
+        dbg(`No odds for: ${t1} - ${t2}`);
+        continue;
       }
+
+      matches.push({
+        team1: t1,
+        team2: t2,
+        odds1: rowInfo.odds1,
+        odds2: rowInfo.odds2,
+        oddsX: rowInfo.oddsX,
+        score1: rowInfo.score1,
+        score2: rowInfo.score2,
+        isLive: rowInfo.isLive,
+        hasOdds: rowInfo.hasOdds,
+        sport: sport || "unknown",
+      });
     }
 
-    // Strategy 2: Try generic table rows if nothing found
-    if (matches.length === 0) {
-      const tableRows = document.querySelectorAll(
-        'table tbody tr, .event-list-item, [class*="event__"]'
-      );
-      for (const row of tableRows) {
-        try {
-          const match = extractTipsportMatch(row, sport);
-          if (match && match.hasOdds) {
-            matches.push(match);
-          }
-        } catch (e) { /* skip */ }
-      }
-    }
-
+    dbg(`Link candidates: ${candidateCount}, with odds: ${matches.length}`);
     return matches;
   }
 
-  function extractTipsportMatch(row, sport) {
-    // === TEAM NAMES ===
-    // Tipsport shows "Team1 - Team2" in match name, or separate participant elements
-    const nameEl = row.querySelector(
-      '.o-match__name, .m-matchRow__name, [class*="match-name"], [class*="matchName"], [class*="event-name"], .o-match__participants'
-    );
+  /**
+   * Walk up the DOM from a match-name link to find the row container
+   * that holds odds values. A match row typically has 2-6 odds.
+   */
+  function findMatchRowData(linkElement) {
+    let container = linkElement;
 
-    let team1, team2;
+    for (let depth = 0; depth < 8; depth++) {
+      container = container.parentElement;
+      if (!container || container === document.body) return null;
 
-    if (nameEl) {
-      const fullText = nameEl.textContent.trim();
-      // Split by " - " or " – " or " vs "
-      const parts = fullText.split(/\s*[-–]\s*|\s+vs\.?\s+/i);
-      if (parts.length >= 2) {
-        team1 = cleanName(parts[0]);
-        team2 = cleanName(parts[parts.length - 1]); // Use last part in case of multiple separators
+      const odds = extractOddsValues(container);
+
+      // A single match row should have 2-8 odds values (1/2 or 1/X/2 + maybe handicap)
+      if (odds.length >= 2 && odds.length <= 8) {
+        const txt = container.textContent.toLowerCase();
+
+        // Live detection from Czech text patterns
+        const isLive = /\d+\s*:\s*\d+/.test(txt) ||
+                       txt.includes('pol.') || txt.includes('.min') ||
+                       txt.includes('přestávka') || txt.includes('live') ||
+                       txt.includes('živě') || txt.includes('probíhá');
+
+        // Score extraction (first "N:N" pattern)
+        let score1 = 0, score2 = 0;
+        const scoreMatch = txt.match(/(\d+)\s*:\s*(\d+)/);
+        if (scoreMatch) {
+          score1 = parseInt(scoreMatch[1]) || 0;
+          score2 = parseInt(scoreMatch[2]) || 0;
+        }
+
+        // Assign odds: if 3+, treat as 1/X/2; if 2, treat as 1/2
+        let odds1, oddsX, odds2;
+        if (odds.length >= 3) {
+          odds1 = odds[0]; oddsX = odds[1]; odds2 = odds[2];
+        } else {
+          odds1 = odds[0]; oddsX = 0; odds2 = odds[1];
+        }
+
+        return {
+          odds1, odds2, oddsX, score1, score2, isLive,
+          hasOdds: odds1 > 1.0 && odds2 > 1.0,
+        };
       }
+
+      // If we find way too many odds, we've walked up to a page-level container
+      if (odds.length > 30) return null;
     }
 
-    // Try separate participant elements if name parsing failed
-    if (!team1 || !team2) {
-      const participants = row.querySelectorAll(
-        '.o-match__participant, [class*="participant"], [class*="team-name"]'
-      );
-      if (participants.length >= 2) {
-        team1 = cleanName(participants[0].textContent);
-        team2 = cleanName(participants[1].textContent);
-      }
-    }
-
-    if (!team1 || !team2) return null;
-
-    // === ODDS ===
-    // Tipsport shows odds as buttons: "1" (home), "X" (draw), "2" (away)
-    const oddEls = row.querySelectorAll(
-      '.o-odd__value, .m-odds__odd, [class*="odd-value"], [class*="oddValue"], button[class*="odd"], [data-testid*="odd"]'
-    );
-
-    let odds1 = 0, oddsX = 0, odds2 = 0;
-    let hasOdds = false;
-
-    if (oddEls.length >= 2) {
-      // 2-way market (tennis, esports): just 1 and 2
-      odds1 = parseOdds(oddEls[0].textContent);
-      if (oddEls.length >= 3) {
-        // 3-way market: 1, X, 2
-        oddsX = parseOdds(oddEls[1].textContent);
-        odds2 = parseOdds(oddEls[2].textContent);
-      } else {
-        odds2 = parseOdds(oddEls[1].textContent);
-      }
-      hasOdds = odds1 > 1.0 && odds2 > 1.0;
-    }
-
-    // === LIVE DETECTION ===
-    const isLive = isLiveMatch(row);
-
-    // === SCORE (if live) ===
-    let score1 = 0, score2 = 0;
-    const scoreEl = row.querySelector(
-      '.o-match__score, [class*="score"], [class*="result"]'
-    );
-    if (scoreEl) {
-      const scoreText = scoreEl.textContent.trim();
-      const scoreParts = scoreText.split(/[:\-–]/);
-      if (scoreParts.length >= 2) {
-        score1 = parseInt(scoreParts[0].trim()) || 0;
-        score2 = parseInt(scoreParts[1].trim()) || 0;
-      }
-    }
-
-    return {
-      team1,
-      team2,
-      odds1,
-      odds2,
-      oddsX,
-      score1,
-      score2,
-      isLive,
-      hasOdds,
-      sport: sport || "unknown",
-    };
+    return null;
   }
 
-  function isLiveMatch(row) {
-    const text = row.textContent.toLowerCase();
-    if (text.includes("live") || text.includes("živě") || text.includes("probíhá")) return true;
-
-    const liveEl = row.querySelector(
-      '.o-match__live, [class*="live"], [class*="inplay"], .live-icon, [data-testid*="live"]'
+  /**
+   * Extract odds-like decimal values from leaf elements inside a container.
+   * Matches patterns like "1.03", "15.00", "1,85", "120.00".
+   * Only counts the DEEPEST elements (children.length === 0) to avoid double-counting.
+   */
+  function extractOddsValues(container) {
+    const values = [];
+    const candidates = container.querySelectorAll(
+      'span, button, td, div, b, strong, a, em, i, label, p'
     );
-    if (liveEl) return true;
 
-    const scoreEl = row.querySelector('[class*="score"]');
-    if (scoreEl && /\d+\s*[:–-]\s*\d+/.test(scoreEl.textContent)) return true;
+    for (const el of candidates) {
+      // Only leaf elements — no sub-elements (prevents counting parent + child)
+      if (el.children.length > 0) continue;
 
-    return false;
+      const text = el.textContent.trim();
+      // Odds are "1.03" to "999.99" — max 7 chars
+      if (text.length < 3 || text.length > 7) continue;
+
+      // Match decimal odds pattern: "1.03", "15.00", "1,85"
+      if (/^\d{1,3}[,.]\d{2}$/.test(text)) {
+        const val = parseFloat(text.replace(',', '.'));
+        if (val >= 1.01 && val <= 500) {
+          values.push(val);
+        }
+      }
+    }
+
+    return values;
   }
 
   function cleanName(text) {
     if (!text) return "";
     return text
-      .replace(/\(\d+\)/g, "")    // Remove seeding
-      .replace(/^\d+\.\s*/, "")   // Remove numbering like "1. "
+      .replace(/\([^)]*\)\s*$/g, "")  // Remove trailing parenthetical: "(odv.)", "(OM)", "(KSA)"
+      .replace(/\(\d+\)/g, "")         // Remove seeding like "(1)"
+      .replace(/^\d+\.\s*/, "")        // Remove numbering like "1. "
       .replace(/\s+/g, " ")
       .trim();
-  }
-
-  function parseOdds(text) {
-    if (!text) return 0;
-    // Tipsport uses Czech format: "1,85" not "1.85"
-    const cleaned = text.trim().replace(",", ".");
-    const val = parseFloat(cleaned);
-    return (val >= 1.01 && val <= 100) ? val : 0;
   }
 
   // ====================================================================
@@ -429,9 +424,10 @@
 
   function init() {
     const sport = detectTipsportSport();
-    log(`💰 Tipsport Odds Scraper v1.0`);
+    log(`💰 Tipsport Odds Scraper v2.0 (Generic DOM)`);
     log(`Page: ${window.location.href}`);
     log(`Sport: ${sport || "unknown"}`);
+    log(`Strategy: Find <a> links with 'Team - Team' pattern, walk up DOM for odds`);
 
     createPanel();
     connectWS();
