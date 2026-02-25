@@ -188,15 +188,33 @@
                            'ebasketball', 'e-basketball'];
 
   // Team names that indicate real football/basketball clubs in e-sports
-  const TP_REAL_TEAMS = [
+  const TP_FOOTBALL_TEAMS = [
     'liverpool', 'realmadrid', 'barcelona', 'manchestercity', 'manchesterunited',
-    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'psg', 'atletico',
-    'porto', 'benfica', 'ajax', 'milan', 'roma', 'napoli', 'rangers', 'celtic',
-    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians', 'deportivo',
+    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'borussiadortmund',
+    'psg', 'atletico', 'porto', 'benfica', 'ajax', 'milan', 'internazionale', 'roma',
+    'napoli', 'rangers', 'celtic', 'racing', 'riverplate', 'bocajuniors', 'flamengo',
+    'corinthians', 'deportivo', 'vflwolfsburg', 'wolfsburg', 'eintrachtfrankfurt',
+    'eintracht', 'sportingcp', 'vitoriasc', 'braga', 'sevilla', 'villarreal',
+    'realbetica', 'realsociedad', 'osasuna', 'girona', 'lazio', 'fiorentina',
+    'argentina', 'brazil', 'france', 'spain', 'germany', 'england', 'portugal',
+    'netherlands', 'italy', 'sweden', 'denmark', 'ghana', 'mexico', 'unitedstates',
+    'switzerland', 'austria', 'belgium', 'poland', 'ukraine',
+  ];
+  const TP_BASKETBALL_TEAMS = [
     'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'knicks', 'nets', 'clippers',
     'houstonrockets', 'clevelandcavaliers', 'sacramentokings', 'minnesotatimberwolves',
     'denvernuggets', 'phoenixsuns', 'milwaukeebucks', 'goldenstatewarriors',
+    'sanantoniospurs', 'torontoraptors', 'dallasmavericks', 'neworleanspe',
+    'memphisgrizzlies', 'atlantahawks', 'charlottehornets', 'detroitpistons',
+    'indianapacers', 'chicagobulls', 'orlandoMagic', 'washingtonwizards',
   ];
+
+  function guessEsportTypeFromTeams(t1, t2) {
+    const key = (t1 + ' ' + t2).toLowerCase().replace(/[^a-z]/g, '');
+    if (TP_BASKETBALL_TEAMS.some(c => key.includes(c))) return 'basketball';
+    if (TP_FOOTBALL_TEAMS.some(c => key.includes(c))) return 'football';
+    return null;
+  }
 
   function detectEsportFromLink(linkEl) {
     // Walk up DOM + prev siblings to find category header

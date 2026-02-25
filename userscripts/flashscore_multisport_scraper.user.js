@@ -154,17 +154,30 @@
   // Team name heuristic: well-known football/basketball clubs → treat as e-football/e-basketball
   // (not skip, just auto-assign sport)
   const FOOTBALL_CLUBS = [
+    // Kluby
     'liverpool', 'realmadrid', 'barcelona', 'manchestercity', 'manchesterunited',
-    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'psg', 'atletico',
-    'porto', 'benfica', 'ajax', 'milan', 'internazionale', 'roma', 'napoli',
-    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians', 'braga', 'benfica',
-    'sportingcp', 'vitoriasc',
+    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'borussiadortmund',
+    'psg', 'atletico', 'porto', 'benfica', 'ajax', 'milan', 'internazionale', 'roma',
+    'napoli', 'rangers', 'celtic', 'racing', 'riverplate', 'bocajuniors', 'flamengo',
+    'corinthians', 'deportivo', 'vflwolfsburg', 'wolfsburg', 'eintrachtfrankfurt',
+    'eintracht', 'sportingcp', 'vitoriasc', 'braga', 'sevilla', 'villarreal',
+    'realbetica', 'realsociedad', 'osasuna', 'girona', 'lazio', 'fiorentina',
+    // Národní týmy (eFootball FIFA národní ligy)
+    'argentina', 'brazil', 'france', 'spain', 'germany', 'england', 'portugal',
+    'netherlands', 'italy', 'sweden', 'denmark', 'ghana', 'mexico', 'unitedstates',
+    'switzerland', 'austria', 'belgium', 'poland', 'ukraine', 'colombia',
+    'uruguay', 'chile', 'ecuador', 'peru', 'senegal', 'nigeria', 'morocco',
+    'japan', 'southkorea', 'australia', 'turkey', 'croatia', 'serbia',
   ];
   const BASKETBALL_CLUBS = [
     'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'knicks', 'nets', 'clippers',
     'houstonrockets', 'clevelandcavaliers', 'sacramentokings', 'minnesotatimberwolves',
     'denvernuggets', 'phoenixsuns', 'milwaukeebucks', 'goldenstatewarriors',
     'sanantoniospurs', 'torontoraptors', 'dallasmavericks', 'neworleanspe',
+    'memphisgrizzlies', 'atlantahawks', 'charlottehornets', 'detroitpistons',
+    'indianapacers', 'chicagobulls', 'orlandoMagic', 'washingtonwizards',
+    // Národní týmy (e-basketball)
+    'newzealand', 'philippines', 'australia', 'southkorea', 'china', 'canada',
   ];
 
   function guessEsportFromTeams(t1, t2) {
