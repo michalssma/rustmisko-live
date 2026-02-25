@@ -502,7 +502,99 @@ fn find_score_edges(
             }
         };
 
-        // Get current Azuro odds
+        // ================================================================
+        // BET HIERARCHY: MAP WINNER > MATCH WINNER (never both!)
+        //
+        // When we see a round lead (e.g. 10-4), both markets may have edge:
+        //   MAP WINNER → 90% certainty, lower odds (~1.10-1.30)
+        //   MATCH WINNER → 72% certainty, higher odds (~1.50-2.00)
+        //
+        // Strategy: ALWAYS prefer MAP WINNER (higher certainty).
+        // Map winner = almost guaranteed profit, match winner = risky
+        // because team can win map but lose the Bo3 match 1-2.
+        //
+        // Only fall back to MATCH WINNER if no map winner odds exist.
+        // NEVER bet both → that's double exposure on the same match!
+        // ================================================================
+
+        let max_score = s1.max(s2);
+        let diff = leading_maps - losing_maps;
+        let mut has_map_winner_edge = false;
+
+        // === STEP 1: Check MAP WINNER edges FIRST (highest priority) ===
+        if max_score > 3 && diff >= 5 {
+            // This is a round-level score within a CS2 map
+            if let Some(map_odds_list) = map_winners_by_match.get(match_key) {
+                // Map win probability direct (NOT converted to match prob)
+                let map_win_prob = match diff {
+                    5..=6 => 0.82,
+                    7..=8 => 0.90,
+                    _ => 0.95,  // 9+
+                };
+
+                for mw in map_odds_list {
+                    let mw_implied = if leading_side == 1 {
+                        1.0 / mw.odds_team1
+                    } else {
+                        1.0 / mw.odds_team2
+                    };
+
+                    let mw_edge = (map_win_prob - mw_implied) * 100.0;
+
+                    if mw_edge < MIN_SCORE_EDGE_PCT {
+                        info!("  🗺️ {} {}-{}: MW {} edge={:.1}% < min {}%",
+                            match_key, s1, s2, mw.market, mw_edge, MIN_SCORE_EDGE_PCT);
+                        continue;
+                    }
+
+                    let mw_confidence = if mw_edge >= 15.0 { "HIGH" } else { "MEDIUM" };
+                    let mw_outcome_id = if leading_side == 1 {
+                        mw.outcome1_id.clone()
+                    } else {
+                        mw.outcome2_id.clone()
+                    };
+
+                    let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                    info!("🗺️ MAP WINNER EDGE [PRIORITY]: {} leads {}-{}, {} implied={:.1}%, map_prob={:.1}%, edge={:.1}% — BLOCKING match_winner",
+                        leading_team, s1, s2, mw.market, mw_implied * 100.0, map_win_prob * 100.0, mw_edge);
+
+                    tracker.edge_cooldown.insert(match_key.to_string(), now);
+                    has_map_winner_edge = true;
+
+                    edges.push(ScoreEdge {
+                        match_key: format!("{}::{}", match_key, mw.market),
+                        team1: live.payload.team1.clone(),
+                        team2: live.payload.team2.clone(),
+                        score1: s1,
+                        score2: s2,
+                        prev_score1: prev_s1,
+                        prev_score2: prev_s2,
+                        leading_side,
+                        azuro_w1: mw.odds_team1,
+                        azuro_w2: mw.odds_team2,
+                        azuro_bookmaker: format!("{} [{}]", mw.bookmaker, mw.market),
+                        azuro_implied_pct: mw_implied * 100.0,
+                        score_implied_pct: map_win_prob * 100.0,
+                        edge_pct: mw_edge,
+                        confidence: mw_confidence,
+                        game_id: None,
+                        condition_id: mw.condition_id.clone(),
+                        outcome_id: mw_outcome_id,
+                        chain: mw.chain.clone(),
+                        azuro_url: mw.url.clone(),
+                    });
+                }
+            }
+        }
+
+        // === STEP 2: MATCH WINNER — only if NO map winner edge found ===
+        if has_map_winner_edge {
+            info!("  ⏭️ {} {}-{}: SKIPPING match_winner (map_winner edge found — higher certainty)",
+                match_key, s1, s2);
+            continue;
+        }
+
+        // Get current Azuro odds for match winner
         let azuro = match azuro_by_match.get(match_key) {
             Some(a) => a,
             None => {
@@ -539,7 +631,7 @@ fn find_score_edges(
         let confidence = if edge >= 15.0 { "HIGH" } else { "MEDIUM" };
 
         let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
-        info!("⚡ SCORE EDGE: {} leads {}-{}, Azuro implied {:.1}%, expected {:.1}%, edge {:.1}%",
+        info!("⚡ MATCH WINNER EDGE [FALLBACK]: {} leads {}-{}, Azuro implied {:.1}%, expected {:.1}%, edge {:.1}% (no map_winner odds available)",
             leading_team, s1, s2, azuro_implied * 100.0, expected_prob * 100.0, edge);
 
         tracker.edge_cooldown.insert(match_key.to_string(), now);
@@ -572,72 +664,6 @@ fn find_score_edges(
             chain: azuro.chain.clone(),
             azuro_url: azuro.url.clone(),
         });
-
-        // === MAP WINNER EDGE ===
-        // When we detect a round-level lead (diff >= 5), also check map winner odds
-        // Map winner gives HIGHER edge because we use map_win_prob directly (82-95%)
-        // instead of converting to match_prob (67-72%).
-        let max_score = s1.max(s2);
-        let diff = leading_maps - losing_maps;
-        if max_score > 3 && diff >= 5 {
-            // This is a round-level score → we're within a map
-            // Check if Azuro has map winner odds for this match
-            if let Some(map_odds_list) = map_winners_by_match.get(match_key) {
-                // Map win probability direct (NOT converted to match prob)
-                let map_win_prob = match diff {
-                    5..=6 => 0.82,
-                    7..=8 => 0.90,
-                    _ => 0.95,  // 9+
-                };
-
-                for mw in map_odds_list {
-                    let mw_implied = if leading_side == 1 {
-                        1.0 / mw.odds_team1
-                    } else {
-                        1.0 / mw.odds_team2
-                    };
-
-                    let mw_edge = (map_win_prob - mw_implied) * 100.0;
-
-                    if mw_edge < MIN_SCORE_EDGE_PCT {
-                        continue;
-                    }
-
-                    let mw_confidence = if mw_edge >= 15.0 { "HIGH" } else { "MEDIUM" };
-                    let mw_outcome_id = if leading_side == 1 {
-                        mw.outcome1_id.clone()
-                    } else {
-                        mw.outcome2_id.clone()
-                    };
-
-                    info!("🗺️ MAP WINNER EDGE: {} {}-{}, {} implied={:.1}%, map_prob={:.1}%, edge={:.1}%",
-                        match_key, s1, s2, mw.market, mw_implied * 100.0, map_win_prob * 100.0, mw_edge);
-
-                    edges.push(ScoreEdge {
-                        match_key: format!("{}::{}", match_key, mw.market),
-                        team1: live.payload.team1.clone(),
-                        team2: live.payload.team2.clone(),
-                        score1: s1,
-                        score2: s2,
-                        prev_score1: prev_s1,
-                        prev_score2: prev_s2,
-                        leading_side,
-                        azuro_w1: mw.odds_team1,
-                        azuro_w2: mw.odds_team2,
-                        azuro_bookmaker: format!("{} [{}]", mw.bookmaker, mw.market),
-                        azuro_implied_pct: mw_implied * 100.0,
-                        score_implied_pct: map_win_prob * 100.0,
-                        edge_pct: mw_edge,
-                        confidence: mw_confidence,
-                        game_id: None,
-                        condition_id: mw.condition_id.clone(),
-                        outcome_id: mw_outcome_id,
-                        chain: mw.chain.clone(),
-                        azuro_url: mw.url.clone(),
-                    });
-                }
-            }
-        }
     }
 
     // Cleanup old entries

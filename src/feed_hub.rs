@@ -185,16 +185,42 @@ fn normalize_name(name: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .collect();
 
+    // Strip common prefixes that differ between sources
+    // HLTV: "Nemesis", Azuro: "Team Nemesis" → both → "nemesis"
+    // Also: "Clan X" vs "X", "FC X" vs "X"
+    let prefixes = ["team", "clan", "fc", "pro"];
+    for prefix in &prefixes {
+        if s.len() > prefix.len() + 2 && s.starts_with(prefix) {
+            s = s[prefix.len()..].to_string();
+            break;
+        }
+    }
+
     // Strip common CS2 org suffixes that differ between sources
     // HLTV: "Ground Zero", Azuro: "Ground Zero Gaming" → both → "groundzero"
     // HLTV: "Cybershoke", Azuro: "CYBERSHOKE Esports" → both → "cybershoke"
-    let suffixes = ["gaming", "esports", "esport"];
+    let suffixes = ["gaming", "esports", "esport", "gg", "club", "org",
+                    "academy", "rising", "fe"];
     for suffix in &suffixes {
         if s.len() > suffix.len() + 2 && s.ends_with(suffix) {
             s.truncate(s.len() - suffix.len());
             break;
         }
     }
+
+    // Strip trailing digits that some sources append (e.g. team name duplicates)
+    while s.len() > 3 {
+        if let Some(last) = s.chars().last() {
+            if last.is_ascii_digit() {
+                s.pop();
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
     s
 }
 
