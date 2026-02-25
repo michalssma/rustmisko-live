@@ -412,9 +412,14 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
     let mut opportunities = Vec::new();
 
     for (match_key, live) in live_map.iter() {
-        // Try alternate sport prefixes for esports (FlashScore sends 'esports',
-        // Azuro uses 'cs2', 'dota-2', etc.) — try all variants
-        let esports_alts: &[&str] = &["cs2", "dota-2", "league-of-legends", "valorant"];
+        // Try alternate sport prefixes for ANY live key that doesn't match Azuro directly.
+        // FlashScore/Tipsport may label a match as 'esports' while Azuro uses 'cs2',
+        // 'dota-2', 'basketball', 'football' etc.
+        // Also: Tipsport 'basketball'/'football' live won't match if Azuro key differs slightly.
+        let esports_alts: &[&str] = &[
+            "cs2", "dota-2", "league-of-legends", "valorant",
+            "basketball", "football", "mma", "starcraft",
+        ];
         let odds_list_opt = odds_by_match.get(match_key.as_str())
             .or_else(|| {
                 if match_key.starts_with("esports::") {
@@ -631,9 +636,31 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
         odds_match_keys.insert(ok.match_key.clone());
     }
 
+    // Esports fallback alts — same as in build_opportunities
+    let esports_alts_snap: &[&str] = &[
+        "cs2", "dota-2", "league-of-legends", "valorant",
+        "basketball", "football", "mma", "starcraft",
+    ];
     let mut fused_keys = Vec::new();
     for k in &odds_match_keys {
-        if live_map.contains_key(k) {
+        let is_fused = if live_map.contains_key(k) {
+            true
+        } else {
+            // Check if any live key with esports:: prefix matches via alt
+            let parts: Vec<&str> = k.splitn(2, "::").collect();
+            if parts.len() == 2 {
+                let tail = parts[1];
+                esports_alts_snap.iter().any(|alt| {
+                    if *alt == parts[0] {
+                        // live key would be esports::tail
+                        live_map.contains_key(&format!("esports::{}", tail))
+                    } else {
+                        false
+                    }
+                })
+            } else { false }
+        };
+        if is_fused {
             fused_keys.push(k.clone());
         }
         if fused_keys.len() >= 50 {

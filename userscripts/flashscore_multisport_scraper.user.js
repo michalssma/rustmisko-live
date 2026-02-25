@@ -96,9 +96,13 @@
   const ESPORT_DOTA_KW  = ['dota 2', 'dota2', 'dota-2', 'dpc', 'dreamleague', 'the international'];
   const ESPORT_LOL_KW   = ['league of legends', 'lol esports', ' lcs ', ' lec ', ' lck ', ' lpl ', 'worlds league'];
   const ESPORT_VAL_KW   = ['valorant', 'vct ', 'valorant champions'];
-  const ESPORT_SKIP_KW  = ['efootball', 'e-football', 'ea sports', 'fifa', 'nba 2k', 'nba2k', 'ebasketball',
-                           'e-basketball', 'madden', 'ecopa', 'e-copa', 'eliga', 'e-liga',
-                           'echampions', 'e-champions', 'echampions', 'nba 2k25', 'nba2k25'];
+  // e-football → map to 'football' (Azuro has football:: keys for e-football too)
+  // e-basketball → map to 'basketball' (Azuro has basketball:: keys)
+  const ESPORT_FOOTBALL_KW = ['efootball', 'e-football', 'ea sports', 'fifa', 'ecopa', 'e-copa',
+                               'eliga', 'e-liga', 'echampions', 'e-champions', 'e-fotbal', 'efotbal',
+                               'esoccer', 'e-soccer', 'virtual football', 'virtual soccer'];
+  const ESPORT_BASKET_KW   = ['nba 2k', 'nba2k', 'ebasketball', 'e-basketball', 'ebasketbal',
+                               'e-basketbal', 'virtual basketball', 'nba 2k25', 'nba2k25'];
 
   function detectEsportFromElement(el) {
     // Walk up DOM tree and check preceding siblings at each level for a category/header
@@ -117,11 +121,12 @@
                          cls.includes('event__') || cls.includes('league') || cls.includes('round');
         if (isHeader) {
           const txt = (' ' + sibling.textContent.toLowerCase() + ' ');
-          for (const kw of ESPORT_SKIP_KW) if (txt.includes(kw)) { dbg(`→ SKIP esport (${kw}): ${txt.substring(0,60)}`); return 'skip'; }
-          for (const kw of ESPORT_CS2_KW)  if (txt.includes(kw)) { dbg(`→ cs2 (${kw})`); return 'cs2'; }
-          for (const kw of ESPORT_DOTA_KW) if (txt.includes(kw)) { dbg(`→ dota-2 (${kw})`); return 'dota-2'; }
-          for (const kw of ESPORT_LOL_KW)  if (txt.includes(kw)) { dbg(`→ lol (${kw})`); return 'league-of-legends'; }
-          for (const kw of ESPORT_VAL_KW)  if (txt.includes(kw)) { dbg(`→ valorant (${kw})`); return 'valorant'; }
+          for (const kw of ESPORT_CS2_KW)     if (txt.includes(kw)) { dbg(`→ cs2 (${kw})`); return 'cs2'; }
+          for (const kw of ESPORT_DOTA_KW)    if (txt.includes(kw)) { dbg(`→ dota-2 (${kw})`); return 'dota-2'; }
+          for (const kw of ESPORT_LOL_KW)     if (txt.includes(kw)) { dbg(`→ lol (${kw})`); return 'league-of-legends'; }
+          for (const kw of ESPORT_VAL_KW)     if (txt.includes(kw)) { dbg(`→ valorant (${kw})`); return 'valorant'; }
+          for (const kw of ESPORT_FOOTBALL_KW) if (txt.includes(kw)) { dbg(`→ football (e-sport)`); return 'football'; }
+          for (const kw of ESPORT_BASKET_KW)  if (txt.includes(kw)) { dbg(`→ basketball (e-sport)`); return 'basketball'; }
         }
         sibling = sibling.previousElementSibling;
         sibCount++;
@@ -146,19 +151,27 @@
     return null; // Could not determine — keep as 'esports'
   }
 
-  // Team name heuristic: real football/basketball clubs → likely e-sport, not CS2
-  const REAL_SPORT_TEAMS = [
-    'liverpool', 'realmadrid', 'barcelona', 'manchester', 'chelsea', 'arsenal', 'juventus',
-    'bayernmunchen', 'dortmund', 'psg', 'atletico', 'porto', 'benfica', 'ajax', 'milan',
-    'internazionale', 'roma', 'napoli', 'rangers', 'celtic',
+  // Team name heuristic: well-known football/basketball clubs → treat as e-football/e-basketball
+  // (not skip, just auto-assign sport)
+  const FOOTBALL_CLUBS = [
+    'liverpool', 'realmadrid', 'barcelona', 'manchestercity', 'manchesterunited',
+    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'psg', 'atletico',
+    'porto', 'benfica', 'ajax', 'milan', 'internazionale', 'roma', 'napoli',
+    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians', 'braga', 'benfica',
+    'sportingcp', 'vitoriasc',
+  ];
+  const BASKETBALL_CLUBS = [
     'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'knicks', 'nets', 'clippers',
     'houstonrockets', 'clevelandcavaliers', 'sacramentokings', 'minnesotatimberwolves',
-    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians',
+    'denvernuggets', 'phoenixsuns', 'milwaukeebucks', 'goldenstatewarriors',
+    'sanantoniospurs', 'torontoraptors', 'dallasmavericks', 'neworleanspe',
   ];
 
-  function looksLikeRealSportTeam(t1, t2) {
+  function guessEsportFromTeams(t1, t2) {
     const key = (t1 + t2).toLowerCase().replace(/[^a-z]/g, '');
-    return REAL_SPORT_TEAMS.some(team => key.includes(team));
+    if (BASKETBALL_CLUBS.some(c => key.includes(c))) return 'basketball';
+    if (FOOTBALL_CLUBS.some(c => key.includes(c))) return 'football';
+    return null;
   }
 
   // ====================================================================
@@ -359,19 +372,18 @@
     // When on generic /esports/ page, detect specific sub-sport from DOM headers
     if (sport === 'esports') {
       const specific = detectEsportFromElement(el);
-      if (specific === 'skip') {
-        dbg(`Skip e-sport (e-football/e-basketball): ${team1} vs ${team2}`);
-        return null;
-      }
+      // specific can be: 'cs2','dota-2','league-of-legends','valorant','football','basketball',null
       if (specific) {
         dbg(`Esport DOM detection: ${sport} → ${specific} for ${team1} vs ${team2}`);
         sport = specific;
       } else {
-        // If we couldn't detect sport from DOM, check if team names look like real clubs
-        if (looksLikeRealSportTeam(team1, team2)) {
-          dbg(`Skip real-sport team in esports: ${team1} vs ${team2}`);
-          return null;
+        // If we couldn't detect sport from DOM, guess from team names
+        const guessed = guessEsportFromTeams(team1, team2);
+        if (guessed) {
+          dbg(`Esport team-name guess: ${guessed} for ${team1} vs ${team2}`);
+          sport = guessed;
         }
+        // else: keep as 'esports' — alert_bot will handle matching
       }
     }
 

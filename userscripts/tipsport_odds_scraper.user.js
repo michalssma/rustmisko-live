@@ -182,9 +182,10 @@
   const TP_DOTA_KW  = ['dota 2', 'dota2', 'dota-2'];
   const TP_LOL_KW   = ['league of legends', ' lcs ', ' lec ', ' lck ', ' lpl '];
   const TP_VAL_KW   = ['valorant', 'vct '];
-  const TP_SKIP_KW  = ['efootball', 'e-football', 'ea sports', 'fifa', 'nba 2k', 'nba2k',
-                       'e-basketbal', 'ebasketbal', 'madden', 'e-fotbal', 'efotbal',
-                       'echampions', 'e-liga', 'eliga', 'nba 2k25'];
+  const TP_FOOTBALL_KW = ['efootball', 'e-football', 'ea sports', 'fifa', 'e-fotbal', 'efotbal',
+                           'esoccer', 'e-soccer', 'e-copa', 'ecopa', 'echampions', 'eliga', 'e-liga'];
+  const TP_BASKET_KW   = ['nba 2k', 'nba2k', 'e-basketbal', 'ebasketbal', 'nba 2k25', 'nba2k25',
+                           'ebasketball', 'e-basketball'];
 
   // Team names that indicate real football/basketball clubs in e-sports
   const TP_REAL_TEAMS = [
@@ -215,11 +216,12 @@
         const isShortLabel = sib.textContent.trim().length < 80 && !sib.textContent.includes(' - ');
 
         if (isHeader || isShortLabel) {
-          for (const kw of TP_SKIP_KW) if (txt.includes(kw)) { dbg(`TP skip esport (${kw})`); return 'skip'; }
-          for (const kw of TP_CS2_KW)  if (txt.includes(kw)) return 'cs2';
-          for (const kw of TP_DOTA_KW) if (txt.includes(kw)) return 'dota-2';
-          for (const kw of TP_LOL_KW)  if (txt.includes(kw)) return 'league-of-legends';
-          for (const kw of TP_VAL_KW)  if (txt.includes(kw)) return 'valorant';
+          for (const kw of TP_CS2_KW)      if (txt.includes(kw)) return 'cs2';
+          for (const kw of TP_DOTA_KW)     if (txt.includes(kw)) return 'dota-2';
+          for (const kw of TP_LOL_KW)      if (txt.includes(kw)) return 'league-of-legends';
+          for (const kw of TP_VAL_KW)      if (txt.includes(kw)) return 'valorant';
+          for (const kw of TP_FOOTBALL_KW) if (txt.includes(kw)) { dbg(`TP e-football: ${txt.substring(0,40)}`); return 'football'; }
+          for (const kw of TP_BASKET_KW)   if (txt.includes(kw)) { dbg(`TP e-basketball: ${txt.substring(0,40)}`); return 'basketball'; }
         }
         sib = sib.previousElementSibling;
         sibCount++;
@@ -227,11 +229,6 @@
       node = node.parentElement;
     }
     return null; // Unknown, keep as 'esports'
-  }
-
-  function looksLikeRealClub(t1, t2) {
-    const key = (t1 + t2).toLowerCase().replace(/[^a-z]/g, '');
-    return TP_REAL_TEAMS.some(team => key.includes(team));
   }
 
   function scanTipsportMatches() {
@@ -291,16 +288,18 @@
       let matchSport = sport || "unknown";
       if (matchSport === 'esports') {
         const specific = detectEsportFromLink(link);
-        if (specific === 'skip') {
-          dbg(`TP skip e-sport (eFootball/eBasketball): ${t1} vs ${t2}`);
-          continue;
-        }
+        // specific: 'cs2','dota-2','lol','valorant','football','basketball',null
         if (specific) {
           matchSport = specific;
           dbg(`TP esport detected: ${matchSport} for ${t1} vs ${t2}`);
-        } else if (looksLikeRealClub(t1, t2)) {
-          dbg(`TP skip real-club esport: ${t1} vs ${t2}`);
-          continue;
+        } else {
+          // Fallback: guess from team names (e.g. Houston Rockets → basketball)
+          const guessed = guessEsportTypeFromTeams(t1, t2);
+          if (guessed) {
+            matchSport = guessed;
+            dbg(`TP esport team-guess: ${matchSport} for ${t1} vs ${t2}`);
+          }
+          // else keep as 'esports' — might still fuse via feed_hub fallback
         }
       }
 

@@ -448,6 +448,69 @@ fn dota2_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
     }
 }
 
+/// Basketball / e-Basketball point lead → estimated win probability.
+/// Without quarter/time info, we use total points as proxy for game stage.
+///   total < 30:  very early (1st quarter) → point lead less reliable
+///   total 30-80: mid-game
+///   total 80+:   late game → leads are MUCH more valuable
+///
+/// Point lead thresholds (conservative — no time info):
+///   10+ pts early: ~65%   10+ pts late: ~83%
+///   15+ pts early: ~75%   15+ pts late: ~90%
+///   20+ pts early: ~82%   20+ pts late: ~93%
+fn basketball_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
+    if leading <= losing { return None; }
+    let diff = leading - losing;
+    let total = leading + losing;
+
+    // Need at least some game played
+    if total < 15 { return None; }
+
+    // Early game (< 30 total) — leads are volatile
+    if total < 30 {
+        return match diff {
+            1..=4  => None,            // Too close early
+            5..=9  => Some(0.60),
+            10..=14 => Some(0.67),
+            _ => Some(0.75),           // 15+ early
+        };
+    }
+
+    // Mid game (30-80 total)
+    if total < 80 {
+        return match diff {
+            1..=4  => None,            // Small lead, high variance
+            5..=9  => Some(0.62),
+            10..=14 => Some(0.72),
+            15..=19 => Some(0.80),
+            _ => Some(0.87),           // 20+ mid
+        };
+    }
+
+    // Late game (80+ total) — leads are decisive
+    match diff {
+        1..=4  => None,
+        5..=9  => Some(0.68),
+        10..=14 => Some(0.80),
+        15..=19 => Some(0.88),
+        _ => Some(0.93),               // 20+ late game
+    }
+}
+
+/// MMA round score → estimated win probability.
+/// Azuro typically has MMA as match_winner with round scores.
+/// Format: rounds won (Bo3 — first to 2 rounds)
+///   1-0 → fighter A won round 1 → ~70% match win
+///   2-0 → match over (skip — too late)
+///   2-1 → match over
+fn mma_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
+    if leading <= losing { return None; }
+    match (leading, losing) {
+        (1, 0) => Some(0.70), // Won 1 round in a Bo3 → ~70%
+        _      => None,       // Match over or invalid
+    }
+}
+
 /// Detect score-based edges: HLTV live score says one team leads,
 /// but Azuro odds haven't adjusted yet → BET on the leading team!
 fn find_score_edges(
@@ -577,12 +640,32 @@ fn find_score_edges(
                     continue;
                 }
             }
-        } else if is_basketball || is_mma {
-            // Basketball: point leads are too volatile without quarter/time info
-            // MMA: round scores don't reliably predict winner
-            info!("  ⏭️ {} {}-{}: {} score model not supported (skipping)",
-                match_key, s1, s2, if is_basketball { "basketball" } else { "mma" });
-            continue;
+        } else if is_basketball {
+            // Basketball / e-Basketball (NBA 2K)
+            // Point lead model — we don't have quarter/time, use total points as proxy.
+            // Guard: garbage parse values (score > 200 = Tipsport concatenation artifact)
+            if s1.max(s2) > 200 || s1.max(s2) < 0 {
+                info!("  ⏭️ {} {}-{}: basketball score looks like garbage (max>200), skipping",
+                    match_key, s1, s2);
+                continue;
+            }
+            match basketball_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: basketball score not actionable (diff={})",
+                        match_key, s1, s2, leading_maps - losing_maps);
+                    continue;
+                }
+            }
+        } else if is_mma {
+            // MMA: round scores (Bo3 format — first to 2 rounds)
+            match mma_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: MMA score not actionable", match_key, s1, s2);
+                    continue;
+                }
+            }
         } else {
             // CS2: scores can be round-level or map-level
             // But FIRST: sanity check for generic "esports::" keys.
@@ -641,7 +724,7 @@ fn find_score_edges(
         // E.g. "esports::isurus_vs_players" → check "cs2::isurus_vs_players" in Azuro.
         // The ORIGINAL match_key is kept for cooldown/dedup/logging.
         // ================================================================
-        let esports_alts_list: &[&str] = &["cs2", "dota-2", "league-of-legends", "valorant"];
+        let esports_alts_list: &[&str] = &["cs2", "dota-2", "league-of-legends", "valorant", "basketball", "football", "mma"];
         let resolved_alt_key: Option<String> = if match_key.starts_with("esports::") {
             let tail = &match_key["esports::".len()..];
             esports_alts_list.iter().find_map(|alt| {
