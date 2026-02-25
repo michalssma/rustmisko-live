@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FlashScore → Feed Hub MULTI-SPORT Scraper v3
 // @namespace    rustmisko
-// @version      3.0
-// @description  Scrapes ALL live matches from FlashScore using generic DOM detection (no CSS class dependency). Supports tennis, football, basketball, esports, etc.
+// @version      3.1
+// @description  Scrapes ALL live matches from FlashScore using generic DOM detection. v3.1: DOM sport detection when URL doesn't tell sport (home page / SPA nav).
 // @author       RustMisko
 // @match        https://www.flashscore.com/*
 // @match        https://www.flashscore.cz/*
@@ -80,6 +80,62 @@
       if (path.startsWith(`/${key}/`) || path === `/${key}`) {
         return sport;
       }
+    }
+    return null;
+  }
+
+  // When URL doesn't tell us the sport (FlashScore home page or SPA navigation),
+  // look at DOM section/sport headers near the match element.
+  const DOM_SPORT_MAP = [
+    { kws: ['football','fotbal','soccer','fussball'], sport: 'football' },
+    { kws: ['tennis','tenis','tenis '], sport: 'tennis' },
+    { kws: ['basketball','basketbal','nba '], sport: 'basketball' },
+    { kws: ['baseball'], sport: 'baseball' },
+    { kws: ['hockey','hokej'], sport: 'hockey' },
+    { kws: ['esport','e-sport','counter-strike','cs2','dota','valorant'], sport: 'esports' },
+    { kws: ['mma','ufc '], sport: 'mma' },
+    { kws: ['handball','hazena','házená'], sport: 'handball' },
+    { kws: ['volleyball','volejbal'], sport: 'volleyball' },
+  ];
+
+  function detectSportFromDOM(el) {
+    // Walk up + backward siblings looking for FlashScore sport section headers
+    // These have classes like: sportName, event__header, category, etc.
+    let node = el;
+    for (let depth = 0; depth < 15; depth++) {
+      if (!node || node === document.body) break;
+      let sib = node.previousElementSibling;
+      let sc = 0;
+      while (sib && sc < 10) {
+        const cls = (sib.className || '').toLowerCase();
+        const isSportHeader = cls.includes('sport') || cls.includes('category') ||
+                              cls.includes('header') || cls.includes('section') ||
+                              cls.includes('title') || cls.includes('league');
+        const txt = (' ' + sib.textContent.toLowerCase() + ' ');
+        // Only look at reasonably short elements (headers, not match rows)
+        if (isSportHeader || sib.textContent.trim().length < 60) {
+          for (const { kws, sport } of DOM_SPORT_MAP) {
+            for (const kw of kws) {
+              if (txt.includes(' '+kw) || txt.includes(kw+' ') || txt.includes(kw+':')) {
+                return sport;
+              }
+            }
+          }
+        }
+        sib = sib.previousElementSibling;
+        sc++;
+      }
+      // Also check parent's own class/id for sport name
+      const p = node.parentElement;
+      if (p) {
+        const pcls = (p.className || '').toLowerCase() + ' ' + (p.id || '').toLowerCase();
+        for (const { kws, sport } of DOM_SPORT_MAP) {
+          for (const kw of kws) {
+            if (pcls.includes(kw)) return sport;
+          }
+        }
+      }
+      node = node.parentElement;
     }
     return null;
   }
@@ -381,6 +437,15 @@
 
     const scores = extractScores(el);
     let sport = pageSport || "unknown";
+
+    // When pageSport is null (home page / SPA nav), detect from DOM section headers
+    if (sport === "unknown") {
+      const fromDom = detectSportFromDOM(el);
+      if (fromDom) {
+        dbg(`DOM sport detect: ${fromDom} for ${team1} vs ${team2}`);
+        sport = fromDom;
+      }
+    }
 
     // When on generic /esports/ page, detect specific sub-sport from DOM headers
     if (sport === 'esports') {
