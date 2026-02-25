@@ -55,6 +55,8 @@ const AUTO_BET_MIN_ODDS: f64 = 1.15;
 const CLAIM_CHECK_SECS: u64 = 60;
 /// Maximum odds for auto-bet (skip extreme underdogs)
 const AUTO_BET_MAX_ODDS: f64 = 3.50;
+/// Portfolio status report interval (seconds) — every 30 min
+const PORTFOLIO_REPORT_SECS: u64 = 1800;
 
 // ====================================================================
 // Types matching feed-hub /opportunities JSON
@@ -144,6 +146,20 @@ struct OddsPayload {
     outcome1_id: Option<String>,
     outcome2_id: Option<String>,
     chain: Option<String>,
+}
+
+/// Map winner odds from Azuro (map1_winner, map2_winner, map3_winner)
+#[derive(Debug, Clone)]
+struct MapWinnerOdds {
+    market: String,
+    odds_team1: f64,
+    odds_team2: f64,
+    condition_id: Option<String>,
+    outcome1_id: Option<String>,
+    outcome2_id: Option<String>,
+    bookmaker: String,
+    chain: Option<String>,
+    url: Option<String>,
 }
 
 // Telegram getUpdates response
@@ -348,6 +364,27 @@ fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
     }
 }
 
+/// Tennis set score → estimated match win probability for the LEADING player
+///
+/// Tennis is Bo3 sets (Grand Slams Bo5, but Azuro mainly has Bo3).
+/// SET lead is the strongest predictor:
+///   - 1-0 in sets → ~65% (won first set but opponent can come back)
+///   - 2-0 → match won (don't bet)
+///   - Within a set: game lead matters less because service breaks/holds
+///     are volatile — we only bet on SET leads for safety.
+///
+/// `leading_score` and `losing_score` represent SET counts.
+fn tennis_score_to_win_prob(leading_sets: i32, losing_sets: i32) -> Option<f64> {
+    if leading_sets <= losing_sets { return None; }
+
+    match (leading_sets, losing_sets) {
+        (1, 0) => Some(0.65),  // Won first set → ~65% match win
+        (2, 0) => None,        // Already won → too late
+        (2, 1) => None,        // Already won
+        _ => None,
+    }
+}
+
 /// Detect score-based edges: HLTV live score says one team leads,
 /// but Azuro odds haven't adjusted yet → BET on the leading team!
 fn find_score_edges(
@@ -362,12 +399,33 @@ fn find_score_edges(
         .map(|l| (l.match_key.as_str(), l))
         .collect();
 
-    // Build Azuro odds map (only azuro_ bookmakers)
+    // Build Azuro odds map (only azuro_ bookmakers, match_winner)
     let mut azuro_by_match: HashMap<&str, &OddsPayload> = HashMap::new();
+    // Build map winner odds map: match_key → Vec<MapWinnerOdds>
+    let mut map_winners_by_match: HashMap<&str, Vec<MapWinnerOdds>> = HashMap::new();
     for item in &state.odds {
-        if item.payload.bookmaker.starts_with("azuro_") {
+        if !item.payload.bookmaker.starts_with("azuro_") {
+            continue;
+        }
+        let market = item.payload.market.as_deref().unwrap_or("match_winner");
+        if market == "match_winner" {
             azuro_by_match.entry(item.match_key.as_str())
                 .or_insert(&item.payload);
+        } else if market.starts_with("map") && market.ends_with("_winner") {
+            // map1_winner, map2_winner, map3_winner
+            map_winners_by_match.entry(item.match_key.as_str())
+                .or_default()
+                .push(MapWinnerOdds {
+                    market: market.to_string(),
+                    odds_team1: item.payload.odds_team1,
+                    odds_team2: item.payload.odds_team2,
+                    condition_id: item.payload.condition_id.clone(),
+                    outcome1_id: item.payload.outcome1_id.clone(),
+                    outcome2_id: item.payload.outcome2_id.clone(),
+                    bookmaker: item.payload.bookmaker.clone(),
+                    chain: item.payload.chain.clone(),
+                    url: item.payload.url.clone(),
+                });
         }
     }
 
@@ -419,13 +477,28 @@ fn find_score_edges(
         };
 
         // Get expected win probability from score
-        let expected_prob = match score_to_win_prob(leading_maps, losing_maps) {
-            Some(p) => p,
-            None => {
-                info!("  ⏭️ {} {}-{}: score not actionable (diff={}, max={})",
-                    match_key, s1, s2, leading_maps - losing_maps,
-                    leading_maps.max(losing_maps));
-                continue;
+        // Use sport-specific probability model
+        let is_tennis = match_key.starts_with("tennis::");
+        let expected_prob = if is_tennis {
+            // Tennis: scores are SET counts (0-2)
+            match tennis_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: tennis score not actionable",
+                        match_key, s1, s2);
+                    continue;
+                }
+            }
+        } else {
+            // CS2: scores can be round-level or map-level
+            match score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: score not actionable (diff={}, max={})",
+                        match_key, s1, s2, leading_maps - losing_maps,
+                        leading_maps.max(losing_maps));
+                    continue;
+                }
             }
         };
 
@@ -499,6 +572,72 @@ fn find_score_edges(
             chain: azuro.chain.clone(),
             azuro_url: azuro.url.clone(),
         });
+
+        // === MAP WINNER EDGE ===
+        // When we detect a round-level lead (diff >= 5), also check map winner odds
+        // Map winner gives HIGHER edge because we use map_win_prob directly (82-95%)
+        // instead of converting to match_prob (67-72%).
+        let max_score = s1.max(s2);
+        let diff = leading_maps - losing_maps;
+        if max_score > 3 && diff >= 5 {
+            // This is a round-level score → we're within a map
+            // Check if Azuro has map winner odds for this match
+            if let Some(map_odds_list) = map_winners_by_match.get(match_key) {
+                // Map win probability direct (NOT converted to match prob)
+                let map_win_prob = match diff {
+                    5..=6 => 0.82,
+                    7..=8 => 0.90,
+                    _ => 0.95,  // 9+
+                };
+
+                for mw in map_odds_list {
+                    let mw_implied = if leading_side == 1 {
+                        1.0 / mw.odds_team1
+                    } else {
+                        1.0 / mw.odds_team2
+                    };
+
+                    let mw_edge = (map_win_prob - mw_implied) * 100.0;
+
+                    if mw_edge < MIN_SCORE_EDGE_PCT {
+                        continue;
+                    }
+
+                    let mw_confidence = if mw_edge >= 15.0 { "HIGH" } else { "MEDIUM" };
+                    let mw_outcome_id = if leading_side == 1 {
+                        mw.outcome1_id.clone()
+                    } else {
+                        mw.outcome2_id.clone()
+                    };
+
+                    info!("🗺️ MAP WINNER EDGE: {} {}-{}, {} implied={:.1}%, map_prob={:.1}%, edge={:.1}%",
+                        match_key, s1, s2, mw.market, mw_implied * 100.0, map_win_prob * 100.0, mw_edge);
+
+                    edges.push(ScoreEdge {
+                        match_key: format!("{}::{}", match_key, mw.market),
+                        team1: live.payload.team1.clone(),
+                        team2: live.payload.team2.clone(),
+                        score1: s1,
+                        score2: s2,
+                        prev_score1: prev_s1,
+                        prev_score2: prev_s2,
+                        leading_side,
+                        azuro_w1: mw.odds_team1,
+                        azuro_w2: mw.odds_team2,
+                        azuro_bookmaker: format!("{} [{}]", mw.bookmaker, mw.market),
+                        azuro_implied_pct: mw_implied * 100.0,
+                        score_implied_pct: map_win_prob * 100.0,
+                        edge_pct: mw_edge,
+                        confidence: mw_confidence,
+                        game_id: None,
+                        condition_id: mw.condition_id.clone(),
+                        outcome_id: mw_outcome_id,
+                        chain: mw.chain.clone(),
+                        azuro_url: mw.url.clone(),
+                    });
+                }
+            }
+        }
     }
 
     // Cleanup old entries
@@ -1255,11 +1394,14 @@ async fn main() -> Result<()> {
     let mut poll_ticker = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     let mut cashout_ticker = tokio::time::interval(Duration::from_secs(CASHOUT_CHECK_SECS));
     let mut claim_ticker = tokio::time::interval(Duration::from_secs(CLAIM_CHECK_SECS));
+    let mut portfolio_ticker = tokio::time::interval(Duration::from_secs(PORTFOLIO_REPORT_SECS));
     // Bets that have been settled and claimed (to avoid re-processing)
     let mut settled_bet_ids: HashSet<String> = HashSet::new();
     // Running profit/loss tracker
     let mut total_wagered: f64 = 0.0;
     let mut total_returned: f64 = 0.0;
+    // Session start time for portfolio reporting
+    let session_start = Utc::now();
 
     loop {
         tokio::select! {
@@ -1872,6 +2014,64 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // === PORTFOLIO STATUS REPORT (every 30 min) ===
+            _ = portfolio_ticker.tick() => {
+                let mut msg = String::from("📊 <b>PORTFOLIO STATUS</b>\n\n");
+                let uptime_mins = (Utc::now() - session_start).num_minutes();
+                msg.push_str(&format!("⏱️ Uptime: {}h {}min\n\n", uptime_mins / 60, uptime_mins % 60));
+
+                // Get wallet balance from executor
+                match client.get(format!("{}/health", executor_url)).send().await {
+                    Ok(resp) => {
+                        if let Ok(h) = resp.json::<ExecutorHealthResponse>().await {
+                            let balance = h.balance.as_deref().unwrap_or("?");
+                            msg.push_str(&format!("💰 <b>Wallet: {} USDT</b>\n", balance));
+                        }
+                    }
+                    Err(_) => msg.push_str("💰 Wallet: ❌ executor offline\n"),
+                }
+
+                // Active bets summary
+                if active_bets.is_empty() {
+                    msg.push_str("🎰 Aktivní sázky: 0\n");
+                } else {
+                    msg.push_str(&format!("🎰 Aktivní sázky: <b>{}</b>\n", active_bets.len()));
+                    for b in &active_bets {
+                        msg.push_str(&format!("  • {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                    }
+                }
+
+                // Session P&L
+                let pnl = total_returned - total_wagered;
+                let (pnl_sign, pnl_emoji) = if pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
+                msg.push_str(&format!("\n{} Session P/L: <b>{}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, pnl));
+                msg.push_str(&format!("   Vsazeno: ${:.2} | Vráceno: ${:.2}\n", total_wagered, total_returned));
+                msg.push_str(&format!("   Auto-bets: {}/{}\n", auto_bet_count, AUTO_BET_MAX_PER_SESSION));
+
+                // Feed-hub live info
+                match client.get(format!("{}/state", feed_hub_url)).send().await {
+                    Ok(resp) => {
+                        if let Ok(state) = resp.json::<StateResponse>().await {
+                            let azuro_count = state.odds.iter().filter(|o| o.payload.bookmaker.starts_with("azuro_")).count();
+                            let map_winner_count = state.odds.iter().filter(|o| {
+                                o.payload.market.as_deref().map(|m| m.starts_with("map")).unwrap_or(false)
+                            }).count();
+                            let tennis_count = state.odds.iter().filter(|o| {
+                                o.payload.sport.as_deref() == Some("tennis")
+                            }).count();
+                            msg.push_str(&format!(
+                                "\n📡 Live: {} zápasů | Azuro: {} odds ({} map, {} tennis)\n",
+                                state.live_items, azuro_count, map_winner_count, tennis_count
+                            ));
+                        }
+                    }
+                    Err(_) => {}
+                }
+
+                let _ = tg_send_message(&client, &token, chat_id, &msg).await;
+                info!("📊 Portfolio report sent");
+            }
+
             // === Check Telegram for user replies ===
             _ = tokio::time::sleep(Duration::from_secs(3)) => {
                 match tg_get_updates(&client, &token, update_offset).await {
@@ -1994,19 +2194,58 @@ async fn main() -> Result<()> {
 
                                 } else if text == "/help" {
                                     let _ = tg_send_message(&client, &token, chat_id,
-                                        "🤖 <b>RustMisko Alert Bot v3</b>\n\n\
-                                         Automatický CS2 Azuro betting + auto-cashout.\n\n\
+                                        "🤖 <b>RustMisko Alert Bot v4</b>\n\n\
+                                         CS2 + Tennis | Match + Map Winner | Auto-bet + Auto-claim.\n\n\
                                          <b>Commands:</b>\n\
                                          /status — systém + executor + wallet\n\
+                                         /portfolio — peněženka + P/L + sázky\n\
                                          /odds — aktuální anomálie\n\
                                          /bets — aktivní sázky\n\
                                          /help — tato zpráva\n\n\
                                          <b>Na alert odpověz:</b>\n\
                                          <code>3 YES $5</code> — sázka $5 na alert #3\n\
                                          <code>3 NO</code> — skip alert #3\n\n\
-                                         Auto-cashout: každých 30s kontroluji sázky.\n\
-                                         Profit ≥3% → automatický cashout + notifikace."
+                                         Auto-bet: edge ≥15% HIGH → auto $2\n\
+                                         Auto-claim: výhry + refundy automaticky.\n\
+                                         Portfolio report: každých 30 min."
                                     ).await;
+
+                                } else if text == "/portfolio" {
+                                    // On-demand portfolio report
+                                    let mut msg = String::from("📊 <b>PORTFOLIO</b>\n\n");
+                                    let uptime_mins = (Utc::now() - session_start).num_minutes();
+                                    msg.push_str(&format!("⏱️ Session: {}h {}min\n\n", uptime_mins / 60, uptime_mins % 60));
+
+                                    match client.get(format!("{}/health", executor_url)).send().await {
+                                        Ok(resp) => {
+                                            if let Ok(h) = resp.json::<ExecutorHealthResponse>().await {
+                                                let balance = h.balance.as_deref().unwrap_or("?");
+                                                let wallet = h.wallet.as_deref().unwrap_or("?");
+                                                msg.push_str(&format!("💰 <b>{} USDT</b>\n", balance));
+                                                msg.push_str(&format!("🔑 <code>{}</code>\n", wallet));
+                                            }
+                                        }
+                                        Err(_) => msg.push_str("❌ Executor offline\n"),
+                                    }
+
+                                    if !active_bets.is_empty() {
+                                        msg.push_str(&format!("\n🎰 <b>Aktivní sázky ({})</b>\n", active_bets.len()));
+                                        let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
+                                        for b in &active_bets {
+                                            msg.push_str(&format!("  • {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                                        }
+                                        msg.push_str(&format!("  Celkem ve hře: <b>${:.2}</b>\n", total_at_risk));
+                                    } else {
+                                        msg.push_str("\n🎰 Žádné aktivní sázky\n");
+                                    }
+
+                                    let pnl = total_returned - total_wagered;
+                                    let (pnl_sign, pnl_emoji) = if pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
+                                    msg.push_str(&format!("\n{} <b>P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, pnl));
+                                    msg.push_str(&format!("Vsazeno: ${:.2} | Vráceno: ${:.2}\n", total_wagered, total_returned));
+                                    msg.push_str(&format!("Auto-bets: {}/{}\n", auto_bet_count, AUTO_BET_MAX_PER_SESSION));
+
+                                    let _ = tg_send_message(&client, &token, chat_id, &msg).await;
 
                                 // === YES reply: place bet ===
                                 } else if let Some((mut aid, amount)) = parse_yes_reply(text) {
