@@ -1639,6 +1639,8 @@ async fn main() -> Result<()> {
                                             "outcomeId": outcome_id,
                                             "amount": amount_raw.to_string(),
                                             "minOdds": min_odds.to_string(),
+                                            "team1": edge.team1,
+                                            "team2": edge.team2,
                                         });
 
                                         match client.post(format!("{}/bet", executor_url))
@@ -2419,6 +2421,8 @@ async fn main() -> Result<()> {
                                             "outcomeId": outcome_id,
                                             "amount": amount_raw.to_string(),
                                             "minOdds": min_odds.to_string(),
+                                            "team1": anomaly.team1,
+                                            "team2": anomaly.team2,
                                         });
 
                                         match client.post(format!("{}/bet", executor_url))
