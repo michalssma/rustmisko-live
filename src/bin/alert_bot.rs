@@ -585,6 +585,26 @@ fn find_score_edges(
             continue;
         } else {
             // CS2: scores can be round-level or map-level
+            // But FIRST: sanity check for generic "esports::" keys.
+            // Tipsport sends e-football (FIFA) AND e-basketball (NBA 2K) under
+            // the same "esports" label. Their scores look like:
+            //   e-basketball: 36-30, 100-98 (NBA-style point scores)
+            //   e-football:   2-1, 3-0 (FIFA goal counts) → ambiguous with CS2 map scores
+            //   CS2 rounds:   12-4, 8-7 (same range as football → indistinguishable)
+            //   CS2 maps:     1-0, 2-1 (same as football goals → indistinguishable)
+            // Filter: scores > 30 are definitely NOT CS2 (basketball garbage)
+            // For scores ≤ 30, we have to trust the data source labeling.
+            if match_key.starts_with("esports::") {
+                let max_s = s1.max(s2);
+                if max_s > 30 {
+                    info!("  ⏭️ {} {}-{}: esports score > 30 (e-basketball or parse garbage), skipping",
+                        match_key, s1, s2);
+                    continue;
+                }
+                // Also warn when triggering edge on generic esports:: (not verified CS2)
+                info!("  ⚠️  {} is generic esports:: key (not confirmed cs2::) — team names may not be CS2. Score {}-{}",
+                    match_key, s1, s2);
+            }
             match score_to_win_prob(leading_maps, losing_maps) {
                 Some(p) => p,
                 None => {
@@ -615,10 +635,35 @@ fn find_score_edges(
         let diff = leading_maps - losing_maps;
         let mut has_map_winner_edge = false;
 
+        // ================================================================
+        // ODDS LOOKUP KEY — for generic esports:: live keys (Tipsport labels
+        // CS2 matches as "esports::"), try Azuro alternative sport prefixes.
+        // E.g. "esports::isurus_vs_players" → check "cs2::isurus_vs_players" in Azuro.
+        // The ORIGINAL match_key is kept for cooldown/dedup/logging.
+        // ================================================================
+        let esports_alts_list: &[&str] = &["cs2", "dota-2", "league-of-legends", "valorant"];
+        let resolved_alt_key: Option<String> = if match_key.starts_with("esports::") {
+            let tail = &match_key["esports::".len()..];
+            esports_alts_list.iter().find_map(|alt| {
+                let k = format!("{}::{}", alt, tail);
+                if azuro_by_match.contains_key(k.as_str()) || map_winners_by_match.contains_key(k.as_str()) {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let odds_lookup_key: &str = resolved_alt_key.as_deref().unwrap_or(match_key);
+        if resolved_alt_key.is_some() {
+            info!("  🔗 {} → esports→Azuro resolved: {}", match_key, odds_lookup_key);
+        }
+
         // === STEP 1: Check MAP WINNER edges FIRST (highest priority) ===
         if max_score > 3 && diff >= 5 {
             // This is a round-level score within a CS2 map
-            if let Some(map_odds_list) = map_winners_by_match.get(match_key) {
+            if let Some(map_odds_list) = map_winners_by_match.get(odds_lookup_key) {
                 // Map win probability direct (NOT converted to match prob)
                 let map_win_prob = match diff {
                     5..=6 => 0.82,
@@ -689,14 +734,13 @@ fn find_score_edges(
         }
 
         // Get current Azuro odds for match winner
-        let azuro = match azuro_by_match.get(match_key) {
+        let azuro = match azuro_by_match.get(odds_lookup_key) {
             Some(a) => a,
             None => {
-                info!("  ⏭️ {} {}-{}: prob={:.0}% but NO AZURO ODDS (keys: {})",
-                    match_key, s1, s2, expected_prob * 100.0,
+                info!("  ⏭️ {} {}-{}: NO AZURO ODDS (tried key={}, similar: {})",
+                    match_key, s1, s2, odds_lookup_key,
                     azuro_by_match.keys().filter(|k| {
-                        // Show similar keys for debugging
-                        let mk_parts: Vec<&str> = match_key.split("::").collect();
+                        let mk_parts: Vec<&str> = odds_lookup_key.split("::").collect();
                         let mk_name = mk_parts.last().unwrap_or(&"");
                         let first_team = mk_name.split("_vs_").next().unwrap_or("");
                         k.contains(first_team)

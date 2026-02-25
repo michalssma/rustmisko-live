@@ -171,6 +171,69 @@
    * This works regardless of Tipsport's CSS class naming.
    */
 
+  // ====================================================================
+  // ESPORT SUB-DETECTION — detect CS2 vs Dota2 vs LoL vs eFOOTBALL from DOM
+  // Tipsport groups esports under category headers on the live page.
+  // We walk prevSibling + ancestor to find the nearest header text.
+  // Returns: 'cs2' | 'dota-2' | 'league-of-legends' | 'valorant' | 'skip' | null
+  // 'skip' = e-football, e-basketball → EXCLUDE from feed
+  // ====================================================================
+  const TP_CS2_KW   = ['counter-strike', 'cs2', 'cs:go', 'csgo', 'iem', 'blast', 'esl pro', 'faceit'];
+  const TP_DOTA_KW  = ['dota 2', 'dota2', 'dota-2'];
+  const TP_LOL_KW   = ['league of legends', ' lcs ', ' lec ', ' lck ', ' lpl '];
+  const TP_VAL_KW   = ['valorant', 'vct '];
+  const TP_SKIP_KW  = ['efootball', 'e-football', 'ea sports', 'fifa', 'nba 2k', 'nba2k',
+                       'e-basketbal', 'ebasketbal', 'madden', 'e-fotbal', 'efotbal',
+                       'echampions', 'e-liga', 'eliga', 'nba 2k25'];
+
+  // Team names that indicate real football/basketball clubs in e-sports
+  const TP_REAL_TEAMS = [
+    'liverpool', 'realmadrid', 'barcelona', 'manchestercity', 'manchesterunited',
+    'chelsea', 'arsenal', 'juventus', 'bayernmunchen', 'dortmund', 'psg', 'atletico',
+    'porto', 'benfica', 'ajax', 'milan', 'roma', 'napoli', 'rangers', 'celtic',
+    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians', 'deportivo',
+    'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'knicks', 'nets', 'clippers',
+    'houstonrockets', 'clevelandcavaliers', 'sacramentokings', 'minnesotatimberwolves',
+    'denvernuggets', 'phoenixsuns', 'milwaukeebucks', 'goldenstatewarriors',
+  ];
+
+  function detectEsportFromLink(linkEl) {
+    // Walk up DOM + prev siblings to find category header
+    let node = linkEl;
+    for (let depth = 0; depth < 10; depth++) {
+      if (!node || node === document.body) break;
+
+      let sib = node.previousElementSibling;
+      let sibCount = 0;
+      while (sib && sibCount < 6) {
+        const cls = (sib.className || '').toLowerCase();
+        const txt = (' ' + sib.textContent.toLowerCase() + ' ');
+        const isHeader = cls.includes('header') || cls.includes('category') || cls.includes('title') ||
+                         cls.includes('league') || cls.includes('sport') || cls.includes('section') ||
+                         cls.includes('nazev') || cls.includes('skupina') || cls.includes('titul');
+        // Also check elements that contain ONLY short text (likely a label/header, not a match row)
+        const isShortLabel = sib.textContent.trim().length < 80 && !sib.textContent.includes(' - ');
+
+        if (isHeader || isShortLabel) {
+          for (const kw of TP_SKIP_KW) if (txt.includes(kw)) { dbg(`TP skip esport (${kw})`); return 'skip'; }
+          for (const kw of TP_CS2_KW)  if (txt.includes(kw)) return 'cs2';
+          for (const kw of TP_DOTA_KW) if (txt.includes(kw)) return 'dota-2';
+          for (const kw of TP_LOL_KW)  if (txt.includes(kw)) return 'league-of-legends';
+          for (const kw of TP_VAL_KW)  if (txt.includes(kw)) return 'valorant';
+        }
+        sib = sib.previousElementSibling;
+        sibCount++;
+      }
+      node = node.parentElement;
+    }
+    return null; // Unknown, keep as 'esports'
+  }
+
+  function looksLikeRealClub(t1, t2) {
+    const key = (t1 + t2).toLowerCase().replace(/[^a-z]/g, '');
+    return TP_REAL_TEAMS.some(team => key.includes(team));
+  }
+
   function scanTipsportMatches() {
     const matches = [];
     const sport = detectTipsportSport();
@@ -224,6 +287,23 @@
         continue;
       }
 
+      // Determine final sport — for esports, try to detect sub-sport from DOM
+      let matchSport = sport || "unknown";
+      if (matchSport === 'esports') {
+        const specific = detectEsportFromLink(link);
+        if (specific === 'skip') {
+          dbg(`TP skip e-sport (eFootball/eBasketball): ${t1} vs ${t2}`);
+          continue;
+        }
+        if (specific) {
+          matchSport = specific;
+          dbg(`TP esport detected: ${matchSport} for ${t1} vs ${t2}`);
+        } else if (looksLikeRealClub(t1, t2)) {
+          dbg(`TP skip real-club esport: ${t1} vs ${t2}`);
+          continue;
+        }
+      }
+
       matches.push({
         team1: t1,
         team2: t2,
@@ -234,7 +314,7 @@
         score2: rowInfo.score2,
         isLive: rowInfo.isLive,
         hasOdds: rowInfo.hasOdds,
-        sport: sport || "unknown",
+        sport: matchSport,
       });
     }
 

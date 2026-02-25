@@ -68,7 +68,7 @@
 
   function detectSportFromURL() {
     const path = window.location.pathname.toLowerCase();
-    // Check esports sub-types FIRST (more specific paths win over generic /esports/)
+    // Check esports sub-types via specific sub-paths (if present)
     if (path.includes('/cs-go/') || path.includes('/cs2/') || path.includes('/counter-strike/')) return 'cs2';
     if (path.includes('/dota-2/') || path.includes('/dota2/')) return 'dota-2';
     if (path.includes('/league-of-legends/') || path.includes('/lol/')) return 'league-of-legends';
@@ -82,6 +82,83 @@
       }
     }
     return null;
+  }
+
+  // ====================================================================
+  // ESPORT SUB-DETECTION — detect CS2 vs Dota2 vs LoL vs eFootball from DOM
+  // FlashScore /esports/ page groups matches under tournament category headers.
+  // We walk UP and BACK from a match element to find the nearest header text.
+  // Returns: 'cs2' | 'dota-2' | 'league-of-legends' | 'valorant' | 'skip' | null
+  // 'skip' = e-football, e-basketball → EXCLUDE from feed
+  // null = unknown, keep as 'esports'
+  // ====================================================================
+  const ESPORT_CS2_KW   = ['counter-strike', 'cs2', 'cs:go', 'csgo', 'iem', 'blast', 'esl pro', 'pgl', 'faceit', 'esea', 'elite series', 'flashpoint'];
+  const ESPORT_DOTA_KW  = ['dota 2', 'dota2', 'dota-2', 'dpc', 'dreamleague', 'the international'];
+  const ESPORT_LOL_KW   = ['league of legends', 'lol esports', ' lcs ', ' lec ', ' lck ', ' lpl ', 'worlds league'];
+  const ESPORT_VAL_KW   = ['valorant', 'vct ', 'valorant champions'];
+  const ESPORT_SKIP_KW  = ['efootball', 'e-football', 'ea sports', 'fifa', 'nba 2k', 'nba2k', 'ebasketball',
+                           'e-basketball', 'madden', 'ecopa', 'e-copa', 'eliga', 'e-liga',
+                           'echampions', 'e-champions', 'echampions', 'nba 2k25', 'nba2k25'];
+
+  function detectEsportFromElement(el) {
+    // Walk up DOM tree and check preceding siblings at each level for a category/header
+    let node = el;
+    for (let depth = 0; depth < 12; depth++) {
+      if (!node || node === document.body) break;
+
+      // Check preceding siblings (tournament/category headers come before match rows)
+      let sibling = node.previousElementSibling;
+      let sibCount = 0;
+      while (sibling && sibCount < 8) {
+        const cls = (sibling.className || '').toLowerCase();
+        // FlashScore headers have classes like event__header, sportName, event__title, etc.
+        const isHeader = cls.includes('header') || cls.includes('category') || cls.includes('title') ||
+                         cls.includes('sport') || cls.includes('tournament') || cls.includes('section') ||
+                         cls.includes('event__') || cls.includes('league') || cls.includes('round');
+        if (isHeader) {
+          const txt = (' ' + sibling.textContent.toLowerCase() + ' ');
+          for (const kw of ESPORT_SKIP_KW) if (txt.includes(kw)) { dbg(`→ SKIP esport (${kw}): ${txt.substring(0,60)}`); return 'skip'; }
+          for (const kw of ESPORT_CS2_KW)  if (txt.includes(kw)) { dbg(`→ cs2 (${kw})`); return 'cs2'; }
+          for (const kw of ESPORT_DOTA_KW) if (txt.includes(kw)) { dbg(`→ dota-2 (${kw})`); return 'dota-2'; }
+          for (const kw of ESPORT_LOL_KW)  if (txt.includes(kw)) { dbg(`→ lol (${kw})`); return 'league-of-legends'; }
+          for (const kw of ESPORT_VAL_KW)  if (txt.includes(kw)) { dbg(`→ valorant (${kw})`); return 'valorant'; }
+        }
+        sibling = sibling.previousElementSibling;
+        sibCount++;
+      }
+
+      // Also check the parent element's own class/text (for sport section wrappers)
+      const parentNode = node.parentElement;
+      if (parentNode) {
+        const pcls = (parentNode.className || '').toLowerCase();
+        const pid  = (parentNode.id || '').toLowerCase();
+        if (pcls.includes('sport') || pid.includes('sport')) {
+          const txt = (' ' + (parentNode.textContent || '').toLowerCase().substring(0, 120) + ' ');
+          for (const kw of ESPORT_SKIP_KW) if (txt.includes(kw)) return 'skip';
+          for (const kw of ESPORT_CS2_KW)  if (txt.includes(kw)) return 'cs2';
+          for (const kw of ESPORT_DOTA_KW) if (txt.includes(kw)) return 'dota-2';
+          for (const kw of ESPORT_LOL_KW)  if (txt.includes(kw)) return 'league-of-legends';
+          for (const kw of ESPORT_VAL_KW)  if (txt.includes(kw)) return 'valorant';
+        }
+      }
+      node = node.parentElement;
+    }
+    return null; // Could not determine — keep as 'esports'
+  }
+
+  // Team name heuristic: real football/basketball clubs → likely e-sport, not CS2
+  const REAL_SPORT_TEAMS = [
+    'liverpool', 'realmadrid', 'barcelona', 'manchester', 'chelsea', 'arsenal', 'juventus',
+    'bayernmunchen', 'dortmund', 'psg', 'atletico', 'porto', 'benfica', 'ajax', 'milan',
+    'internazionale', 'roma', 'napoli', 'rangers', 'celtic',
+    'lakers', 'celtics', 'warriors', 'bulls', 'heat', 'knicks', 'nets', 'clippers',
+    'houstonrockets', 'clevelandcavaliers', 'sacramentokings', 'minnesotatimberwolves',
+    'racing', 'riverplate', 'bocajuniors', 'flamengo', 'corinthians',
+  ];
+
+  function looksLikeRealSportTeam(t1, t2) {
+    const key = (t1 + t2).toLowerCase().replace(/[^a-z]/g, '');
+    return REAL_SPORT_TEAMS.some(team => key.includes(team));
   }
 
   // ====================================================================
@@ -277,7 +354,27 @@
     seen.add(key);
 
     const scores = extractScores(el);
-    const sport = pageSport || "unknown";
+    let sport = pageSport || "unknown";
+
+    // When on generic /esports/ page, detect specific sub-sport from DOM headers
+    if (sport === 'esports') {
+      const specific = detectEsportFromElement(el);
+      if (specific === 'skip') {
+        dbg(`Skip e-sport (e-football/e-basketball): ${team1} vs ${team2}`);
+        return null;
+      }
+      if (specific) {
+        dbg(`Esport DOM detection: ${sport} → ${specific} for ${team1} vs ${team2}`);
+        sport = specific;
+      } else {
+        // If we couldn't detect sport from DOM, check if team names look like real clubs
+        if (looksLikeRealSportTeam(team1, team2)) {
+          dbg(`Skip real-sport team in esports: ${team1} vs ${team2}`);
+          return null;
+        }
+      }
+    }
+
     if (sport === "unknown") {
       dbg(`Skip unknown sport: ${team1} vs ${team2}`);
       return null;
