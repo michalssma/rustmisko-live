@@ -191,49 +191,33 @@ fn normalize_tennis_name(name: &str) -> String {
         return name.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
     }
 
-    // Detect FlashScore format: last part is an INITIAL (has period)
-    // e.g. "Blanchet U.", "De Stefano S.", "Rakhimova K."
-    // Must contain period — "Ce" (2-letter surname) is NOT an initial!
+    // Detect FlashScore format: last part is an INITIAL (has period or ≤1 alphanum char)
+    // e.g. "Blanchet U.", "De Stefano S.", "Jimenez Kasintseva V."
     let last = parts.last().unwrap();
     let last_clean: String = last.chars().filter(|c| c.is_alphanumeric()).collect();
     let is_initial = (last.contains('.') && last_clean.len() <= 2)
         || last_clean.len() <= 1;
 
     if is_initial && parts.len() >= 2 {
-        // FlashScore format: surname = all parts except last (initial)
-        let surname: String = parts[..parts.len() - 1]
-            .join("")
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect();
-        return surname;
+        // FlashScore format: take SECOND-TO-LAST word as the surname.
+        // "Jimenez Kasintseva V." → "kasintseva" (not "jimenezkasintseva")
+        // "De Stefano S."        → "stefano"
+        // "Davidovich Fokina A." → "fokina"
+        // "De la Cruz O."        → "cruz"
+        let surname_word = parts[parts.len() - 2];
+        return surname_word.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect();
     }
 
-    // Azuro format: "Firstname [particles] Surname"
-    // Take last word + any preceding particles (de, van, von, da, di, del, ...)
-    let particles = ["de", "van", "von", "da", "di", "del", "le", "la", "el", "al", "bin", "mc"];
-    let mut surname_start = parts.len() - 1;
-    while surname_start > 1 {
-        let prev: String = parts[surname_start - 1]
-            .to_lowercase()
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect();
-        if particles.contains(&prev.as_str()) {
-            surname_start -= 1;
-        } else {
-            break;
-        }
-    }
-
-    let surname: String = parts[surname_start..]
-        .join("")
+    // Azuro format: "Firstname [particles] Surname" — just take the LAST word.
+    // "Victoria Jimenez Kasintseva" → "kasintseva"
+    // "Alejandro Davidovich Fokina" → "fokina"
+    // "Andrea De Stefano"           → "stefano"
+    // "Luca Van Assche"             → "assche"
+    parts.last().unwrap()
         .to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric())
-        .collect();
-    surname
+        .collect()
 }
 
 fn normalize_name(name: &str) -> String {
@@ -273,6 +257,10 @@ fn normalize_name(name: &str) -> String {
             break;
         }
     }
+
+    // Spelling aliases: normalize variant spellings to a single canonical form
+    // "Athletico Paranaense" (Azuro) vs "Atletico-PR" (Tipsport) — 'th' vs 't'
+    if s.starts_with("athletico") { s = "atletico".to_string() + &s["athletico".len()..]; }
 
     // Strip trailing digits that some sources append (e.g. team name duplicates)
     while s.len() > 3 {
