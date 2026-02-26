@@ -1,230 +1,131 @@
-# EDGE NÁPADY — RustMiskoLive Expansion Roadmap
+# EDGE NÁPADY — Prioritní expanze
 
-> Datum: 2026-02-25 | Stav: v4.4.0 | Balance: $38.74 USDT
-> Persona: Pasivní příjem $2,000/měsíc cíl
-> VYLOUČENO: CS2 skiny — Miša to nechce dělat.
+Aktualizováno: **2026-02-26**
 
----
-
-## PRIORITNÍ MAPA
-
-| # | Edge | ROI/den odhad | Effort | Status |
-|---|------|--------------|--------|--------|
-| 1 | **Více bookmakerů (Bet365, Betano, Fortuna)** | $50-200 | Nízký | ⏳ TODO |
-| 2 | **Fotbal/Hokej live score → Azuro** | $30-150 | Nízký | ⏳ TODO |
-| 3 | **Betfair Exchange scraping** | $50-300 | Střední | ⏳ TODO |
-| 4 | **Polymarket vs Azuro cross-market ARB** | $10-50 | Vysoký | ⏳ TODO |
-| 5 | **Crypto Funding Rate Harvesting** | 15-25% p.a. | Střední | ⏳ TODO |
-| 6 | **Twitter/X Sentiment → Crypto alerts** | manual | Nízký | ⏳ TODO |
-| 7 | **ESPN / LiveSports.cz data** | rozšíření | Nízký | ⏳ TODO |
+> Tento dokument je strategický backlog s vysokou prioritou.  
+> Neobsahuje garantované P/L sliby; slouží jako exekuční mapa „co má největší edge efekt“.
 
 ---
 
-## EDGE #1 — Více Bookmakerů (NEJJEDNODUŠŠÍ, OKAMŽITĚ)
+## Priority mapa
 
-**Princip:**  
-Čím více bookmakerů = více cenosvých divergencí vůči Azuru.
-Momentálně máme Tipsport → ~8 kurzů. S 5+ booky → 50-100 divergencí/hodinu.
-
-**Implementace:**  
-- Napsat Tampermonkey scraper pro: Fortuna.cz, Bet365.com, Betano.cz, Unibet.cz, Pinnacle.com
-- Stejná architektura jako `tipsport_odds_scraper.user.js`
-- Každý nový bookmaker = nový `.user.js` soubor
-- Feed hub je připraven — stačí přidat `bookmaker: "fortuna"` atd.
-
-**ARB matematika:**  
-$$\text{ARB edge} = \frac{1}{\text{Azuro odds}} + \frac{1}{\text{Fortuna odds}} < 1.0$$
-
-Pokud součet < 1.0 → garantovaný risk-free profit.
-
-**Soubory k vytvoření:**
-- `userscripts/fortuna_odds_scraper.user.js`
-- `userscripts/bet365_odds_scraper.user.js`
-- `userscripts/betano_odds_scraper.user.js`
-
-**Effort:** ~2-4 hodiny na scraper, scrapeovat URL strukturu cílového bookmakera first.
+| #   | Edge                                       | Očekávaný dopad                           | Náročnost                    | Priorita |
+| --- | ------------------------------------------ | ----------------------------------------- | ---------------------------- | -------- |
+| 1   | **Valorant + LoL + Dota2 map_winner**      | Same CS2 logic, 3x coverage               | Nízká (scraper + match keys) | **P0**   |
+| 2   | **1xbit Tampermonkey scraper**             | Nový datový zdroj ALL sports              | Střední                      | **P1**   |
+| 3   | **Fortuna/Tipsport cross-book divergence** | Více kvalitních signálů denně             | Nízká–střední                | **P1**   |
+| 4   | **Tennis set_winner edge model**           | Přesný set model (game leads)             | Střední                      | **P1**   |
+| 5   | **Source trust scoring**                   | Méně fake signálů                         | Nízká                        | **P1**   |
+| 6   | **Bet reason tagging (ground truth)**      | Lepší ranní audit a tuning                | Nízká                        | **P2**   |
+| 7   | **Betfair / exchange feed**                | Potenciálně velmi silný pricing benchmark | Vysoká                       | **P3**   |
 
 ---
 
-## EDGE #2 — Fotbal/Hokej/Tenis Live Score Edge (ROZŠÍŘENÍ EXISTUJÍCÍHO)
+## EDGE #1 — Fortuna + další bookmaker (nejrychlejší multiplikátor)
 
-**Princip:**  
-Stejná logika jako CS2 (score momentum), ale pro:
-- **Fotbal:** Gól → kurzy zaostávají 10-60 sekund → sázej ihned
-- **Hokej:** Přesilovka/oslabení → temporary edge
-- **Tenis:** Break of serve → kurzy pomalé na update
+### Proč je to důležité
 
-**Aktuální stav:**  
-`find_score_edges()` má modely jen pro CS2 (round/map score) a tenis (set score).
-Fotbal a hokej jsou zatím SKIPPED.
+- Jeden feed = omezený počet divergence.
+- Dva a více feedů = výrazně víc validních porovnání proti Azuro.
 
-**Implementace v alert_bot.rs:**  
-- Přidat football model: gól → +1 = ~69% win prob, +2 = ~88%, +3 = ~96%
-- Přidat hockey model: puck ahead +1 = ~65%, +2 = ~82% (hockey is closer)
-- Přidat basketball model: +10pts = ~70%, +20pts = ~90%
+### Co implementovat
 
-```rust
-"football" => {
-    // Gól model — Dixon-Coles inspired
-    let fair = match score_diff {
-        1 => 69.0,  // leads by 1 goal
-        2 => 86.0,  // leads by 2 goals  
-        3 => 95.0,  // leads by 3 goals
-        _ => 50.0 + (score_diff as f64 * 12.0).min(45.0),
-    };
-}
-```
+- `userscripts/fortuna_odds_scraper.user.js` ve stejném WS formátu jako Tipsport.
+- V `feed_hub` přidat source-level metriku kvality (garbage ratio, stale ratio).
+- V `alert_bot` mít možnost filtrovat nebo penalizovat konkrétní zdroj.
 
-**Effort:** ~3-5 hodin. Modely jsou jednoduché.
+### Hot path (minimum viable)
+
+1. odds scraper Fortuna (match_winner market)
+2. stejné normalizační čištění názvů jako Tipsport
+3. quality gate: pokud source dělá garbage, nevstupuje do auto-betu
 
 ---
 
-## EDGE #3 — Betfair Exchange Scraping (PREMIUM LIQUIDITY)
+## EDGE #2 — Score-edge modely pro football/hockey/basketball
 
-**Princip:**  
-Betfair Exchange = peer-to-peer sázkový trh, $500B+ roční obrat.
-Betfair má NEJLEPŠÍ světové kurzy na sport (žádná marže bookmakera).
+### Proč je to důležité
 
-**Edge:**  
-- Betfair kurzy ~5-10% lepší než tradiční bookmakerky
-- Pokud Betfair nabízí 2.10 a Azuro 1.95 → sázej Azuro (očekávaná hodnota +7.7%)
-- Betfair nemá API rate limity pro DOM scraping
+- Dnes je nejsilnější coverage v CS2; mimo něj se nechává edge ležet.
 
-**URL:** `betfair.com/exchange/plus/football/event/{id}`
+### Co implementovat
 
-**Implementace:**  
-- `userscripts/betfair_exchange_scraper.user.js`
-- Scrapeovat "Back" odds pro každý trh
-- WebSocket do Feed Hub jako `bookmaker: "betfair_exchange"`
+- `src/bin/alert_bot.rs`:
+  - football: konzervativní win-prob model podle score diff
+  - hockey: nižší jistota, přísnější threshold
+  - basketball: score diff + total points proxy (fáze zápasu)
 
-**Effort:** ~4-6 hodin (Betfair DOM je komplexní)
+### Bezpečnost
+
+- Zachovat hard score sanity limity podle sportu.
+- Auto-bet jen HIGH confidence + guardy jako dnes.
 
 ---
 
-## EDGE #4 — Polymarket vs Azuro Cross-Market ARB
+## EDGE #3 — Source trust scoring (must-have proti garbage)
 
-**Princip:**  
-Polymarket (prediction market) vs Azuro = stejné eventy, různé líkvidní zdroje.
-Polymarket cena 0.70 = implikuje 70% pravděpodobnost.
-Azuro kurz 1.40 = implikuje 71.4% pravděpodobnost.
-Divergence → hedguj oboje strany → risk-free.
+### Cíl
 
-**Polymarket scraping URL:** `polymarket.com/event/{slug}`
+- Každému zdroji dát dynamické trust skóre a tím řídit, zda jde do auto-betu.
 
-**Implementace:**
-- `userscripts/polymarket_scraper.user.js` — scrape event prices
-- Feed Hub: přidat `bookmaker: "polymarket"` support
-- alert_bot: přidat polymarket vs azuro fúze logiku
-- Polymarket používá USDC na Polygon — stejná síť jako Azuro!
+### Návrh metrik
 
-**Effort:** ~1-2 týdny (Polymarket má React SSR, scraping je obtížnější)
+- `garbage_name_rate`
+- `score_sanity_reject_rate`
+- `stale_rate`
+- `match_success_rate` (kolik signálů skončí validním settlement flow)
 
----
+### Praktická pravidla
 
-## EDGE #5 — Crypto Funding Rate Harvesting (PASIVNÍ, 24/7)
-
-**Princip:**  
-Na Binance/Bybit perpetual futures se každých 8h platí "funding rate".
-Pokud funding > 0.05% (= >18% ročně) → delta-neutral harvest:
-
-$$\text{Setup} = \text{SHORT futures} + \text{LONG spot} = \text{delta-neutral}$$
-$$\text{Výdělek} = 3 \times \text{funding} / \text{den} = 18-25\%/\text{rok risk-free}$$
-
-**Implementace:**
-- Tampermonkey na `binance.com/en/futures` scrape funding rates tabulku
-- Alert pokud funding > 0.05% (= výhodné spustit harvest)
-- Žádné on-chain transakce — jen Binance/Bybit účet
-
-**Scraper URL:** `binance.com/en/futures/funding-history`
-
-**Effort:** ~3-5 hodin scraper + manuální execution na začátku
+- Pokud trust pod limitem → jen alert (bez auto-betu).
+- Tipsport může být „trusted default“, ostatní „probation mode“.
 
 ---
 
-## EDGE #6 — Twitter/X Sentiment Alerts → Crypto
+## EDGE #4 — Ground-truth reason tagging do historie sázek
 
-**Princip:**  
-Klíčová slova na Twitter/X předcházejí pohybům cen krypta:
-- CZ Binance tweet → BNB pump
-- Coinbase Listing announcement → coin pumps 20-50% do 5 minut
-- Elon Musk zmínka → DOGE/crypto pohyb
+### Proč
 
-**Implementace:**
-- Tampermonkey na `twitter.com` (nebo `x.com`)
-- Sledovat specific accounts: @cz_binance, @coinbase, @elonmusk, @brian_armstrong
-- Pattern match na klíčová slova: "listing", "partnership", "pump"
-- Alert → Telegram zpráva okamžitě → manuální react
+- Ranní report teď reason částečně odhaduje heuristikou.
+- Potřebujeme 100% audit: proč byla sázka otevřena.
 
-**Effort:** ~2-3 hodiny (Twitter DOM je stabilní)
+### Co změnit
 
-**POZOR:** Jen alerting, ne auto-execution. Sentiment trading je risky.
+- Při zápisu do `data/bet_history.txt` přidat explicitní field:
+  - `reason=score_edge` nebo `reason=odds_anomaly_high`
+  - ideálně i snapshot edge/confidence v momentu vstupu
 
 ---
 
-## EDGE #7 — ESPN / LiveSports.cz / SofaScore Jako Další Live Data
+## EDGE #5 — Exchange benchmark (Betfair-like)
 
-**Princip:**  
-Více src pro live score = rychlejší detekce gólů/eventů = větší edge okno.
+### Realita
 
-**Cíle:**
-- `espn.com/soccer/scoreboard` — americký futbol, NBA, NFL
-- `livesports.cz` — rychlé české výsledky  
-- `sofascore.com` — komplexní live stats (shots, possession, etc.)
-- `whoscored.com` — detailní fotbal statistiky per event
+- Potenciálně velmi silný zdroj „fair odds“ benchmarku.
+- Vyšší implementační i provozní složitost (DOM/přístup/region).
 
-**Výhoda SofaScore:** Má events timeline (přesný čas gólu v sekundách), nejen skóre.
+### Kdy to řešit
 
-**Implementace:**
-- Každý = 1 Tampermonkey skript vysílající do Feed Hub
-- Feed Hub de-dupuje stejné zápasy (normalizace jmen)
-- Rychleji potvrzený gól/event = dřívější sázka = větší edge
-
-**Effort:** ~2-4 hodiny na scripty, 1-2 hodiny na de-dup logiku v feed_hub
+- Až po dokončení P1 a P2.
 
 ---
 
-## IMPLEMENTAČNÍ PLÁN (Fáze)
+## Přijímací kritéria pro každý nový edge
 
-### Fáze 1 — IHNED (toto týden)
-1. ✅ **CS2 sport matching fix** (esports→cs2 v feed_hub) — HOTOVO v4.4.0
-2. ⏳ **Fortuna.cz scraper** — největší ROI/effort ratio
-3. ⏳ **Football score model** v alert_bot (gól → edge)
-
-### Fáze 2 — Tento měsíc
-4. ⏳ **Betfair Exchange scraper**
-5. ⏳ **Betano.cz / Bet365 scrapers**
-6. ⏳ **Hockey + Basketball score models**
-
-### Fáze 3 — Za 2-4 týdny  
-7. ⏳ **SofaScore live stats scraper**
-8. ⏳ **Funding rate harvesting** (Binance)
-9. ⏳ **Polymarket integration**
-
-### Fáze 4 — Experimentální
-10. ⏳ **Twitter/X sentiment alerts**
-11. ⏳ **ESPN multi-sport data**
+1. **Data kvalita**: bez garbage jmen a score artefaktů.
+2. **Stabilita**: parser drží dlouhý běh bez degradace.
+3. **Bez regrese**: Tipsport v2.3 nesmí utrpět.
+4. **Risk guardy**: auto-bet jen při stejných nebo přísnějších podmínkách.
+5. **Rollback**: možnost edge okamžitě vypnout feature flagem.
 
 ---
 
-## TECHNICKÁ ARCHITEKTURA (pro všechny edge)
+## Execution pořadí (doporučené)
 
-```
-Chrome Tab (Tampermonkey) ─── WebSocket ──→ Feed Hub :8080
-                                                    │
-                                               fuse_all()
-                                                    │
-                                           alert_bot polls /state
-                                                    │
-                                      find_score_edges() + find_odds_anomalies()
-                                                    │
-                                           edge detected? YES
-                                                    │
-                                    HIGH confidence? → POST /bet → Azuro on-chain
-                                    MEDIUM confidence? → Telegram alert → manual
-```
+1. Fortuna scraper + quality gate
+2. Ground-truth reason tagging
+3. Football/Hockey/Basket score modely
+4. Source trust scoring
+5. Exchange benchmark
 
-**Každý nový edge = nový Tampermonkey skript + případný model v alert_bot.rs**
-
----
-
-*Poslední update: 2026-02-25 | Git: v4.4.0*
+Tohle je „profit-first“ pořadí s nejlepším poměrem dopad / risk / čas.

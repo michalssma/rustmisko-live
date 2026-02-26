@@ -39,27 +39,51 @@ const MIN_SCORE_EDGE_PCT: f64 = 8.0;
 /// Score edge cooldown per match (seconds)
 const SCORE_EDGE_COOLDOWN_SECS: i64 = 300; // 5 min per match
 /// === AUTO-BET CONFIG ===
-/// Auto-bet ON: automaticky vsadí na HIGH confidence score edges
 const AUTO_BET_ENABLED: bool = true;
-/// Minimum edge % for auto-bet (only HIGH confidence)
-/// TIGHTENED: was 12%, now 15% — only bet on strong edges
-const AUTO_BET_MIN_EDGE_PCT: f64 = 15.0;
-/// Fixed stake per auto-bet in USD
+/// Base stake per auto-bet in USD (multiplied by sport-specific multiplier)
 const AUTO_BET_STAKE_USD: f64 = 2.0;
-/// Fixed stake for HIGH odds-anomaly auto-bets (extra conservative)
-const AUTO_BET_ODDS_ANOMALY_STAKE_USD: f64 = 1.0;
-/// Auto-bet on prematch odds anomalies: DISABLED — only alert, no auto-bet.
-/// Prematch odds discrepancy ≠ guaranteed edge. Our real advantage is LIVE score edges.
-const AUTO_BET_ODDS_ANOMALY_ENABLED: bool = false;
 /// Minimum Azuro odds to auto-bet (skip heavy favorites)
 const AUTO_BET_MIN_ODDS: f64 = 1.15;
-/// === AUTO-CLAIM CONFIG ===
-/// Interval for checking settled bets and claiming payouts
-const CLAIM_CHECK_SECS: u64 = 60;
 /// Maximum odds for auto-bet (skip extreme underdogs)
 const AUTO_BET_MAX_ODDS: f64 = 3.50;
+/// === RISK MANAGEMENT ===
+/// Daily NET loss limit — stop auto-bets if net P&L < -$20
+/// NET = total_returned_today - total_wagered_today (NOT gross loss)
+const DAILY_LOSS_LIMIT_USD: f64 = 20.0;
+/// === AUTO-CLAIM CONFIG ===
+const CLAIM_CHECK_SECS: u64 = 60;
 /// Portfolio status report interval (seconds) — every 30 min
 const PORTFOLIO_REPORT_SECS: u64 = 1800;
+/// === WATCHDOG ===
+/// Seconds without feed-hub data before entering SAFE MODE
+const WATCHDOG_TIMEOUT_SECS: u64 = 120;
+
+/// Sport-specific auto-bet configuration
+/// Returns: (auto_bet_allowed, min_edge_pct, stake_multiplier, preferred_market)
+/// preferred_market: "map_winner" | "set_winner" | "match_winner"
+fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
+    match sport {
+        // Esports: map_winner ONLY — match_winner on BO3 too risky
+        "cs2" | "valorant" | "dota-2" | "league-of-legends" | "esports"
+            => (true, 12.0, 1.0, "map_winner"),
+        // Tennis: set_winner priority — momentum breaks give strong edge
+        "tennis"
+            => (true, 15.0, 1.0, "set_winner"),
+        // Basketball: conservative — high variance
+        "basketball"
+            => (true, 14.0, 0.5, "match_winner"),
+        // Football: ALERTS ONLY — too risky for auto-bet
+        "football"
+            => (false, 0.0, 0.0, "none"),
+        // Unknown sport: alerts only
+        _
+            => (false, 0.0, 0.0, "none"),
+    }
+}
+
+/// Prematch odds anomaly auto-bet: DISABLED — alert only
+const AUTO_BET_ODDS_ANOMALY_ENABLED: bool = false;
+const AUTO_BET_ODDS_ANOMALY_STAKE_USD: f64 = 1.0;
 
 // ====================================================================
 // Types matching feed-hub /opportunities JSON
@@ -1564,6 +1588,47 @@ async fn main() -> Result<()> {
         }
     }
 
+    // === DAILY P&L TRACKING (NET loss limit) ===
+    let mut daily_wagered: f64 = 0.0;
+    let mut daily_returned: f64 = 0.0;
+    let mut daily_date = Utc::now().format("%Y-%m-%d").to_string();
+    // Load from daily_pnl.json if exists
+    {
+        let pnl_path = "data/daily_pnl.json";
+        if Path::new(pnl_path).exists() {
+            if let Ok(contents) = std::fs::read_to_string(pnl_path) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if v["date"].as_str() == Some(&daily_date) {
+                        daily_wagered = v["wagered"].as_f64().unwrap_or(0.0);
+                        daily_returned = v["returned"].as_f64().unwrap_or(0.0);
+                        info!("📋 Loaded daily P&L: wagered={:.2} returned={:.2} net={:.2}",
+                            daily_wagered, daily_returned, daily_returned - daily_wagered);
+                    } else {
+                        info!("📋 daily_pnl.json is from different day, resetting");
+                    }
+                }
+            }
+        }
+    }
+
+    // === WATCHDOG: SAFE MODE ===
+    let mut safe_mode = false;
+    let mut last_good_data = std::time::Instant::now();
+
+    // === EVENT LOG HELPER ===
+    let events_path = "data/events.jsonl";
+    let log_event = |event_type: &str, data: &serde_json::Value| {
+        let mut event = data.clone();
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert("ts".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+            obj.insert("type".to_string(), serde_json::json!(event_type));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(events_path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", event);
+        }
+    };
+
     // === DEDUP: track already-bet match keys + condition IDs (persisted across restarts) ===
     let bet_history_path = "data/bet_history.txt";
     let mut already_bet_matches: HashSet<String> = HashSet::new();
@@ -1698,15 +1763,16 @@ async fn main() -> Result<()> {
     // Startup message
     let session_limit_str = "∞ (UNLIMITED)".to_string();
     let auto_bet_info = if AUTO_BET_ENABLED {
-        format!("🤖 <b>AUTO-BET: ON</b>\n   \
-                 Edge ≥{:.0}% + HIGH → auto-sázka ${:.0}\n   \
-                 HIGH odds anomaly → auto-sázka ${:.0} (konzervativní filtry)\n   \
-                 Max {}/session | Odds {:.2}-{:.2}\n\
-                 💰 <b>AUTO-CLAIM: ON</b> (každých {}s)\n   \
-                 Výhry a refundy se automaticky vybírají!",
-                AUTO_BET_MIN_EDGE_PCT, AUTO_BET_STAKE_USD,
-                AUTO_BET_ODDS_ANOMALY_STAKE_USD,
-                session_limit_str, AUTO_BET_MIN_ODDS, AUTO_BET_MAX_ODDS,
+        format!("🤖 <b>AUTO-BET v5: ON</b>\n   \
+                 CS2/Esports: map_winner, edge ≥12%\n   \
+                 Tennis: set_winner, edge ≥15%\n   \
+                 Basketball: match_winner, edge ≥14%, stake 0.5x\n   \
+                 Football: ❌ ALERTS ONLY\n   \
+                 Base stake: ${:.0} | Odds {:.2}-{:.2}\n   \
+                 Daily loss limit: ${:.0} | Watchdog: {}s\n\
+                 💰 <b>AUTO-CLAIM: ON</b> (každých {}s)",
+                AUTO_BET_STAKE_USD, AUTO_BET_MIN_ODDS, AUTO_BET_MAX_ODDS,
+                DAILY_LOSS_LIMIT_USD, WATCHDOG_TIMEOUT_SECS,
                 CLAIM_CHECK_SECS)
     } else {
         "🔒 AUTO-BET: OFF (manuální YES/NO)".to_string()
@@ -1751,11 +1817,47 @@ async fn main() -> Result<()> {
                 let already_alerted: HashSet<String> = sent_alerts.iter()
                     .map(|a| a.match_key.clone()).collect();
 
+                // === WATCHDOG: check for feed-hub timeout ===
+                if last_good_data.elapsed().as_secs() > WATCHDOG_TIMEOUT_SECS && !safe_mode {
+                    safe_mode = true;
+                    let elapsed = last_good_data.elapsed().as_secs();
+                    warn!("⚠️ SAFE MODE: Feed-hub silent for {}s > {}s threshold", elapsed, WATCHDOG_TIMEOUT_SECS);
+                    let _ = tg_send_message(&client, &token, chat_id,
+                        &format!("⚠️ <b>SAFE MODE ACTIVATED</b>\n\nFeed-hub neodpovídá {}s.\nAuto-bety POZASTAVENY.\nAlerty stále fungují.\n\nZkontroluj Chrome tab + Tampermonkey.", elapsed)
+                    ).await;
+                    log_event("SAFE_MODE_ON", &serde_json::json!({"elapsed_secs": elapsed}));
+                }
+
                 // 1. Check /state for cross-bookmaker odds anomalies
                 match client.get(format!("{}/state", feed_hub_url)).send().await {
                     Ok(resp) => {
                         match resp.json::<StateResponse>().await {
                             Ok(state) => {
+                                // === WATCHDOG: feed-hub is alive ===
+                                last_good_data = std::time::Instant::now();
+                                if safe_mode {
+                                    safe_mode = false;
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        "✅ Feed-hub ONLINE. Auto-bety obnoveny.").await;
+                                    log_event("SAFE_MODE_OFF", &serde_json::json!({}));
+                                }
+
+                                // === DAILY DATE RESET (midnight UTC) ===
+                                let today_now = Utc::now().format("%Y-%m-%d").to_string();
+                                if today_now != daily_date {
+                                    log_event("DAILY_RESET", &serde_json::json!({
+                                        "date": daily_date,
+                                        "wagered": daily_wagered,
+                                        "returned": daily_returned,
+                                        "pnl": daily_returned - daily_wagered,
+                                    }));
+                                    info!("📅 New day {} — resetting daily P&L (yesterday net={:.2})",
+                                        today_now, daily_returned - daily_wagered);
+                                    daily_wagered = 0.0;
+                                    daily_returned = 0.0;
+                                    daily_date = today_now;
+                                }
+
                                 // === 1. SCORE EDGE detection (primary strategy!) ===
                                 let score_edges = find_score_edges(&state, &mut score_tracker);
                                 let mut sent_score_edges = 0usize;
@@ -1814,39 +1916,50 @@ async fn main() -> Result<()> {
                                             inflight_conditions.contains(&cond_id_str) || inflight_conditions.contains(&match_key_for_bet));
                                     }
 
+                                    // === SPORT-SPECIFIC AUTO-BET CONFIG ===
+                                    let sport = edge.match_key.split("::").next().unwrap_or("?");
+                                    let (sport_auto_allowed, sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
+                                    let stake = AUTO_BET_STAKE_USD * sport_multiplier;
+                                    let is_preferred_market = match preferred_market {
+                                        "map_winner" => edge.match_key.contains("::map"),
+                                        "set_winner" => edge.match_key.contains("::set"),
+                                        "match_winner" => true,
+                                        _ => false,
+                                    };
+
+                                    // Check daily NET loss limit
+                                    let daily_net_pnl = daily_returned - daily_wagered;
+                                    let within_daily_limit = daily_net_pnl > -DAILY_LOSS_LIMIT_USD;
+
                                     let should_auto_bet = AUTO_BET_ENABLED
+                                        && sport_auto_allowed
+                                        && is_preferred_market
+                                        && within_daily_limit
+                                        && !safe_mode
                                         && edge.confidence == "HIGH"
-                                        && edge.edge_pct >= AUTO_BET_MIN_EDGE_PCT
+                                        && edge.edge_pct >= sport_min_edge
                                         && azuro_odds >= AUTO_BET_MIN_ODDS
                                         && azuro_odds <= AUTO_BET_MAX_ODDS
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
                                         && !already_bet_this;
 
-                                    // SPORT-SPECIFIC MARKET GUARD:
-                                    // For esports BO3/BO5 (CS2, Dota, Valorant, LoL):
-                                    //   Only auto-bet on MAP WINNER (match_key contains "::map")
-                                    //   Match winner is too risky (1-0 map lead ≠ match win guarantee)
-                                    // For traditional sports (football, basketball, tennis, etc.):
-                                    //   Match winner auto-bet is allowed (score directly = winning)
-                                    let is_esports = {
-                                        let sport = edge.match_key.split("::").next().unwrap_or("");
-                                        matches!(sport, "cs2" | "dota-2" | "league-of-legends" | "valorant" | "esports")
-                                    };
-                                    let is_map_winner_market = edge.match_key.contains("::map");
-                                    let should_auto_bet_base = should_auto_bet;
-                                    let should_auto_bet = should_auto_bet && (!is_esports || is_map_winner_market);
-                                    if should_auto_bet_base && !should_auto_bet && is_esports {
-                                        info!("🛡️ ESPORTS GUARD: {} is match_winner on BO — alert only, no auto-bet (use map_winner instead)", edge.match_key);
+                                    if !sport_auto_allowed && edge.confidence == "HIGH" {
+                                        info!("📢 {} ALERT ONLY (auto-bet disabled for {})", edge.match_key, sport);
+                                    }
+                                    if !within_daily_limit {
+                                        info!("🛑 DAILY LOSS LIMIT: net P&L={:.2} < -{:.2}, skipping auto-bet", daily_net_pnl, DAILY_LOSS_LIMIT_USD);
+                                    }
+                                    if !is_preferred_market && sport_auto_allowed {
+                                        info!("🛡️ MARKET GUARD: {} needs {} but got match_winner — alert only", edge.match_key, preferred_market);
                                     }
 
                                     let mut score_alert_sent = false;
 
                                     if should_auto_bet {
-                                        // AUTO-BET!
+                                        // AUTO-BET with sport-specific stake (set above)
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
-                                        let stake = AUTO_BET_STAKE_USD;
 
                                         // RACE CONDITION FIX: mark in-flight BEFORE sending to executor
                                         inflight_conditions.insert(cond_id_str.clone());
@@ -1916,10 +2029,13 @@ async fn main() -> Result<()> {
                                                             ).await;
                                                         } else {
                                                             auto_bet_count += 1;
-                                                            // BUG #6 FIX: Persist auto_bet_count
+                                                            daily_wagered += stake;
+                                                            // Persist daily P&L
                                                             {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
+                                                                let _ = std::fs::write("data/daily_pnl.json",
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
@@ -2135,9 +2251,13 @@ async fn main() -> Result<()> {
                                                             ).await;
                                                         } else {
                                                             auto_bet_count += 1;
+                                                            daily_wagered += stake;
+                                                            // Persist daily P&L
                                                             {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
+                                                                let _ = std::fs::write("data/daily_pnl.json",
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");

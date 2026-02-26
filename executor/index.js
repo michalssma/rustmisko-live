@@ -164,12 +164,51 @@ app.use(express.json());
 // Track active bets for auto-cashout
 const activeBets = new Map();
 
-const PENDING_CLAIMS_PATH = path.resolve(
+// ============================================================
+// Persistent Active Bets (data/active_bets.json)
+// Survives executor restarts for auto-cashout continuity
+// ============================================================
+
+const ACTIVE_BETS_PATH = path.resolve(
   process.cwd(),
   "..",
   "data",
-  "pending_claims.txt",
+  "active_bets.json",
 );
+
+// Condition dedup: prevent duplicate on-chain bets
+const bettedConditions = new Set();
+
+function loadActiveBetsFromDisk() {
+  try {
+    if (!fs.existsSync(ACTIVE_BETS_PATH)) return [];
+    const data = JSON.parse(fs.readFileSync(ACTIVE_BETS_PATH, "utf8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveActiveBetsToDisk() {
+  const arr = Array.from(activeBets.values());
+  try {
+    fs.writeFileSync(ACTIVE_BETS_PATH, JSON.stringify(arr, null, 2));
+  } catch (e) {
+    console.error(`⚠️ Failed to save active_bets.json: ${e.message}`);
+  }
+}
+
+// Load persisted bets on startup
+{
+  const loaded = loadActiveBetsFromDisk();
+  for (const b of loaded) {
+    activeBets.set(b.betId || b.tokenId, b);
+    if (b.conditionId) bettedConditions.add(b.conditionId);
+  }
+  if (loaded.length > 0) {
+    console.log(`📋 Loaded ${loaded.length} active bets from disk (${bettedConditions.size} conditions in dedup)`);
+  }
+}
 
 function extractTokenIdFromUnknown(value) {
   if (value === null || value === undefined) return null;
@@ -391,6 +430,15 @@ app.post("/bet", async (req, res) => {
       .json({ error: "Missing: conditionId, outcomeId, amount" });
   }
 
+  // DEDUP: prevent duplicate on-chain bets for same condition
+  if (bettedConditions.has(conditionId)) {
+    console.log(`🚫 DEDUP: condition ${conditionId} already bet — rejecting`);
+    return res.status(409).json({
+      error: "DEDUP: Already bet on this condition",
+      conditionId,
+    });
+  }
+
   // === DRY-RUN: simulate bet ===
   if (DRY_RUN) {
     const fakeId = `dry-${Date.now()}`;
@@ -491,18 +539,24 @@ app.post("/bet", async (req, res) => {
         result.state === "Created" ||
         result.state === "Pending"
       ) {
-        activeBets.set(result.id, {
-          id: result.id,
+        const betData = {
+          betId: result.id,
+          tokenId: discoveredTokenId,
+          graphBetId,
           conditionId,
-          outcomeId,
-          amount: parseFloat(amount),
-          minOdds: parseFloat(minOdds || "0"),
-          gameId,
-          team1,
-          team2,
+          outcomeId: cleanOutcomeId,
+          stake: parseFloat(amount) / 1e6,
+          odds: parseFloat(minOdds || "0") / 1e12,
+          sport: (req.body.matchKey || "").split("::")[0] || "?",
+          matchKey: req.body.matchKey || "",
+          team: team1 || "",
           placedAt: new Date().toISOString(),
-          state: result.state,
-        });
+          status: "pending",
+        };
+        activeBets.set(result.id, betData);
+        bettedConditions.add(conditionId);
+        saveActiveBetsToDisk();
+        console.log(`💾 Saved active bet: ${result.id} condition=${conditionId}`);
       }
 
       res.json({
