@@ -554,6 +554,15 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
                 for j in (i+1)..odds_list.len() {
                     let a = &odds_list[i].payload;
                     let b = &odds_list[j].payload;
+
+                    // Skip correlated same-platform markets (e.g. azuro_polygon vs azuro_polygon_map3_winner)
+                    // These appear as huge "ARB" but are NOT independent bets — they're map/match sub-markets
+                    // of the same underlying book. Real ARB requires genuinely different bookmakers.
+                    let a_platform = a.bookmaker.split(|c: char| c == '_' || c == '-').next().unwrap_or("");
+                    let b_platform = b.bookmaker.split(|c: char| c == '_' || c == '-').next().unwrap_or("");
+                    if a_platform == b_platform && !a_platform.is_empty() {
+                        continue; // Same underlying book — skip false ARB
+                    }
                     // Check arb: 1/odds_a_team1 + 1/odds_b_team2 < 1
                     let arb1 = 1.0 / a.odds_team1 + 1.0 / b.odds_team2;
                     let arb2 = 1.0 / a.odds_team2 + 1.0 / b.odds_team1;
