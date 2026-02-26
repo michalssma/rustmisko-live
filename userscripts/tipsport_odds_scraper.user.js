@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Tipsport → Feed Hub Odds Scraper
 // @namespace    rustmisko
-// @version      2.1
-// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub — generic DOM v2.1 with text cleanup
+// @version      2.3
+// @description  Scrapes live odds from Tipsport.cz and sends to Feed Hub — v2.3 row-scoped score extraction
 // @author       RustMisko
 // @match        https://www.tipsport.cz/*
 // @match        https://m.tipsport.cz/*
@@ -14,7 +14,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 10000; // 10s — odds don't change as fast as scores
+  const SCAN_INTERVAL_MS = 5000; // 5s — need fast score updates for live betting
   const RECONNECT_MS = 5000;
   const HEARTBEAT_MS = 20000;
   const SOURCE_NAME = "tipsport";
@@ -362,12 +362,17 @@
                        txt.includes('přestávka') || txt.includes('live') ||
                        txt.includes('živě') || txt.includes('probíhá');
 
-        // Score extraction (first "N:N" pattern)
+        // Score extraction v3 — ELEMENT-LEVEL (not textContent!)
+        // textContent concatenates child elements: "0:1" + "2.třetina" → "0:12.třetina"
+        // SOLUTION: Find a specific DOM element whose text is ONLY a score like "0:1"
+        // The blue badge on Tipsport is exactly such an element.
         let score1 = 0, score2 = 0;
-        const scoreMatch = txt.match(/(\d+)\s*:\s*(\d+)/);
-        if (scoreMatch) {
-          score1 = parseInt(scoreMatch[1]) || 0;
-          score2 = parseInt(scoreMatch[2]) || 0;
+        // CRITICAL FIX: score must be extracted from THIS match row/link first,
+        // otherwise parent-level search can reuse one score for multiple matches.
+        const scoreResult = findScoreElement(linkElement, container);
+        if (scoreResult) {
+          score1 = scoreResult.s1;
+          score2 = scoreResult.s2;
         }
 
         // Assign odds: if 3+, treat as 1/X/2; if 2, treat as 1/2
@@ -386,6 +391,86 @@
 
       // If we find way too many odds, we've walked up to a page-level container
       if (odds.length > 30) return null;
+    }
+
+    return null;
+  }
+
+  /**
+   * Find a DOM element that contains ONLY a score pattern "X:Y".
+   * This avoids the textContent concatenation bug where "0:1" + "2.třetina" becomes "0:12".
+   * Strategy 1: Leaf element with EXACTLY "X:Y" as full text (most reliable)
+   * Strategy 2: Small element (<15 chars) containing "X:Y" as fallback
+   * Strategy 3: Regex on textContent as last resort (with period-separator fix)
+   */
+  function findScoreElement(linkElement, container) {
+    const selectors = 'span, div, b, strong, em, td, p, label, small, i';
+
+    // Phase A (strict): scan only inside the concrete match link/row first.
+    // This prevents cross-match score bleeding (same score copied to many rows).
+    const primaryRoot = linkElement || container;
+    const primaryCandidates = primaryRoot.querySelectorAll(selectors);
+
+    for (const el of primaryCandidates) {
+      if (el.children.length > 0) continue;
+      const text = el.textContent.trim();
+      if (/^\d{1,3}\s*:\s*\d{1,3}$/.test(text)) {
+        const m = text.match(/^(\d{1,3})\s*:\s*(\d{1,3})$/);
+        if (m) {
+          dbg(`Score found (phase A, row-scoped exact): "${text}"`);
+          return { s1: parseInt(m[1]), s2: parseInt(m[2]) };
+        }
+      }
+    }
+
+    for (const el of primaryCandidates) {
+      if (el.children.length > 0) continue;
+      const text = el.textContent.trim();
+      if (text.length < 1 || text.length > 15) continue;
+      if (/\d\.\s*(?:pol|set|tře|per|mapa|min|čt|half|třetina|perioda)/i.test(text)) continue;
+      const m = text.match(/(\d{1,3})\s*:\s*(\d{1,3})/);
+      if (m) {
+        dbg(`Score found (phase A, row-scoped small): "${text}"`);
+        return { s1: parseInt(m[1]), s2: parseInt(m[2]) };
+      }
+    }
+
+    const candidates = container.querySelectorAll(selectors);
+
+    // Strategy 1: Leaf element with EXACTLY "X:Y" as its entire text
+    for (const el of candidates) {
+      if (el.children.length > 0) continue;
+      const text = el.textContent.trim();
+      if (/^\d{1,3}\s*:\s*\d{1,3}$/.test(text)) {
+        const m = text.match(/^(\d{1,3})\s*:\s*(\d{1,3})$/);
+        if (m) {
+          dbg(`Score found (strategy 1, exact element): "${text}"`);
+          return { s1: parseInt(m[1]), s2: parseInt(m[2]) };
+        }
+      }
+    }
+
+    // Strategy 2: Small leaf element containing "X:Y" among short text
+    for (const el of candidates) {
+      if (el.children.length > 0) continue;
+      const text = el.textContent.trim();
+      if (text.length < 1 || text.length > 15) continue;
+      // Must not contain period indicators ("2.pol", "3.set" etc)
+      if (/\d\.\s*(?:pol|set|tře|per|mapa|min|čt|half|třetina|perioda)/i.test(text)) continue;
+      const m = text.match(/(\d{1,3})\s*:\s*(\d{1,3})/);
+      if (m) {
+        dbg(`Score found (strategy 2, small element): "${text}"`);
+        return { s1: parseInt(m[1]), s2: parseInt(m[2]) };
+      }
+    }
+
+    // Strategy 3: Last resort — regex on preprocessed textContent
+    const txt = container.textContent.toLowerCase()
+      .replace(/(\d+\s*:\s*\d+?)(\d\.\s*(?:pol|set|tře|per|mapa|min|čt|čtvrt|kol|half|třetina|perioda|čtvrtina|poločas))/gi, '$1 $2');
+    const m = txt.match(/(\d{1,3})\s*:\s*(\d{1,3})/);
+    if (m) {
+      dbg(`Score found (strategy 3, textContent fallback): "${m[0]}"`);
+      return { s1: parseInt(m[1]), s2: parseInt(m[2]) };
     }
 
     return null;
@@ -436,12 +521,19 @@
       /\d{1,2}:\d{1,2}/,                    // Score: "0:0", "2:3", "22:36"
       /\d\.\s*(pol|set|min|čt|mapa|kolo)/i,  // Period: "2.pol", "1.set"
       /Za\s+\d+/i,                           // Prematch: "Za 13 minut"
+      /Za\s*okamžik/i,                       // "Za okamžik" (starting soon)
       /Kurzy\s/i,                            // "Kurzy nejsou..."
       /Událost\s/i,                          // "Událost skončila..."
       /Lepší\s+ze/i,                         // "Lepší ze 3"
       /Přestávka/i,                          // Half-time
       /\d{2,}[,.]\d{2}/,                     // Odds values: "11.50", "118.00"
       /\+\d{2,}/,                            // Bet count: "+53", "+25"
+      /Inquisitor/i,                         // Tipsport internal labels
+      /BetBoom/i,                            // Sponsor labels
+      /RushB/i,                              // Tournament labels
+      /Summit/i,                             // Tournament labels
+      /Probíhá/i,                            // "Probíhá" (in progress)
+      /Živě/i,                               // "Živě" (live)
     ];
 
     let minIdx = text.length;
@@ -458,9 +550,32 @@
   function cleanName(text) {
     if (!text) return "";
     return text
+      // Czech game event notifications (Tipsport shows inline)
+      .replace(/GÓL\s*$/i, "")         // Strip trailing Czech "GÓL" (goal notification)
+      .replace(/\bGÓL\b/gi, "")        // Strip "GÓL" anywhere in name
+      .replace(/\bGOAL\b/gi, "")       // Strip English "GOAL"
+      .replace(/\bŽLUTÁ\b/gi, "")     // Strip "ŽLUTÁ" (yellow card)
+      .replace(/\bČERVENÁ\b/gi, "")   // Strip "ČERVENÁ" (red card)
+      .replace(/\bFAUL\b/gi, "")       // Strip "FAUL"
+      .replace(/\bPENALTA\b/gi, "")    // Strip "PENALTA"
+      .replace(/\bTYČ\b/gi, "")        // Strip "TYČ" (post)
+      .replace(/\bROH\b/gi, "")        // Strip "ROH" (corner)
+      .replace(/\bOFSAJD\b/gi, "")     // Strip "OFSAJD" (offside)
+      .replace(/\bAUT\b/gi, "")        // Strip "AUT" (out)
+      .replace(/\bVAR\b/gi, "")        // Strip "VAR" (video review)
+      // Tipsport status text that sticks to team names
+      .replace(/Za\s*okamžik.*/i, "")  // "Za okamžik" (starting soon)
+      .replace(/Za\s+\d+\s*min.*/i, "") // "Za 15 min" (starting in X min)
+      .replace(/Přestávka.*/i, "")      // "Přestávka" half-time
+      .replace(/Inquisitor.*/i, "")     // Random Tipsport labels
+      .replace(/BetBoom.*/i, "")        // Sponsor labels that stick to names
+      .replace(/RushB.*/i, "")          // Tournament labels
+      .replace(/Summit.*/i, "")         // Tournament labels
+      .replace(/(zaokamžik|inquisitor|betboom|rushb|summit|probíhá|živě).*$/i, "") // Glued lowercase labels
       .replace(/\([^)]*\)\s*$/g, "")  // Remove trailing parenthetical: "(odv.)", "(OM)", "(KSA)"
       .replace(/\(\d+\)/g, "")         // Remove seeding like "(1)"
       .replace(/^\d+\.\s*/, "")        // Remove numbering like "1. "
+      // Final cleanup: if name is still > 40 chars, something stuck — cut at first suspicious word
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -529,10 +644,22 @@
       const oddsMsg = buildOddsMessage(match);
       if (sendJSON(oddsMsg)) sentThisScan++;
 
-      // Send live score if available (bonus)
+      // Send live score if available (bonus) — with score sanity check
       if (match.isLive) {
-        const liveMsg = buildLiveMessage(match);
-        if (liveMsg && sendJSON(liveMsg)) sentThisScan++;
+        // Score sanity gate: reject obviously garbage scores at source
+        const maxScore = Math.max(match.score1, match.score2);
+        const sportLimits = {
+          'football': 8, 'hockey': 10, 'tennis': 7, 'basketball': 200,
+          'cs2': 40, 'dota-2': 100, 'mma': 5, 'handball': 45, 'volleyball': 5,
+          'esports': 50,
+        };
+        const limit = sportLimits[match.sport] || 999;
+        if (maxScore > limit) {
+          dbg(`SCORE SANITY REJECT: ${match.team1} ${match.score1}:${match.score2} ${match.team2} (${match.sport} max=${limit})`);
+        } else {
+          const liveMsg = buildLiveMessage(match);
+          if (liveMsg && sendJSON(liveMsg)) sentThisScan++;
+        }
       }
 
       sportCounts[match.sport] = (sportCounts[match.sport] || 0) + 1;
@@ -561,7 +688,7 @@
 
   function init() {
     const sport = detectTipsportSport();
-    log(`💰 Tipsport Odds Scraper v2.1 (Generic DOM + text cleanup)`);
+    log(`💰 Tipsport Odds Scraper v2.3 (Row-scoped score extraction)`);
     log(`Page: ${window.location.href}`);
     log(`Sport: ${sport || "unknown"}`);
     log(`Strategy: Find <a> links with 'Team - Team', strip scores/status garbage, walk up DOM for odds`);

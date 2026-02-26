@@ -20,7 +20,7 @@ $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # === PROCESS NAMES ===
 $FEED_HUB_EXE = Join-Path $ROOT "target\debug\feed-hub.exe"
-$ALERT_BOT_EXE = Join-Path $ROOT "target\debug\alert_bot.exe"
+$ALERT_BOT_EXE = Join-Path $ROOT "target\debug\alert-bot.exe"
 $EXECUTOR_DIR = Join-Path $ROOT "executor"
 $LOG_DIR = Join-Path $ROOT "logs"
 
@@ -54,6 +54,10 @@ $env:TELEGRAM_BOT_TOKEN = "7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk"
 $env:TELEGRAM_CHAT_ID = "6458129071"
 $env:FEED_HUB_URL = "http://127.0.0.1:8081"
 $env:EXECUTOR_URL = "http://127.0.0.1:3030"
+# PRIVATE KEY pro Azuro executor (LIVE mode — bez toho je DRY-RUN!)
+$env:PRIVATE_KEY = "0x34fb468df8e14a223595b824c1515f0477d2f06b3f6509f25c2f9e9e02ce3f7c"
+$env:CHAIN_ID = "137"
+$env:EXECUTOR_PORT = "3030"
 
 # === START FEED HUB ===
 Write-Host "[2/4] Startuji Feed Hub (WS:8080 HTTP:8081)..." -ForegroundColor Green
@@ -73,15 +77,21 @@ if ($feedProc) {
 
 # === START EXECUTOR ===
 Write-Host "[3/4] Startuji Executor (port 3030)..." -ForegroundColor Green
-$executorScript = Join-Path $EXECUTOR_DIR "executor.js"
+$executorScript = Join-Path $EXECUTOR_DIR "index.js"
 if (Test-Path $executorScript) {
     $executorLog = Join-Path $LOG_DIR "executor.log"
     Start-Process -FilePath "node" -ArgumentList $executorScript -WorkingDirectory $EXECUTOR_DIR -WindowStyle Hidden `
         -RedirectStandardOutput $executorLog -RedirectStandardError (Join-Path $LOG_DIR "executor_err.log")
-    Start-Sleep -Seconds 2
-    Write-Host "  Executor OK" -ForegroundColor Green
+    Start-Sleep -Seconds 3
+    # Verify executor is up
+    try {
+        $exHealth = Invoke-RestMethod -Uri "http://127.0.0.1:3030/health" -TimeoutSec 5
+        Write-Host "  Executor OK (balance: $($exHealth.balance) USDT)" -ForegroundColor Green
+    } catch {
+        Write-Host "  Executor: mozna start, health check selhal (zkontroluj logs\executor.log)" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "  Executor script nenalezen ($executorScript) — preskakuji" -ForegroundColor Yellow
+    Write-Host "  Executor script nenalezen ($executorScript) — zkontroluj executor/index.js" -ForegroundColor Red
 }
 
 # === START ALERT BOT ===

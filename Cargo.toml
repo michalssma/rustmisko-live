@@ -43,6 +43,10 @@ path = "src/ultra_live.rs"
 name = "feed-hub"
 path = "src/feed_hub.rs"
 
+[[bin]]
+name = "alert-bot"
+path = "src/bin/alert_bot.rs"
+
 [dependencies]
 tokio              = { workspace = true }
 dotenv             = { workspace = true }

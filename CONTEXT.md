@@ -1,53 +1,46 @@
-# CONTEXT.md — Systémový kontext pro RustMiskoLive
+# CONTEXT
 
-Aktualizováno: 2026-02-24
+Aktualizováno: **2026-02-26 14:27**
 
-## Co tento projekt dělá
+## Co projekt dělá
 
-RustMiskoLive je **automatizovaný CS2 esports arbitrážní systém**. Detekuje cenové rozdíly (edge) mezi tradičními bookmakery (1xbit, HLTV featured) a decentralizovanou platformou Azuro Protocol (on-chain, Polygon). Při nalezení příležitosti pošle alert na Telegram; uživatel potvrdí a systém reálně sází on-chain.
+RustMiskoLive je lokální automatizační stack pro sběr live kurzů/skóre, detekci edge příležitostí a exekuci sázek přes Azuro executor na Polygon chain.
 
-## Status: 🔴 LIVE PRODUKCE
+## Aktivní komponenty
 
-Systém běží s reálnými penězi na Polygon (33.77 USDT). Executor je v LIVE režimu.
+- `feed-hub` (Rust): ingest WS feedů + HTTP `/state` a `/opportunities`
+- `alert-bot` (Rust): alerting, auto-bet logika (LIVE score edges only), cashout/claim orchestrace
+- `executor` (Node.js): endpointy `/bet`, `/cashout`, `/check-payout`, `/claim`, `/my-bets`, `/auto-claim`
+  - **`/my-bets` a `/auto-claim` — ON-CHAIN NFT enumeration** (žádná subgraph závislost!)
+- `userscripts/tipsport_odds_scraper.user.js` (v2.3): Tipsport odds/live feed
 
-## Klíčové komponenty
+## Auto-bet strategie (v4.5)
 
-| Komponenta | Tech | Port | Status |
-|---|---|---|---|
-| Feed Hub | Rust, tokio | WS 8080, HTTP 8081 | ✅ LIVE |
-| Alert Bot | Rust, tokio | — | ✅ LIVE |
-| Executor | Node.js, viem | 3030 | ✅ LIVE |
-| HLTV scraper | Tampermonkey v3 | — | ✅ LIVE |
-| Bo3.gg scraper | Tampermonkey v3 | — | ✅ Ready |
-| Azuro poller | Rust (in feed-hub) | — | ✅ LIVE |
+- **LIVE score edges** → auto-bet (naše skutečná výhoda — vidíme skóre dřív než Azuro)
+  - Esports (CS2/Dota/Valorant/LoL): **pouze map_winner** (match_winner na BO3 je příliš riskantní)
+  - Tradiční sporty: match_winner povoleno
+- **Prematch odds anomaly** → alert only, žádný auto-bet
+- **Per-condition dedup** — nikdy dva bety na stejnou condition
+- **Inflight lock** — race condition ochrana při čekání na executor odpověď
+- **Žádný session limit** — neomezený počet betů
 
-## Kde je kód
+## Ověřené prostředí
 
-| Soubor | Účel |
-|--------|------|
-| `src/feed_hub.rs` | Hlavní binary — WS + HTTP server, opportunities engine |
-| `src/azuro_poller.rs` | Azuro GraphQL poller (4 chainy) |
-| `src/feed_db.rs` | SQLite persistence (WAL mode) |
-| `src/bin/alert_bot.rs` | Telegram alert bot + executor integration |
-| `executor/index.js` | Node.js executor sidecar (Azuro bet/cashout) |
-| `userscripts/hltv_live_scraper.user.js` | HLTV Tampermonkey scraper v3 |
-| `userscripts/odds_scraper.user.js` | Bo3.gg odds scraper v3 |
-| `crates/logger/` | JSONL event logging |
+- Chain: Polygon (`137`)
+- Bet token: USDT (`0xc2132D05D31c914a87C6611C10748AEb04B58e8F`)
+- Wallet: `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00`
+- AzuroBet NFT: `0x7A1c3FEf712753374C4DCe34254B96faF2B7265B`
+- Core: `0xF9548Be470A4e130c90ceA8b179FCD66D2972AC7`
+- LP: `0x0FA7FB5407eA971694652E6E16C12A52625DE1b8`
 
-## Wallet
+## Plánované rozšíření
 
-- Address: `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00`
-- Chain: Polygon (137)
-- Token: USDT (`0xc2132D05D31c914a87C6611C10748AEb04B58e8F`)
-- Balance: 33.77 USDT + ~2.09 POL (gas)
-- Azuro Relayer: approved UNLIMITED
+- Tampermonkey scraper pro **1xbit** (LIVE sekce všech sportů)
+- Tampermonkey scraper pro **Fortuna**
+- **HLTV** scraper pro CS2 data
+- Rozšíření na tenis (set_winner), basketball (quarter logic), další sporty
 
-## Azuro Protocol
+## Důležité pravidlo pro dokumentaci
 
-- Typ: Decentralizovaný on-chain bookmaker (AMM pool)
-- KYC: ŽÁDNÉ — wallet-only
-- Subgraph: `thegraph-1.onchainfeed.org` (data-feed, NE client!)
-- Chainy: Polygon, Gnosis, Base, Chiliz
-- Bet flow: EIP712 → Relayer → on-chain
-- Frontend: bookmaker.xyz
-- RPC: `https://1rpc.io/matic`
+- Aktuální čísla (balance, pending, procesy) drž pouze v `AKTUALNI_PROGRESS.md`.
+- Ostatní `.md` používej jako strategii/plán, ne jako live telemetry.

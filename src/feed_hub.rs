@@ -441,15 +441,18 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
         // Catches mislabeled sports: basketball game tagged as football, etc.
         let sport_in_key = match_key.split("::").next().unwrap_or("unknown");
         let score_looks_valid = match sport_in_key {
-            "football" => score1 <= 15 && score2 <= 15, // max realistic football score
+            "football" => score1 <= 8 && score2 <= 8,   // max realistic football score (tightened)
+            "hockey" => score1 <= 10 && score2 <= 10,    // max realistic hockey score
             "cs2" | "dota-2" | "league-of-legends" | "valorant" => {
                 // Map scores: 0-3 range for match level
                 score1 <= 3 && score2 <= 3
             },
             "tennis" => score1 <= 5 && score2 <= 5, // sets: max 5
-            "basketball" => score1 >= 0 && score2 >= 0, // basketball any score ok
+            "basketball" => score1 <= 200 && score2 <= 200, // max realistic basketball score per team
             "mma" | "boxing" => score1 <= 5 && score2 <= 5,
-            _ => true,
+            "handball" => score1 <= 45 && score2 <= 45,
+            "volleyball" => score1 <= 5 && score2 <= 5,
+            _ => score1 <= 50 && score2 <= 50,  // generic safety net for unknown sports
         };
         if !score_looks_valid {
             // Skip — score doesn't match sport type, likely mislabeled
@@ -687,9 +690,7 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
         if is_fused {
             fused_keys.push(k.clone());
         }
-        if fused_keys.len() >= 50 {
-            break;
-        }
+        // No limit on fused_keys — alert-bot needs full picture
     }
 
     let fused_ready = fused_keys.len();
@@ -702,9 +703,6 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
             seen_at: v.seen_at.to_rfc3339(),
             payload: v.payload.clone(),
         });
-        if live.len() >= 50 {
-            break;
-        }
     }
 
     let mut odds = Vec::new();
@@ -715,9 +713,6 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
             seen_at: v.seen_at.to_rfc3339(),
             payload: v.payload.clone(),
         });
-        if odds.len() >= 50 {
-            break;
-        }
     }
 
     HttpStateResponse {
