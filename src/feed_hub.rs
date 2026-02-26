@@ -437,6 +437,25 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
         let score_str = format!("{}-{}", score1, score2);
         let live_age = now.signed_duration_since(live.seen_at).num_seconds();
 
+        // === SPORT-AWARE SCORE SANITY CHECK ===
+        // Catches mislabeled sports: basketball game tagged as football, etc.
+        let sport_in_key = match_key.split("::").next().unwrap_or("unknown");
+        let score_looks_valid = match sport_in_key {
+            "football" => score1 <= 15 && score2 <= 15, // max realistic football score
+            "cs2" | "dota-2" | "league-of-legends" | "valorant" => {
+                // Map scores: 0-3 range for match level
+                score1 <= 3 && score2 <= 3
+            },
+            "tennis" => score1 <= 5 && score2 <= 5, // sets: max 5
+            "basketball" => score1 >= 0 && score2 >= 0, // basketball any score ok
+            "mma" | "boxing" => score1 <= 5 && score2 <= 5,
+            _ => true,
+        };
+        if !score_looks_valid {
+            // Skip — score doesn't match sport type, likely mislabeled
+            continue;
+        }
+
         for odds_state in odds_list {
             let odds = &odds_state.payload;
             let odds_age = now.signed_duration_since(odds_state.seen_at).num_seconds();
