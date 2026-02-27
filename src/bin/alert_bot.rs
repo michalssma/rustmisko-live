@@ -3972,10 +3972,61 @@ async fn main() -> Result<()> {
 
                 // Claim payouts in batch
                 if !tokens_to_claim.is_empty() {
-                    info!("💰 Claiming {} settled bets: {:?}", tokens_to_claim.len(), tokens_to_claim);
+                    // PRE-FILTER: verify each token is actually claimable on-chain
+                    // (subgraph can be ahead of chain — bet shows Canceled in subgraph but
+                    //  viewPayout still reverts on chain)
+                    let mut verified_tokens: Vec<String> = Vec::new();
+                    let mut verified_details: Vec<(u32, String, String, String, f64, f64, String)> = Vec::new();
+                    let mut deferred_bets: Vec<String> = Vec::new(); // tokens that are still pending on-chain
+
+                    for (i, tid) in tokens_to_claim.iter().enumerate() {
+                        let payout_body = serde_json::json!({ "tokenId": tid });
+                        let payout_check = match client.post(format!("{}/check-payout", executor_url))
+                            .json(&payout_body).send().await {
+                            Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                            Err(_) => None,
+                        };
+
+                        let is_chain_ready = payout_check.as_ref()
+                            .map(|p| {
+                                let claimable = p.get("claimable").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let pending = p.get("pending").and_then(|v| v.as_bool()).unwrap_or(true);
+                                claimable && !pending
+                            })
+                            .unwrap_or(false);
+
+                        if is_chain_ready {
+                            verified_tokens.push(tid.clone());
+                            if i < claim_details.len() {
+                                verified_details.push(claim_details[i].clone());
+                            }
+                        } else {
+                            let reason = payout_check.as_ref()
+                                .and_then(|p| p.get("reason").and_then(|v| v.as_str()))
+                                .unwrap_or("unknown");
+                            info!("⏳ Token {} not ready on-chain yet ({}), deferring claim", tid, reason);
+                            deferred_bets.push(tid.clone());
+                        }
+                    }
+
+                    // Remove deferred bets from the "settled" and "remove" lists — they need to stay active
+                    if !deferred_bets.is_empty() {
+                        info!("⏳ {} bets deferred (chain not ready): {:?}", deferred_bets.len(), deferred_bets);
+                        // Find bet_ids that match deferred tokens and remove from bets_to_remove
+                        let deferred_set: std::collections::HashSet<&str> = deferred_bets.iter().map(|s| s.as_str()).collect();
+                        bets_to_remove.retain(|bid| {
+                            let bet_token = active_bets.iter().find(|b| b.bet_id == *bid).and_then(|b| b.token_id.as_deref());
+                            !bet_token.map(|t| deferred_set.contains(t)).unwrap_or(false)
+                        });
+                    }
+
+                    if verified_tokens.is_empty() {
+                        info!("⏳ All {} tokens pending on-chain, skipping claim batch", tokens_to_claim.len());
+                    } else {
+                    info!("💰 Claiming {} settled bets: {:?}", verified_tokens.len(), verified_tokens);
 
                     let claim_body = serde_json::json!({
-                        "tokenIds": tokens_to_claim,
+                        "tokenIds": verified_tokens,
                     });
 
                     match client.post(format!("{}/claim", executor_url))
@@ -3998,7 +4049,7 @@ async fn main() -> Result<()> {
 
                                     // Build detailed notification
                                     let mut msg = String::from("💰 <b>AUTO-CLAIM úspěšný!</b>\n\n");
-                                    for (aid, _t1, _t2, vt, amt, odds, res) in &claim_details {
+                                    for (aid, _t1, _t2, vt, amt, odds, res) in &verified_details {
                                         let emoji = if res == "Won" { "✅" } else { "🔄" };
                                         let result_text = if res == "Won" {
                                             format!("VÝHRA! +${:.2}", amt * odds - amt)
@@ -4027,7 +4078,7 @@ async fn main() -> Result<()> {
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;
                                     // === LEDGER: CLAIMED (batch) ===
-                                    for (aid, t1, t2, vt, amt, odds, res) in &claim_details {
+                                    for (aid, t1, t2, vt, amt, odds, res) in &verified_details {
                                         ledger_write("CLAIMED", &serde_json::json!({
                                             "alert_id": aid, "value_team": vt,
                                             "amount_usd": amt, "odds": odds,
@@ -4053,6 +4104,7 @@ async fn main() -> Result<()> {
                             ).await;
                         }
                     }
+                    } // end if verified_tokens not empty
                 }
 
                 // Remove settled bets from active list
