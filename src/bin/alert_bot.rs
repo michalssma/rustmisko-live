@@ -56,8 +56,10 @@ const MANUAL_BET_DEFAULT_USD: f64 = 3.0;
 const MANUAL_BET_MAX_ODDS: f64 = 2.00;
 /// Manual/Reaction alert must be fresh (prevents betting stale/reset markets)
 const MANUAL_ALERT_MAX_AGE_SECS: i64 = 25;
-/// Block betting on generic esports keys (often mixed/non-CS2 semantics)
-const BLOCK_GENERIC_ESPORTS_BETS: bool = true;
+/// Block betting on generic esports keys — DISABLED: Azuro condition_id check
+/// already ensures we only bet on real Azuro markets. esports:: keys from
+/// Tipsport resolve to cs2:: via alt-key lookup → safe to bet.
+const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
 /// Retry settings for live markets (short bursts, many attempts)
 const AUTO_BET_RETRY_MAX: usize = 8;
 const AUTO_BET_RETRY_SLEEP_MS: u64 = 900;
@@ -87,7 +89,7 @@ const WATCHDOG_TIMEOUT_SECS: u64 = 120;
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
-        "cs2" | "valorant" | "dota-2" | "league-of-legends" | "esports"
+        "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol" | "esports"
             => (true, 12.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
         // Safety: auto-bet only allowed when set_diff >= 1 (checked in sport guard)
@@ -101,6 +103,9 @@ fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
         // Safety: auto-bet only when goal_diff >= 2 (checked in sport guard)
         "football"
             => (true, 18.0, 1.0, "match_winner"),
+        // New sports: alerts enabled, conservative edge thresholds
+        "volleyball" | "ice-hockey" | "baseball" | "cricket" | "boxing"
+            => (true, 15.0, 1.0, "match_winner"),
         // Unknown sport: alerts only
         _
             => (false, 0.0, 0.0, "none"),
@@ -403,6 +408,8 @@ struct ScoreEdge {
     outcome_id: Option<String>,
     chain: Option<String>,
     azuro_url: Option<String>,
+    /// CS2 map confidence tier for dynamic odds cap ("ULTRA"/"HIGH"/"MEDIUM"/"LOW"/None)
+    cs2_map_confidence: Option<&'static str>,
 }
 
 /// CS2 score → estimated win probability for the LEADING team
@@ -433,6 +440,60 @@ fn normalize_team_name(name: &str) -> String {
         .collect::<String>()
 }
 
+/// Check if a single team name loosely matches another (substring or equality after normalization)
+fn team_name_matches_single(live_name: &str, azuro_name: &str) -> bool {
+    let a = normalize_team_name(live_name);
+    let b = normalize_team_name(azuro_name);
+    if a.is_empty() || b.is_empty() { return false; }
+    if a == b || a.contains(&b) || b.contains(&a) { return true; }
+    // Word-set match: handles first/last name reversal (tennis, individual sports)
+    // "Masarova Rebeka" vs "Rebeka Masarova" → both normalize to same set of words
+    let la = live_name.to_lowercase();
+    let lb = azuro_name.to_lowercase();
+    let mut wa: Vec<&str> = la.split_whitespace().collect();
+    let mut wb: Vec<&str> = lb.split_whitespace().collect();
+    if wa.len() >= 2 && wa.len() == wb.len() {
+        wa.sort();
+        wb.sort();
+        if wa == wb { return true; }
+    }
+    false
+}
+
+/// Given the leading team name from live data, determine which Azuro side (1 or 2) matches.
+/// Returns Some(1) or Some(2) if unambiguously matched, None if ambiguous or no match.
+/// NEVER falls back to positional — if we can't identify the team, we BLOCK the bet.
+fn resolve_azuro_side(leading_team: &str, azuro_team1: &str, azuro_team2: &str, _positional_side: u8) -> Option<u8> {
+    let m1 = team_name_matches_single(leading_team, azuro_team1);
+    let m2 = team_name_matches_single(leading_team, azuro_team2);
+    if m1 && !m2 { return Some(1); }
+    if m2 && !m1 { return Some(2); }
+    // Also try matching the OTHER live team against Azuro teams for cross-validation
+    // (caller should use resolve_azuro_side_pair for that)
+    // Both match or neither: AMBIGUOUS → return None (block bet)
+    None
+}
+
+/// Full pair resolution: try leading team first, then losing team for cross-validation.
+/// Returns Some(azuro_side_of_leading_team) or None if ambiguous.
+fn resolve_azuro_side_pair(
+    live_team1: &str, live_team2: &str, leading_side: u8,
+    azuro_team1: &str, azuro_team2: &str,
+) -> Option<u8> {
+    let leading_team = if leading_side == 1 { live_team1 } else { live_team2 };
+    let losing_team = if leading_side == 1 { live_team2 } else { live_team1 };
+    // Try leading team first
+    if let Some(s) = resolve_azuro_side(leading_team, azuro_team1, azuro_team2, leading_side) {
+        return Some(s);
+    }
+    // Fallback: match the LOSING team and invert
+    if let Some(s) = resolve_azuro_side(losing_team, azuro_team1, azuro_team2, if leading_side == 1 { 2 } else { 1 }) {
+        // losing team matched side s → leading team is the OTHER side
+        return Some(if s == 1 { 2 } else { 1 });
+    }
+    None
+}
+
 fn teams_match_loose(a1: &str, a2: &str, b1: &str, b2: &str) -> bool {
     let a1n = normalize_team_name(a1);
     let a2n = normalize_team_name(a2);
@@ -448,7 +509,18 @@ fn teams_match_loose(a1: &str, a2: &str, b1: &str, b2: &str) -> bool {
         !x.is_empty() && !y.is_empty() && (x.contains(y) || y.contains(x))
     };
 
-    (overlap(&a1n, &b1n) && overlap(&a2n, &b2n)) || (overlap(&a1n, &b2n) && overlap(&a2n, &b1n))
+    if (overlap(&a1n, &b1n) && overlap(&a2n, &b2n)) || (overlap(&a1n, &b2n) && overlap(&a2n, &b1n)) {
+        return true;
+    }
+
+    // Word-set match for name reversals (tennis/individual sports)
+    let word_match = |x: &str, y: &str| -> bool {
+        let mut wx: Vec<String> = x.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        let mut wy: Vec<String> = y.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+        wx.len() >= 2 && wx.len() == wy.len() && { wx.sort(); wy.sort(); wx == wy }
+    };
+
+    (word_match(a1, b1) && word_match(a2, b2)) || (word_match(a1, b2) && word_match(a2, b1))
 }
 
 fn is_recent_seen_at(seen_at: &str, now: DateTime<Utc>) -> bool {
@@ -465,6 +537,75 @@ fn is_recent_seen_at(seen_at: &str, now: DateTime<Utc>) -> bool {
 /// Map scores (max <= 3): Bo3 map count
 ///   - 1-0 → ~68% match win
 ///   - 2-0 → match won (don't bet)
+/// CS2 map win probability based on round differential AND total rounds played.
+/// Uses empirical data from CS2 pro matches (MR12 format, first to 13).
+///
+/// Key insight: same diff at different stages means very different things:
+///   5-0 (total=5, early) → 65-70% (half-switch at r13 can flip momentum)
+///   9-4 (total=13, at half) → 80% (past half, momentum confirmed)
+///   12-7 (total=19, late) → 95% (1 round away from win)
+///
+/// Half-switch at round 13: CT→T or T→CT changes dynamics significantly.
+fn cs2_map_win_prob(diff: i32, total_rounds: i32) -> f64 {
+    if diff <= 0 { return 0.50; }
+    match (diff, total_rounds) {
+        // EARLY GAME (total ≤ 8): high variance, half-switch coming
+        // Even big diffs can reverse after side switch
+        (d, t) if t <= 8 => match d {
+            1..=2 => 0.55,
+            3..=4 => 0.62,
+            5..=6 => 0.68,
+            _ => 0.75,   // 7-0 or 7-1 early = strong but volatile
+        },
+        // MID-EARLY (total 9-12): approaching half, some info but switch coming
+        (d, t) if t <= 12 => match d {
+            1..=2 => 0.57,
+            3..=4 => 0.67,
+            5..=6 => 0.76,
+            7..=8 => 0.85,
+            _ => 0.90,
+        },
+        // AT/PAST HALF (total 13-18): half-switch done, momentum visible
+        (d, t) if t <= 18 => match d {
+            1..=2 => 0.60,
+            3..=4 => 0.73,
+            5..=6 => 0.84,
+            7..=8 => 0.92,
+            _ => 0.96,
+        },
+        // LATE GAME (total 19+): very few rounds left, approaching 13
+        (d, _) => match d {
+            1..=2 => 0.65,
+            3..=4 => 0.82,
+            5..=6 => 0.93,
+            _ => 0.97,
+        },
+    }
+}
+
+/// Confidence tier for dynamic odds cap:
+///   "ULTRA"  → prob ≥ 90% AND late game → max odds 5.00
+///   "HIGH"   → prob ≥ 80% AND mid+ game → max odds 3.00
+///   "MEDIUM" → prob ≥ 70%              → max odds 2.00
+///   "LOW"    → prob < 70%              → max odds 1.60
+fn cs2_confidence_tier(map_win_prob: f64, total_rounds: i32) -> &'static str {
+    if map_win_prob >= 0.90 && total_rounds >= 16 { "ULTRA" }
+    else if map_win_prob >= 0.80 && total_rounds >= 13 { "HIGH" }
+    else if map_win_prob >= 0.70 { "MEDIUM" }
+    else { "LOW" }
+}
+
+/// Dynamic max odds for CS2 map_winner based on confidence tier
+fn cs2_dynamic_max_odds(tier: &str) -> f64 {
+    match tier {
+        "ULTRA" => 5.00,
+        "HIGH" => 3.00,
+        "MEDIUM" => 2.00,
+        "LOW" => 1.60,
+        _ => 2.00,
+    }
+}
+
 fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
     let diff = leading_score - losing_score;
     if diff <= 0 { return None; }
@@ -473,35 +614,16 @@ fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
 
     if max_score > 3 {
         // ROUND scores within a map (CS2 MR12: first to 13)
-        // The leading team needs fewer rounds to win this map.
-        // Model: differential maps to map-win probability,
-        // then map-win probability gives match advantage.
-        let rounds_to_win = 13 - leading_score; // rounds leading team needs
-        let rounds_opponent = 13 - losing_score; // rounds opponent needs
+        let total = leading_score + losing_score;
+        let map_win_prob = cs2_map_win_prob(diff, total);
 
-        if rounds_to_win <= 0 {
+        if leading_score >= 13 {
             return None; // Map already won, too late
         }
 
-        // Rough map-win probability based on round differential
-        let map_win_prob = match diff {
-            1..=2 => 0.58,   // Slight lead
-            3..=4 => 0.70,   // Solid lead
-            5..=6 => 0.82,   // Dominant
-            7..=8 => 0.90,   // Near-certain map win
-            _ => 0.95,       // 9+ round lead = map locked
-        };
-
         // Map win → match impact (assumes this map matters)
-        // If they win this map: they either take 1-0 or 2-1 lead
-        // Approximate: match_prob ≈ 50% + (map_win_prob - 50%) * 0.55
         let match_prob = 0.50 + (map_win_prob - 0.50) * 0.55;
 
-        // Only flag if there's a STRONG round lead
-        // TIGHTENED: was diff >= 3, now diff >= 5
-        // At 4-1 in CS2, CT side often starts strong then collapses on T side.
-        // Comebacks at 4-1 happen ~35-38% of the time — NOT safe enough for auto-bet.
-        // At 7-2 (diff=5), map win prob is genuinely 82% → match prob 67.6%.
         if diff >= 3 {
             Some(match_prob)
         } else {
@@ -509,11 +631,15 @@ fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
         }
     } else {
         // MAP scores (Bo3/Bo5 format)
+        // IMPORTANT: (1, 0) is REMOVED — in CS2/LoL Bo3, winning map 1
+        // means you won YOUR MAP PICK (expected). Opponent plays their pick
+        // on map 2 → effectively ~55% not 68%. Azuro odds at 1.90-2.00 are
+        // CORRECT, not stale. Real edge is only 5%, not 17%.
+        // Only map_winner with ROUND-level edges (diff >= 3) are profitable.
         match (leading_score, losing_score) {
-            (1, 0) => Some(0.68),  // Won first map → ~68%
             (2, 0) => None,        // Already won → too late
             (2, 1) => None,        // Already won
-            _ => None,
+            _ => None,             // (1,0) = won 1 map pick → no reliable edge
         }
     }
 }
@@ -965,13 +1091,14 @@ fn find_score_edges(
         if max_score > 3 && diff >= 3 {
             // This is a round-level score within a CS2 map
             if let Some(map_odds_list) = map_odds_list_opt {
-                // Map win probability direct (NOT converted to match prob)
-                let map_win_prob = match diff {
-                    3..=4 => 0.72,
-                    5..=6 => 0.82,
-                    7..=8 => 0.90,
-                    _ => 0.95,
-                };
+                // CS2 map win probability: based on (diff, total_rounds)
+                // Half-switch at round 13: CT→T or T→CT — changes momentum
+                // Early game (total ≤ 12): high variance, half-switch coming
+                // Mid game (total 13-18): past half, more predictable
+                // Late game (total 19+): very few rounds left, high certainty
+                let total_rounds = s1 + s2;
+                let map_win_prob = cs2_map_win_prob(diff, total_rounds);
+                let map_confidence_tier = cs2_confidence_tier(map_win_prob, total_rounds);
 
                 for mw in map_odds_list {
                     if !is_recent_seen_at(&mw.seen_at, now) {
@@ -979,7 +1106,27 @@ fn find_score_edges(
                             match_key, s1, s2, mw.market);
                         continue;
                     }
-                    let mw_implied = if leading_side == 1 {
+
+                    // Resolve correct Azuro side by TEAM NAME — HARD BLOCK if ambiguous
+                    let azuro_side = match resolve_azuro_side_pair(
+                        &live.payload.team1, &live.payload.team2, leading_side,
+                        &mw.team1, &mw.team2,
+                    ) {
+                        Some(s) => s,
+                        None => {
+                            let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                            info!("  🛑 {} MW {}: TEAM IDENTITY AMBIGUOUS! live={}+{} azuro={}+{} — BLOCKING bet",
+                                match_key, mw.market, live.payload.team1, live.payload.team2, mw.team1, mw.team2);
+                            continue;
+                        }
+                    };
+                    if azuro_side != leading_side {
+                        let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                        info!("  🔀 {} MW {}: team order fix! live leading={} (side {}), matched azuro side {} ({})",
+                            match_key, mw.market, leading_team, leading_side, azuro_side, if azuro_side == 1 { &mw.team1 } else { &mw.team2 });
+                    }
+
+                    let mw_implied = if azuro_side == 1 {
                         1.0 / mw.odds_team1
                     } else {
                         1.0 / mw.odds_team2
@@ -994,18 +1141,26 @@ fn find_score_edges(
                     }
 
                     let mw_confidence = if mw_edge >= 15.0 { "HIGH" } else { "MEDIUM" };
-                    let mw_outcome_id = if leading_side == 1 {
+                    let mw_outcome_id = if azuro_side == 1 {
                         mw.outcome1_id.clone()
                     } else {
                         mw.outcome2_id.clone()
                     };
 
-                    let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
-                    info!("🗺️ MAP WINNER EDGE [PRIORITY]: {} leads {}-{}, {} implied={:.1}%, map_prob={:.1}%, edge={:.1}% — BLOCKING match_winner",
-                        leading_team, s1, s2, mw.market, mw_implied * 100.0, map_win_prob * 100.0, mw_edge);
+                    let leading_team_name = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                    info!("🗺️ MAP WINNER EDGE [PRIORITY]: {} leads {}-{}, {} implied={:.1}%, map_prob={:.1}%, edge={:.1}% (azuro_side={}, tier={}, max_odds={:.2}) — BLOCKING match_winner",
+                        leading_team_name, s1, s2, mw.market, mw_implied * 100.0, map_win_prob * 100.0, mw_edge, azuro_side,
+                        map_confidence_tier, cs2_dynamic_max_odds(map_confidence_tier));
 
                     tracker.edge_cooldown.insert(match_key.to_string(), now);
                     has_map_winner_edge = true;
+
+                    // Reorder azuro odds to match live team ordering
+                    let (sw1, sw2, so1, so2) = if azuro_side == leading_side {
+                        (mw.odds_team1, mw.odds_team2, mw.outcome1_id.clone(), mw.outcome2_id.clone())
+                    } else {
+                        (mw.odds_team2, mw.odds_team1, mw.outcome2_id.clone(), mw.outcome1_id.clone())
+                    };
 
                     edges.push(ScoreEdge {
                         match_key: format!("{}::{}", match_key, mw.market),
@@ -1016,8 +1171,8 @@ fn find_score_edges(
                         prev_score1: prev_s1,
                         prev_score2: prev_s2,
                         leading_side,
-                        azuro_w1: mw.odds_team1,
-                        azuro_w2: mw.odds_team2,
+                        azuro_w1: sw1,
+                        azuro_w2: sw2,
                         azuro_bookmaker: format!("{} [{}]", mw.bookmaker, mw.market),
                         azuro_implied_pct: mw_implied * 100.0,
                         score_implied_pct: map_win_prob * 100.0,
@@ -1025,11 +1180,12 @@ fn find_score_edges(
                         confidence: mw_confidence,
                         game_id: None,
                         condition_id: mw.condition_id.clone(),
-                        outcome1_id: mw.outcome1_id.clone(),
-                        outcome2_id: mw.outcome2_id.clone(),
+                        outcome1_id: so1,
+                        outcome2_id: so2,
                         outcome_id: mw_outcome_id,
                         chain: mw.chain.clone(),
                         azuro_url: mw.url.clone(),
+                        cs2_map_confidence: Some(map_confidence_tier),
                     });
                 }
             }
@@ -1075,7 +1231,26 @@ fn find_score_edges(
             continue;
         }
 
-        let azuro_implied = if leading_side == 1 {
+        // Resolve correct Azuro side by TEAM NAME — HARD BLOCK if ambiguous
+        let mw_azuro_side = match resolve_azuro_side_pair(
+            &live.payload.team1, &live.payload.team2, leading_side,
+            &azuro.payload.team1, &azuro.payload.team2,
+        ) {
+            Some(s) => s,
+            None => {
+                info!("  🛑 {} match_winner: TEAM IDENTITY AMBIGUOUS! live={}+{} azuro={}+{} — BLOCKING bet",
+                    match_key, live.payload.team1, live.payload.team2, azuro.payload.team1, azuro.payload.team2);
+                continue;
+            }
+        };
+        if mw_azuro_side != leading_side {
+            let mw_leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+            info!("  🔀 {} MW match_winner: team order fix! live leading={} (side {}), matched azuro side {} ({})",
+                match_key, mw_leading_team, leading_side, mw_azuro_side,
+                if mw_azuro_side == 1 { &azuro.payload.team1 } else { &azuro.payload.team2 });
+        }
+
+        let azuro_implied = if mw_azuro_side == 1 {
             1.0 / azuro.payload.odds_team1
         } else {
             1.0 / azuro.payload.odds_team2
@@ -1104,15 +1279,24 @@ fn find_score_edges(
         let confidence = if edge >= 15.0 { "HIGH" } else { "MEDIUM" };
 
         let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
-        info!("⚡ MATCH WINNER EDGE [FALLBACK]: {} leads {}-{}, Azuro implied {:.1}%, expected {:.1}%, edge {:.1}% (no map_winner odds available)",
-            leading_team, s1, s2, azuro_implied * 100.0, expected_prob * 100.0, edge);
+        info!("⚡ MATCH WINNER EDGE [FALLBACK]: {} leads {}-{}, Azuro implied {:.1}%, expected {:.1}%, edge {:.1}% (azuro_side={}, no map_winner odds available)",
+            leading_team, s1, s2, azuro_implied * 100.0, expected_prob * 100.0, edge, mw_azuro_side);
 
         tracker.edge_cooldown.insert(match_key.to_string(), now);
 
-        let outcome_id = if leading_side == 1 {
+        let outcome_id = if mw_azuro_side == 1 {
             azuro.payload.outcome1_id.clone()
         } else {
             azuro.payload.outcome2_id.clone()
+        };
+
+        // Reorder azuro odds to match live team ordering
+        let (sw1, sw2, so1, so2) = if mw_azuro_side == leading_side {
+            (azuro.payload.odds_team1, azuro.payload.odds_team2,
+             azuro.payload.outcome1_id.clone(), azuro.payload.outcome2_id.clone())
+        } else {
+            (azuro.payload.odds_team2, azuro.payload.odds_team1,
+             azuro.payload.outcome2_id.clone(), azuro.payload.outcome1_id.clone())
         };
 
         edges.push(ScoreEdge {
@@ -1124,8 +1308,8 @@ fn find_score_edges(
             prev_score1: prev_s1,
             prev_score2: prev_s2,
             leading_side,
-            azuro_w1: azuro.payload.odds_team1,
-            azuro_w2: azuro.payload.odds_team2,
+            azuro_w1: sw1,
+            azuro_w2: sw2,
             azuro_bookmaker: azuro.payload.bookmaker.clone(),
             azuro_implied_pct: azuro_implied * 100.0,
             score_implied_pct: expected_prob * 100.0,
@@ -1133,11 +1317,12 @@ fn find_score_edges(
             confidence,
             game_id: azuro.payload.game_id.clone(),
             condition_id: azuro.payload.condition_id.clone(),
-            outcome1_id: azuro.payload.outcome1_id.clone(),
-            outcome2_id: azuro.payload.outcome2_id.clone(),
+            outcome1_id: so1,
+            outcome2_id: so2,
             outcome_id,
             chain: azuro.payload.chain.clone(),
             azuro_url: azuro.payload.url.clone(),
+            cs2_map_confidence: None, // match_winner, not map_winner
         });
     }
 
@@ -1362,6 +1547,9 @@ fn teams_match(a: &str, b: &str) -> bool {
     if na == nb { return true; }
     // One contains the other (e.g. "MIBR" vs "MIBR Academy")
     if na.contains(&nb) || nb.contains(&na) { return true; }
+    // Word-set match: handles first/last name reversal (tennis, individual sports)
+    // "lea ma" vs "ma lea", "andrea pellegrino" vs "pellegrino andrea"
+    if words_match(&na, &nb) { return true; }
     // Levenshtein-like: if short and differ by 1-2 chars, might be typo
     if na.len() >= 3 && nb.len() >= 3 {
         let shorter = na.len().min(nb.len());
@@ -1371,9 +1559,23 @@ fn teams_match(a: &str, b: &str) -> bool {
     false
 }
 
+/// Check if two names have the same set of words (order-independent)
+/// Handles "Firstname Lastname" vs "Lastname Firstname" common in tennis/individual sports
+fn words_match(a: &str, b: &str) -> bool {
+    let mut wa: Vec<&str> = a.split_whitespace().collect();
+    let mut wb: Vec<&str> = b.split_whitespace().collect();
+    if wa.len() < 2 || wb.len() < 2 { return false; }
+    // Must have same number of words
+    if wa.len() != wb.len() { return false; }
+    wa.sort();
+    wb.sort();
+    wa == wb
+}
+
 /// Detect if odds from two sources have team1/team2 swapped
-/// Returns (market_w1_aligned, market_w2_aligned, is_swapped)
-fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool) {
+/// Returns (market_w1_aligned, market_w2_aligned, is_swapped, is_ambiguous)
+/// ambiguous = true when normal_score == swap_score (cannot determine team order)
+fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool, bool) {
     let a1 = norm_team(&azuro.team1);
     let a2 = norm_team(&azuro.team2);
     let m1 = norm_team(&market.team1);
@@ -1386,11 +1588,13 @@ fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool) {
     let swap_score = (if teams_match(&a1, &m2) { 1 } else { 0 })
                    + (if teams_match(&a2, &m1) { 1 } else { 0 });
 
+    let ambiguous = normal_score == swap_score;
+
     if swap_score > normal_score {
         // Teams are swapped — flip market odds
-        (market.odds_team2, market.odds_team1, true)
+        (market.odds_team2, market.odds_team1, true, ambiguous)
     } else {
-        (market.odds_team1, market.odds_team2, false)
+        (market.odds_team1, market.odds_team2, false, ambiguous)
     }
 }
 
@@ -1437,14 +1641,23 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
         let mut total_m_w1 = 0.0_f64;
         let mut total_m_w2 = 0.0_f64;
         let mut any_swapped = false;
+        let mut any_ambiguous = false;
         let mut market_count = 0;
 
         for mi in &market_items {
-            let (mw1, mw2, swapped) = align_teams(azuro, &mi.payload);
+            let (mw1, mw2, swapped, ambiguous) = align_teams(azuro, &mi.payload);
             total_m_w1 += mw1;
             total_m_w2 += mw2;
             if swapped { any_swapped = true; }
+            if ambiguous { any_ambiguous = true; }
             market_count += 1;
+        }
+
+        // HARD BLOCK: if team identity is ambiguous, skip entirely (same safety as score edge path)
+        if any_ambiguous {
+            info!("🚫 ODDS ANOMALY TEAM AMBIGUOUS: {} — azuro({} vs {}) cannot reliably match market teams, skipping",
+                match_key, azuro.team1, azuro.team2);
+            continue;
         }
 
         let avg_w1 = total_m_w1 / market_count as f64;
@@ -1461,7 +1674,7 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
 
         // PENALTY: teams were swapped
         if any_swapped {
-            reasons.push(format!("Team order PROHOZENÝ (azuro: {} vs {}, trh: {} vs {})",
+            reasons.push(format!("Týmy v jiném pořadí ✅ zarovnáno (azuro: {} vs {}, trh: {} vs {})",
                 azuro.team1, azuro.team2,
                 market_items[0].payload.team1, market_items[0].payload.team2));
             penalty += 1;
@@ -1521,16 +1734,66 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
         let side1_ok = disc_w1 > MIN_EDGE_PCT;
         let side2_ok = disc_w2 > MIN_EDGE_PCT;
 
-        // Safety: never emit both sides for the same condition in one cycle.
-        // If both look positive (stale/misaligned market), keep only the stronger edge.
-        let selected_side = match (side1_ok, side2_ok) {
-            (true, true) => {
-                if disc_w1 >= disc_w2 { 1 } else { 2 }
-            }
-            (true, false) => 1,
-            (false, true) => 2,
-            (false, false) => 0,
+        // === FAVORITE-ONLY LOGIC ===
+        // Strategie: sázíme POUZE na FAVORITA když Azuro nabízí lepší odds než trh.
+        // Underdog anomálie BEZ score-edge je noise — favorit s lepším kurzem = reálná value.
+        // Favorit = strana s NIŽŠÍMI Azuro odds (vyšší implied probability).
+        let fav_side = if azuro.odds_team1 < azuro.odds_team2 {
+            1 // team1 je favorit (nižší odds)
+        } else if azuro.odds_team2 < azuro.odds_team1 {
+            2 // team2 je favorit
+        } else {
+            // Odds jsou rovné — povolíme obě strany
+            0
         };
+
+        let selected_side = if fav_side == 0 {
+            // Equal odds — pick stronger discrepancy
+            match (side1_ok, side2_ok) {
+                (true, true) => { if disc_w1 >= disc_w2 { 1 } else { 2 } }
+                (true, false) => 1,
+                (false, true) => 2,
+                (false, false) => 0,
+            }
+        } else if fav_side == 1 {
+            // team1 je favorit — jen side1
+            if side1_ok {
+                if side2_ok && !side1_ok {
+                    // Log underdog anomaly but skip it
+                    info!("⏭️ ODDS ANOMALY {} UNDERDOG-ONLY: {:.1}% disc on underdog {} — SKIPPING (favorit-only mode)",
+                        match_key, disc_w2, azuro.team2);
+                }
+                1
+            } else {
+                if side2_ok {
+                    info!("⏭️ ODDS ANOMALY {} UNDERDOG-ONLY: {:.1}% disc on underdog {} — SKIPPING (favorit-only mode)",
+                        match_key, disc_w2, azuro.team2);
+                }
+                0 // Favorit nemá edge → skip
+            }
+        } else {
+            // team2 je favorit — jen side2
+            if side2_ok {
+                if side1_ok && !side2_ok {
+                    info!("⏭️ ODDS ANOMALY {} UNDERDOG-ONLY: {:.1}% disc on underdog {} — SKIPPING (favorit-only mode)",
+                        match_key, disc_w1, azuro.team1);
+                }
+                2
+            } else {
+                if side1_ok {
+                    info!("⏭️ ODDS ANOMALY {} UNDERDOG-ONLY: {:.1}% disc on underdog {} — SKIPPING (favorit-only mode)",
+                        match_key, disc_w1, azuro.team1);
+                }
+                0 // Favorit nemá edge → skip
+            }
+        };
+
+        if any_swapped {
+            info!("🔀 ODDS ANOMALY {}: team order different (azuro: {} vs {} | market: {} vs {}) — odds aligned correctly, value_side={}",
+                match_key, azuro.team1, azuro.team2,
+                market_items[0].payload.team1, market_items[0].payload.team2,
+                selected_side);
+        }
 
         if selected_side == 1 {
             anomalies.push(OddsAnomaly {
@@ -1618,7 +1881,7 @@ fn format_anomaly_alert(a: &OddsAnomaly, alert_id: u32) -> String {
         .unwrap_or_default();
 
     let swap_warn = if a.teams_swapped {
-        "\n⚠️ Týmy PROHOZENÉ mezi zdroji (opraveno)"
+        "\n✅ Týmy v jiném pořadí mezi zdroji — odds správně zarovnány"
     } else {
         ""
     };
@@ -2264,7 +2527,37 @@ async fn main() -> Result<()> {
                                             let goal_diff = (edge.score1 - edge.score2).abs();
                                             goal_diff >= 2
                                         }
-                                        _ => true, // esports + basketball: no extra guard
+                                        // ESPORTS guard: BLOCK match_winner auto-bet on map-level scores!
+                                        // In Bo3 (CS2/LoL/Dota), score 1-0 means won your map pick → no real edge.
+                                        // Only map_winner bets with ROUND-level edges are reliable.
+                                        // Match_winner is only allowed on ROUND-level edges (score > 3).
+                                        "cs2" | "esports" | "lol" | "dota-2" | "valorant" | "league-of-legends" => {
+                                            let is_map_winner_bet = edge.match_key.contains("::map");
+                                            if is_map_winner_bet {
+                                                true // map_winner bets (round-level edges) are always OK
+                                            } else {
+                                                // match_winner: only allow if score is round-level (max > 3)
+                                                let max_s = edge.score1.max(edge.score2);
+                                                if max_s <= 3 {
+                                                    info!("🛡️ ESPORTS GUARD: {} score {}-{} is MAP-LEVEL — blocking match_winner auto-bet (use map_winner instead)",
+                                                        edge.match_key, edge.score1, edge.score2);
+                                                    false
+                                                } else {
+                                                    true // round-level scores (e.g. 10-4) → OK for match_winner
+                                                }
+                                            }
+                                        }
+                                        _ => true, // basketball: no extra guard
+                                    };
+
+                                    // Dynamic odds cap: CS2 map_winner uses confidence-based cap, others use fixed cap
+                                    let is_map_winner_edge = edge.match_key.contains("::map");
+                                    let effective_max_odds = if let Some(tier) = edge.cs2_map_confidence {
+                                        cs2_dynamic_max_odds(tier)
+                                    } else if is_map_winner_edge {
+                                        AUTO_BET_MAX_ODDS_CS2_MAP // fallback for non-CS2 map winners
+                                    } else {
+                                        AUTO_BET_MAX_ODDS
                                     };
 
                                     let should_auto_bet = AUTO_BET_ENABLED
@@ -2276,7 +2569,7 @@ async fn main() -> Result<()> {
                                         && edge.confidence == "HIGH"
                                         && edge.edge_pct >= sport_min_edge
                                         && azuro_odds >= AUTO_BET_MIN_ODDS
-                                        && azuro_odds <= AUTO_BET_MAX_ODDS
+                                        && azuro_odds <= effective_max_odds
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
                                         && !generic_esports_blocked
@@ -2297,6 +2590,16 @@ async fn main() -> Result<()> {
                                     }
                                     if generic_esports_blocked {
                                         info!("🛡️ REALITY GUARD: {} uses generic esports:: key — auto-bet blocked", edge.match_key);
+                                    }
+                                    // DEBUG: log ALL reasons when auto-bet is blocked but edge is high
+                                    if !should_auto_bet && edge.confidence == "HIGH" && edge.edge_pct >= 10.0 {
+                                        info!("🔍 AUTO-BET BLOCKED for {} edge={:.1}%: enabled={} sport_ok={} market_ok={} guard_ok={} daily_ok={} safe={} conf={} min_edge={:.1} odds={:.2} min={:.2} max={:.2} cond={} out={} dedup={} esports_block={}",
+                                            edge.match_key, edge.edge_pct,
+                                            AUTO_BET_ENABLED, sport_auto_allowed, is_preferred_market, sport_guard_ok,
+                                            within_daily_limit, safe_mode, edge.confidence, sport_min_edge,
+                                            azuro_odds, AUTO_BET_MIN_ODDS, effective_max_odds,
+                                            anomaly.condition_id.is_some(), anomaly.outcome_id.is_some(),
+                                            already_bet_this, generic_esports_blocked);
                                     }
 
                                     let mut score_alert_sent = false;

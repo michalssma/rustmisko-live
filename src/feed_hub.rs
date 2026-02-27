@@ -447,7 +447,7 @@ fn match_key(sport: &str, team1: &str, team2: &str) -> String {
     // for write-time alias explosion.  The actual game title is still preserved
     // in payload.sport for downstream consumers (Azuro execution, etc.).
     let is_esports = matches!(sport_lower.as_str(),
-        "cs2" | "dota-2" | "valorant" | "league-of-legends" | "starcraft" | "esports"
+        "cs2" | "dota-2" | "valorant" | "league-of-legends" | "lol" | "starcraft" | "esports"
     );
     let sport_prefix = if is_esports { "esports" } else { sport_lower.as_str() };
 
@@ -469,7 +469,7 @@ fn match_key(sport: &str, team1: &str, team2: &str) -> String {
 /// and "cs2::a_vs_b" → ["esports::a_vs_b"]
 fn match_key_aliases(key: &str) -> Vec<String> {
     let esports_games: &[&str] = &[
-        "cs2", "dota-2", "league-of-legends", "valorant", "starcraft",
+        "cs2", "dota-2", "league-of-legends", "lol", "valorant", "starcraft",
     ];
     if let Some(tail) = key.strip_prefix("esports::") {
         esports_games.iter().map(|g| format!("{}::{}", g, tail)).collect()

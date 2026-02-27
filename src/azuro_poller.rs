@@ -93,13 +93,17 @@ const AZURO_FEED_POLYGON: &str =
 const AZURO_FEED_BASE: &str =
     "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-base";
 
-/// All sports we poll
-const AZURO_SPORTS: &[&str] = &["cs2", "tennis", "football", "basketball", "dota-2", "mma"];
+/// All sports we poll — FULL coverage of everything Azuro offers LIVE!
+/// Added: lol, volleyball, ice-hockey, baseball, cricket, boxing (= +38 LIVE matches)
+const AZURO_SPORTS: &[&str] = &[
+    "cs2", "tennis", "football", "basketball", "dota-2", "mma",
+    "lol", "volleyball", "ice-hockey", "baseball", "cricket", "boxing",
+];
 
 /// Poll interval — ULTRA-FAST for live score-edge detection!
-/// 3s = aggressive but stable. 12 parallel queries per cycle = 240 req/min to The Graph.
-/// Tested stable on hosted subgraph. Lower risks rate-limiting.
-const AZURO_POLL_INTERVAL_SECS: u64 = 3;
+/// 5s = 12 sports × 2 chains = 24 parallel queries per cycle = 288 req/min to The Graph.
+/// Slightly slower than 3s to account for doubled sport count (was 12 queries, now 24).
+const AZURO_POLL_INTERVAL_SECS: u64 = 5;
 
 /// GraphQL query — data-feed schema (state, not status; Active conditions)
 fn build_sport_query(sport_slug: &str) -> String {
@@ -110,7 +114,7 @@ fn build_sport_query(sport_slug: &str) -> String {
 
     format!(r#"{{
   games(
-    first: 25
+    first: 100
     where: {{
       sport_: {{ slug: "{sport_slug}" }}
       state_in: ["Live"]
@@ -162,6 +166,12 @@ fn sport_url_segment(sport: &str) -> &'static str {
         "basketball" => "sports/basketball",
         "dota-2" => "esports/dota-2",
         "mma" => "sports/mma",
+        "lol" => "esports/lol",
+        "volleyball" => "sports/volleyball",
+        "ice-hockey" => "sports/ice-hockey",
+        "baseball" => "sports/baseball",
+        "cricket" => "sports/cricket",
+        "boxing" => "sports/boxing",
         _ => "sports/other",
     }
 }
@@ -460,14 +470,14 @@ async fn poll_subgraph(
 
 pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
     info!(
-        "azuro data-feed poller starting — polling every {}s for 6 sports (Polygon+Base)",
-        AZURO_POLL_INTERVAL_SECS
+        "azuro data-feed poller starting — polling every {}s for {} sports (Polygon+Base)",
+        AZURO_POLL_INTERVAL_SECS, AZURO_SPORTS.len()
     );
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(10))
         .user_agent("RustMiskoLive/1.0")
-        .pool_max_idle_per_host(4)
+        .pool_max_idle_per_host(6)
         .build()
         .expect("failed to create reqwest client");
 
@@ -482,7 +492,7 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         let mut total_map_markets = 0usize;
         let mut sport_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
-        // Poll ALL sports on Polygon + Base in parallel (12 queries)
+        // Poll ALL 12 sports on Polygon + Base in parallel (24 queries)
         // Gnosis + Chiliz are dead (0 games) — skip them to save latency
         let (
             cs2_poly, cs2_base,
@@ -491,6 +501,12 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
             bb_poly, bb_base,
             dota_poly, dota_base,
             mma_poly, mma_base,
+            lol_poly, lol_base,
+            vb_poly, vb_base,
+            ih_poly, ih_base,
+            base_poly, base_base,
+            cri_poly, cri_base,
+            box_poly, box_base,
         ) = tokio::join!(
             poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "cs2"),
             poll_subgraph(&client, AZURO_FEED_BASE, "base", "cs2"),
@@ -504,6 +520,18 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
             poll_subgraph(&client, AZURO_FEED_BASE, "base", "dota-2"),
             poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "mma"),
             poll_subgraph(&client, AZURO_FEED_BASE, "base", "mma"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "lol"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "lol"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "volleyball"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "volleyball"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "ice-hockey"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "ice-hockey"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "baseball"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "baseball"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "cricket"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "cricket"),
+            poll_subgraph(&client, AZURO_FEED_POLYGON, "polygon", "boxing"),
+            poll_subgraph(&client, AZURO_FEED_BASE, "base", "boxing"),
         );
 
         // Merge results — dedup by match_key+market (prefer polygon > base)
@@ -515,6 +543,12 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
             bb_poly, bb_base,
             dota_poly, dota_base,
             mma_poly, mma_base,
+            lol_poly, lol_base,
+            vb_poly, vb_base,
+            ih_poly, ih_base,
+            base_poly, base_base,
+            cri_poly, cri_base,
+            box_poly, box_base,
         ];
 
         for result in &all_results {
