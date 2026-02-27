@@ -210,6 +210,52 @@ function saveActiveBetsToDisk() {
   }
 }
 
+// Auto-prune settled bets on startup (after toolkit becomes available)
+// SAFETY: Only removes Lost/Rejected immediately.
+// Won/Canceled are removed ONLY if on-chain viewPayout confirms already claimed.
+async function autoPruneSettled() {
+  if (!toolkit || activeBets.size === 0) return;
+  const before = activeBets.size;
+  let removed = 0;
+  let kept_won = 0;
+  const lpAbi = parseAbi(['function viewPayout(address,uint256) view returns (uint128)']);
+  for (const [key, bet] of activeBets.entries()) {
+    try {
+      const result = await toolkit.getBet({ chainId: CHAIN_ID, orderId: bet.betId || key });
+      const st = result?.state || "";
+      const rs = result?.result || "";
+      // Rejected: never on-chain, safe to remove
+      if (st === "Rejected") { activeBets.delete(key); removed++; continue; }
+      // Lost: no payout, safe to remove
+      if (rs === "Lost") { activeBets.delete(key); removed++; continue; }
+      // Won/Canceled: ONLY remove if on-chain payout already claimed
+      if (rs === "Won" || rs === "Canceled" || st === "Canceled") {
+        const tid = extractTokenIdFromUnknown(result);
+        if (tid && !DRY_RUN) {
+          try {
+            const payout = await publicClient.readContract({
+              address: contracts.lp, abi: lpAbi,
+              functionName: 'viewPayout', args: [contracts.core, BigInt(tid)],
+            });
+            // viewPayout returns 0 after claim (NFT burned), safe to prune
+            if (Number(payout) === 0) { activeBets.delete(key); removed++; continue; }
+          } catch {
+            // viewPayout reverted = not yet resolved on-chain, KEEP!
+          }
+        }
+        kept_won++;
+        continue;
+      }
+    } catch {}
+  }
+  if (removed > 0) {
+    saveActiveBetsToDisk();
+    console.log(`🧹 Auto-prune on startup: ${removed} removed (Lost/Rejected/Claimed), ${kept_won} Won/Canceled kept (awaiting claim). ${before} -> ${activeBets.size}`);
+  }
+}
+// Schedule auto-prune 10s after startup (give toolkit time to init)
+setTimeout(() => autoPruneSettled().catch(e => console.error(`Auto-prune error: ${e.message}`)), 10000);
+
 function extractTokenIdFromUnknown(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === "bigint") return value.toString();
@@ -539,6 +585,13 @@ app.post("/bet", async (req, res) => {
         result.state === "Created" ||
         result.state === "Pending"
       ) {
+        const selectedTeam =
+          req.body.valueTeam ||
+          req.body.value_team ||
+          req.body.team ||
+          team1 ||
+          "";
+
         const betData = {
           betId: result.id,
           tokenId: discoveredTokenId,
@@ -549,7 +602,7 @@ app.post("/bet", async (req, res) => {
           odds: parseFloat(minOdds || "0") / 1e12,
           sport: (req.body.matchKey || "").split("::")[0] || "?",
           matchKey: req.body.matchKey || "",
-          team: team1 || "",
+          team: selectedTeam,
           placedAt: new Date().toISOString(),
           status: "pending",
         };
@@ -747,6 +800,61 @@ app.get("/active-bets", (req, res) => {
     count: activeBets.size,
     bets: Array.from(activeBets.values()),
   });
+});
+
+// ============================================================
+// POST /prune-settled — remove settled/resolved bets from active tracking
+// ============================================================
+
+app.post("/prune-settled", async (req, res) => {
+  if (!toolkit) {
+    return res.status(501).json({ error: "Toolkit not available" });
+  }
+  const before = activeBets.size;
+  const removed = [];
+  const kept = [];
+  const lpAbi = parseAbi(['function viewPayout(address,uint256) view returns (uint128)']);
+  for (const [key, bet] of activeBets.entries()) {
+    try {
+      const result = await toolkit.getBet({ chainId: CHAIN_ID, orderId: bet.betId || key });
+      const st = result?.state || "";
+      const rs = result?.result || "";
+      // Safe to remove: Rejected (never on-chain) and Lost (no payout)
+      if (st === "Rejected" || rs === "Lost") {
+        removed.push({ team: bet.team, state: st, result: rs, reason: "safe-dead" });
+        activeBets.delete(key);
+        continue;
+      }
+      // Won/Canceled: only prune if on-chain confirms already claimed
+      if (rs === "Won" || rs === "Canceled" || st === "Canceled") {
+        const tid = extractTokenIdFromUnknown(result);
+        if (tid && !DRY_RUN) {
+          try {
+            const payout = await publicClient.readContract({
+              address: contracts.lp, abi: lpAbi,
+              functionName: 'viewPayout', args: [contracts.core, BigInt(tid)],
+            });
+            if (Number(payout) === 0) {
+              removed.push({ team: bet.team, state: st, result: rs, reason: "claimed" });
+              activeBets.delete(key);
+              continue;
+            } else {
+              kept.push({ team: bet.team, state: st, result: rs, tokenId: tid, payoutUsd: Number(payout) / 10**contracts.betTokenDecimals, reason: "UNCLAIMED — DO NOT DELETE" });
+              continue;
+            }
+          } catch {
+            kept.push({ team: bet.team, state: st, result: rs, reason: "oracle-pending (viewPayout reverted)" });
+            continue;
+          }
+        }
+        kept.push({ team: bet.team, state: st, result: rs, reason: "no-tokenId-or-dry-run" });
+        continue;
+      }
+    } catch {}
+  }
+  if (removed.length > 0) saveActiveBetsToDisk();
+  console.log(`🧹 Prune: ${removed.length} removed, ${kept.length} kept (have money). ${before} -> ${activeBets.size}`);
+  res.json({ before, after: activeBets.size, removed, kept });
 });
 
 // ============================================================

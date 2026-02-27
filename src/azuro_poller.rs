@@ -96,22 +96,24 @@ const AZURO_FEED_BASE: &str =
 /// All sports we poll
 const AZURO_SPORTS: &[&str] = &["cs2", "tennis", "football", "basketball", "dota-2", "mma"];
 
-/// Poll interval — faster for score-edge detection!
-const AZURO_POLL_INTERVAL_SECS: u64 = 15;
+/// Poll interval — ULTRA-FAST for live score-edge detection!
+/// 3s = aggressive but stable. 12 parallel queries per cycle = 240 req/min to The Graph.
+/// Tested stable on hosted subgraph. Lower risks rate-limiting.
+const AZURO_POLL_INTERVAL_SECS: u64 = 3;
 
 /// GraphQL query — data-feed schema (state, not status; Active conditions)
 fn build_sport_query(sport_slug: &str) -> String {
     let now_unix = Utc::now().timestamp();
-    // Fetch games starting in the past 6h (live) through next 24h (prematch)
+    // LIVE ONLY — prematch is useless for our score-edge strategy!
     let from = now_unix - 6 * 3600;
     let to = now_unix + 24 * 3600;
 
     format!(r#"{{
   games(
-    first: 50
+    first: 25
     where: {{
       sport_: {{ slug: "{sport_slug}" }}
-      state_in: ["Prematch", "Live"]
+      state_in: ["Live"]
       startsAt_gte: "{from}"
       startsAt_lte: "{to}"
     }}
@@ -128,8 +130,8 @@ fn build_sport_query(sport_slug: &str) -> String {
       sortOrder
     }}
     conditions(
-      first: 60
-      where: {{ state_in: ["Active", "Stopped"] }}
+      first: 20
+      where: {{ state_in: ["Active"] }}
     ) {{
       id
       state
@@ -277,7 +279,8 @@ fn extract_all_winner_odds(game: &AzuroGame) -> Vec<ParsedCondition> {
 
     for cond in conditions {
         let cond_state = cond.state.as_deref().unwrap_or("");
-        if cond_state != "Active" && cond_state != "Stopped" {
+        // ONLY Active conditions — Stopped means paused/can't bet!
+        if cond_state != "Active" {
             continue;
         }
 
@@ -462,13 +465,14 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
     );
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(8))
         .user_agent("RustMiskoLive/1.0")
+        .pool_max_idle_per_host(4)
         .build()
         .expect("failed to create reqwest client");
 
-    // Initial delay
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Minimal startup delay
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     loop {
         let now = Utc::now();

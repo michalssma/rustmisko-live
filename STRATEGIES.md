@@ -1,90 +1,31 @@
-# RustMiskoLive — Projednané strategie
+# Strategie
 
-Aktualizováno: 2026-02-24
-Stav: **AZURO PROTOCOL = LIVE EXECUTION PLATFORMA**
+Aktualizováno: **2026-02-26**
 
----
+## Aktivní produkční strategie
 
-## ✅ AKTIVNÍ STRATEGIE (LIVE)
+1. **Score-edge (primární)**
+   - trigger: live score změna + edge nad limitem
+   - auto-bet: **2 USD**
+   - cíl: využít zpoždění adjustace kurzů
 
-### ✅ Azuro Protocol (Cross-Platform CS2 Arb) — LIVE EXECUTION
+2. **HIGH odds-anomaly (sekundární, konzervativní)**
+   - trigger: HIGH confidence, bounded discrepancy, safety guards
+   - auto-bet: **1 USD**
+   - cíl: chytat jen čisté, ne-extrémní anomálie
 
-**Status: LIVE — reálné sázky na Polygon**
+## Risk guardy
 
-Decentralizovaný on-chain bookmaker na Polygon. **MASIVNÍ CS2 pokrytí** — desítky zápasů denně.
+- min/max odds guard
+- max bets per session
+- dedup podle match/condition/base match key
+- Telegram fail-safe (alert není „sent“, pokud odeslání selže)
 
-**Proč Azuro vyhrává:**
-- **NO KYC** — wallet-only, žádné geo-blocky
-- **Polygon USDT** — nízké gas fees
-- **GraphQL API** — structured data, spolehlivé
-- **AMM pool** — odds driven by liquidity pool
-- **Cross-platform arb** — 1xbit/hltv odds vs azuro on-chain odds
-- **Automated execution** — EIP712 → Relayer → on-chain
+## Co není aktivní strategie
 
-**Technické detaily:**
-- Subgraph: `thegraph-1.onchainfeed.org` (data-feed)
-- CS2 sport: `id: 1061`
-- RPC: `https://1rpc.io/matic`
-- Wallet: `0x8226D38e5c69c2f0a77FBa80e466082B410a8F00`
-- Balance: 33.77 USDT
-- Relayer: UNLIMITED allowance
+- nápady bez implementace (Betfair/Polymarket/funding arbitráže) jsou backlog, ne live rozhodování.
 
-**Implementováno v kódu:**
-- `src/azuro_poller.rs` — GraphQL poller, 30s interval, 4 chainy
-- `executor/index.js` — Node.js bet/cashout execution
-- `src/bin/alert_bot.rs` — Telegram alerts + YES→bet flow
+## Source of truth
 
----
-
-### ✅ Tampermonkey + Feed Hub (Data Fusion) — LIVE
-
-**Status: PRODUKČNÍ**
-
-- HLTV scraper v3 (auto-refresh, stale detection)
-- Bo3.gg odds scraper v3 (multi-bookmaker)
-- Feed Hub: WS 8080 + HTTP 8081
-
----
-
-## ❌ ZAMÍTNUTO
-
-### ❌ SX Bet
-**ZAMÍTNUTO: ZERO CS2 markets.** Pouze LoL LPL (2 zápasy).
-
-### ❌ Polymarket
-**ZAMÍTNUTO: ZERO esports.** Pouze politika/geopolitika.
-
-### ❌ Overtime / Thales
-**ZAMÍTNUTO: DEPRECATED.** API nefunkční.
-
-### ❌ Betfair Exchange
-**BLOKOVÁNO: CZ geoblocking.** Vyžaduje UK VPN + UK entity.
-
-### ❌ Smarkets
-**BLOKOVÁNO: CZ 404.**
-
-### ❌ Pinnacle API
-**BLOKOVÁNO: 401 bez auth.**
-
----
-
-## 📋 BUDOUCÍ ROZŠÍŘENÍ
-
-### 🟡 Azuro WebSocket (Live Odds Stream)
-`wss://streams.onchainfeed.org/v1/streams/feed` — sub-second odds místo 30s polling.
-
-### 🟡 Kelly Criterion Stake Sizing
-Automatický výpočet optimální velikosti sázky na základě edge a bankrollu.
-
-### 🟡 Multi-Chain Optimization
-Porovnání fees: Polygon vs Base vs Gnosis — automatický výběr nejlevnějšího chainu.
-
----
-
-## Závěr
-
-```
-PRIMÁRNÍ:  Azuro Protocol × Tampermonkey odds → LIVE cross-platform CS2 arb
-LIVE:      33.77 USDT na Polygon, executor běží, alerty fungují
-NEXT:      WebSocket live odds + Kelly criterion sizing
-```
+- runtime čísla: `AKTUALNI_PROGRESS.md`
+- implementace logiky: `src/bin/alert_bot.rs`, `src/feed_hub.rs`, `executor/index.js`

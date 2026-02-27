@@ -184,7 +184,7 @@
       // Event names usually have patterns like "season", "cup", "league", etc.
       const rest = vsSplit.slice(1).join("-vs-"); // handle rare case of "vs" in event name
       const eventCutoff = rest.search(
-        /-(season|cup|league|qualifier|series|open|closed|major|minor|invitational|championship|tournament|finals|group|playoff|esl|iem|blast|cct|digital|nodwin|elisa|jb|exort|ukic|faceit|esea)/i
+        /-(season|cup|league|qualifier|series|open|closed|major|minor|invitational|championship|tournament|finals|group|playoff|esl|iem|blast|cct|pgl|betboom|summit|rush|rushb|digital|nodwin|elisa|jb|exort|ukic|faceit|esea|dreamhack|weplay|pinnacle|perfect|world|bucharest|cracovia)/i
       );
       let team2FromUrl;
       if (eventCutoff > 0) {

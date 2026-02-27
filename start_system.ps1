@@ -1,129 +1,114 @@
-# ============================================================
-# RustMiskoLive — AUTO-START SCRIPT (24/7)
-# ============================================================
-# Spustí celý arbitrážní systém:
-#   1. Feed Hub (WS 8080 + HTTP 8081)
-#   2. Alert Bot (Telegram + auto-bet)
-#   3. Executor (Node.js port 3030)
-#
-# Použití:
-#   .\start_system.ps1           — spustí vše
-#   .\start_system.ps1 -Stop     — zastaví vše
-# ============================================================
-
 param (
     [switch]$Stop
 )
 
-$ErrorActionPreference = "Continue"
+$ErrorActionPreference = 'Continue'
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# === PROCESS NAMES ===
-$FEED_HUB_EXE = Join-Path $ROOT "target\debug\feed-hub.exe"
-$ALERT_BOT_EXE = Join-Path $ROOT "target\debug\alert-bot.exe"
-$EXECUTOR_DIR = Join-Path $ROOT "executor"
-$LOG_DIR = Join-Path $ROOT "logs"
+$FEED_HUB_EXE = Join-Path $ROOT 'target\release\feed-hub.exe'
+$ALERT_BOT_EXE = Join-Path $ROOT 'target\release\alert-bot.exe'
+$EXECUTOR_DIR = Join-Path $ROOT 'executor'
+$EXECUTOR_SCRIPT = Join-Path $EXECUTOR_DIR 'index.js'
+$LOG_DIR = Join-Path $ROOT 'logs'
 
-if (-not (Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null }
+if (-not (Test-Path $LOG_DIR)) {
+    New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null
+}
 
-# === STOP MODE ===
+function Stop-SystemProcesses {
+    Get-Process -Name 'feed-hub' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'alert-bot' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'alert_bot' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'node' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 if ($Stop) {
-    Write-Host "[STOP] Zastavuji system..." -ForegroundColor Yellow
-    Get-Process -Name "feed-hub" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process -Name "alert_bot" -ErrorAction SilentlyContinue | Stop-Process -Force
-    Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
-        $_.MainWindowTitle -like "*executor*" -or $_.CommandLine -like "*executor*"
-    } | Stop-Process -Force -ErrorAction SilentlyContinue
-    Write-Host "[STOP] Hotovo." -ForegroundColor Green
+    Write-Host '[STOP] Stopping system...' -ForegroundColor Yellow
+    Stop-SystemProcesses
+    Write-Host '[STOP] Done.' -ForegroundColor Green
     exit 0
 }
 
-# === KILL EXISTING ===
-Write-Host "=== RustMiskoLive System Start ===" -ForegroundColor Cyan
-Write-Host "[1/4] Cistim stare procesy..." -ForegroundColor Yellow
-Get-Process -Name "feed-hub" -ErrorAction SilentlyContinue | Stop-Process -Force
-Get-Process -Name "alert_bot" -ErrorAction SilentlyContinue | Stop-Process -Force
+Write-Host '=== RustMiskoLive System Start ===' -ForegroundColor Cyan
+Write-Host '[1/4] Cleaning old processes...' -ForegroundColor Yellow
+Stop-SystemProcesses
 Start-Sleep -Seconds 2
 
-# === ENV VARIABLES ===
-$env:RUST_LOG = "info"
-$env:FEED_DB_PATH = "data/feed.db"
-$env:FEED_HUB_BIND = "0.0.0.0:8080"
-$env:FEED_HTTP_BIND = "0.0.0.0:8081"
-$env:TELEGRAM_BOT_TOKEN = "7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk"
-$env:TELEGRAM_CHAT_ID = "6458129071"
-$env:FEED_HUB_URL = "http://127.0.0.1:8081"
-$env:EXECUTOR_URL = "http://127.0.0.1:3030"
-# PRIVATE KEY pro Azuro executor (LIVE mode — bez toho je DRY-RUN!)
-$env:PRIVATE_KEY = "0x34fb468df8e14a223595b824c1515f0477d2f06b3f6509f25c2f9e9e02ce3f7c"
-$env:CHAIN_ID = "137"
-$env:EXECUTOR_PORT = "3030"
+$env:RUST_LOG = 'info'
+$env:FEED_DB_PATH = 'data/feed.db'
+$env:FEED_HUB_BIND = '0.0.0.0:8080'
+$env:FEED_HTTP_BIND = '0.0.0.0:8081'
+$env:TELEGRAM_BOT_TOKEN = '7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk'
+$env:TELEGRAM_CHAT_ID = '6458129071'
+$env:FEED_HUB_URL = 'http://127.0.0.1:8081'
+$env:EXECUTOR_URL = 'http://127.0.0.1:3030'
+$env:PRIVATE_KEY = '0x34fb468df8e14a223595b824c1515f0477d2f06b3f6509f25c2f9e9e02ce3f7c'
+$env:CHAIN_ID = '137'
+$env:EXECUTOR_PORT = '3030'
 
-# === START FEED HUB ===
-Write-Host "[2/4] Startuji Feed Hub (WS:8080 HTTP:8081)..." -ForegroundColor Green
-$feedHubLog = Join-Path $LOG_DIR "feed_hub.log"
-Start-Process -FilePath $FEED_HUB_EXE -WorkingDirectory $ROOT -WindowStyle Hidden `
-    -RedirectStandardOutput $feedHubLog -RedirectStandardError (Join-Path $LOG_DIR "feed_hub_err.log")
+Write-Host '[2/4] Starting feed-hub...' -ForegroundColor Green
+$feedHubLog = Join-Path $LOG_DIR 'feed_hub.log'
+$feedHubErr = Join-Path $LOG_DIR 'feed_hub_err.log'
+Start-Process -FilePath $FEED_HUB_EXE -WorkingDirectory $ROOT -WindowStyle Hidden -RedirectStandardOutput $feedHubLog -RedirectStandardError $feedHubErr
 Start-Sleep -Seconds 3
 
-# Verify feed-hub is running
-$feedProc = Get-Process -Name "feed-hub" -ErrorAction SilentlyContinue
+$feedProc = Get-Process -Name 'feed-hub' -ErrorAction SilentlyContinue
 if ($feedProc) {
-    Write-Host "  Feed Hub OK (PID: $($feedProc.Id))" -ForegroundColor Green
+    Write-Host "  feed-hub OK (PID: $($feedProc.Id))" -ForegroundColor Green
 } else {
-    Write-Host "  CHYBA: Feed Hub se nespustil!" -ForegroundColor Red
+    Write-Host '  ERROR: feed-hub did not start' -ForegroundColor Red
     exit 1
 }
 
-# === START EXECUTOR ===
-Write-Host "[3/4] Startuji Executor (port 3030)..." -ForegroundColor Green
-$executorScript = Join-Path $EXECUTOR_DIR "index.js"
-if (Test-Path $executorScript) {
-    $executorLog = Join-Path $LOG_DIR "executor.log"
-    Start-Process -FilePath "node" -ArgumentList $executorScript -WorkingDirectory $EXECUTOR_DIR -WindowStyle Hidden `
-        -RedirectStandardOutput $executorLog -RedirectStandardError (Join-Path $LOG_DIR "executor_err.log")
+Write-Host '[3/4] Starting executor...' -ForegroundColor Green
+if (Test-Path $EXECUTOR_SCRIPT) {
+    $executorLog = Join-Path $LOG_DIR 'executor.log'
+    $executorErr = Join-Path $LOG_DIR 'executor_err.log'
+    Start-Process -FilePath 'node' -ArgumentList $EXECUTOR_SCRIPT -WorkingDirectory $EXECUTOR_DIR -WindowStyle Hidden -RedirectStandardOutput $executorLog -RedirectStandardError $executorErr
     Start-Sleep -Seconds 3
-    # Verify executor is up
     try {
-        $exHealth = Invoke-RestMethod -Uri "http://127.0.0.1:3030/health" -TimeoutSec 5
-        Write-Host "  Executor OK (balance: $($exHealth.balance) USDT)" -ForegroundColor Green
+        $exHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:3030/health' -TimeoutSec 5
+        Write-Host "  executor OK (balance: $($exHealth.balance) USDT)" -ForegroundColor Green
     } catch {
-        Write-Host "  Executor: mozna start, health check selhal (zkontroluj logs\executor.log)" -ForegroundColor Yellow
+        Write-Host '  executor health check failed, check logs/executor.log' -ForegroundColor Yellow
     }
 } else {
-    Write-Host "  Executor script nenalezen ($executorScript) — zkontroluj executor/index.js" -ForegroundColor Red
+    Write-Host "  ERROR: executor script not found ($EXECUTOR_SCRIPT)" -ForegroundColor Red
 }
 
-# === START ALERT BOT ===
-Write-Host "[4/4] Startuji Alert Bot (Telegram + auto-bet)..." -ForegroundColor Green
-$alertLog = Join-Path $LOG_DIR "alert_bot.log"
-Start-Process -FilePath $ALERT_BOT_EXE -WorkingDirectory $ROOT -WindowStyle Hidden `
-    -RedirectStandardOutput $alertLog -RedirectStandardError (Join-Path $LOG_DIR "alert_bot_err.log")
+Write-Host '[4/4] Starting alert-bot...' -ForegroundColor Green
+$alertLog = Join-Path $LOG_DIR 'alert_bot.log'
+$alertErr = Join-Path $LOG_DIR 'alert_bot_err.log'
+Start-Process -FilePath $ALERT_BOT_EXE -WorkingDirectory $ROOT -WindowStyle Hidden -RedirectStandardOutput $alertLog -RedirectStandardError $alertErr
 Start-Sleep -Seconds 3
 
-$alertProc = Get-Process -Name "alert_bot" -ErrorAction SilentlyContinue
+$alertProc = Get-Process -Name 'alert-bot' -ErrorAction SilentlyContinue
+if (-not $alertProc) {
+    $alertProc = Get-Process -Name 'alert_bot' -ErrorAction SilentlyContinue
+}
+
 if ($alertProc) {
-    Write-Host "  Alert Bot OK (PID: $($alertProc.Id))" -ForegroundColor Green
+    Write-Host "  alert-bot OK (PID: $($alertProc.Id))" -ForegroundColor Green
 } else {
-    Write-Host "  CHYBA: Alert Bot se nespustil!" -ForegroundColor Red
+    Write-Host '  ERROR: alert-bot did not start' -ForegroundColor Red
 }
 
-# === HEALTH CHECK ===
-Write-Host "" -ForegroundColor White
-Write-Host "=== System Health Check ===" -ForegroundColor Cyan
+Write-Host ''
+Write-Host '=== Health Check ===' -ForegroundColor Cyan
 Start-Sleep -Seconds 5
+
 try {
-    $health = Invoke-RestMethod -Uri "http://127.0.0.1:8081/health" -TimeoutSec 5
-    Write-Host "  Feed Hub: ONLINE" -ForegroundColor Green
+    Invoke-RestMethod -Uri 'http://127.0.0.1:8081/health' -TimeoutSec 5 | Out-Null
+    Write-Host '  feed-hub: ONLINE' -ForegroundColor Green
 } catch {
-    Write-Host "  Feed Hub: OFFLINE!" -ForegroundColor Red
+    Write-Host '  feed-hub: OFFLINE' -ForegroundColor Red
 }
 
-Write-Host ""
-Write-Host "=== SYSTEM BEZI ===" -ForegroundColor Cyan
-Write-Host "  Feed Hub:  http://127.0.0.1:8081/state" -ForegroundColor White
-Write-Host "  Executor:  http://127.0.0.1:3030" -ForegroundColor White
-Write-Host "  Logy:      $LOG_DIR" -ForegroundColor White
-Write-Host ""
-Write-Host "Pro zastaveni: .\start_system.ps1 -Stop" -ForegroundColor Yellow
-Write-Host "Pro sledovani: Invoke-RestMethod http://127.0.0.1:8081/state" -ForegroundColor Yellow
+Write-Host ''
+Write-Host '=== SYSTEM RUNNING ===' -ForegroundColor Cyan
+Write-Host '  Feed Hub:  http://127.0.0.1:8081/state' -ForegroundColor White
+Write-Host '  Executor:  http://127.0.0.1:3030' -ForegroundColor White
+Write-Host "  Logs:      $LOG_DIR" -ForegroundColor White
+Write-Host ''
+Write-Host 'Stop: .\start_system.ps1 -Stop' -ForegroundColor Yellow
+Write-Host 'Watch: Invoke-RestMethod http://127.0.0.1:8081/state' -ForegroundColor Yellow

@@ -14,7 +14,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 5000; // 5s — need fast score updates for live betting
+  const SCAN_INTERVAL_MS = 2000; // 2s — instant score detection is our edge!
   const RECONNECT_MS = 5000;
   const HEARTBEAT_MS = 20000;
   const SOURCE_NAME = "tipsport";
@@ -211,8 +211,8 @@
 
   function guessEsportTypeFromTeams(t1, t2) {
     const key = (t1 + ' ' + t2).toLowerCase().replace(/[^a-z]/g, '');
-    if (TP_BASKETBALL_TEAMS.some(c => key.includes(c))) return 'basketball';
-    if (TP_FOOTBALL_TEAMS.some(c => key.includes(c))) return 'football';
+    if (TP_BASKETBALL_TEAMS.some(c => key.includes(c))) return 'skip'; // eBasketball → EXCLUDE
+    if (TP_FOOTBALL_TEAMS.some(c => key.includes(c))) return 'skip'; // eFOOTBALL → EXCLUDE
     return null;
   }
 
@@ -238,8 +238,8 @@
           for (const kw of TP_DOTA_KW)     if (txt.includes(kw)) return 'dota-2';
           for (const kw of TP_LOL_KW)      if (txt.includes(kw)) return 'league-of-legends';
           for (const kw of TP_VAL_KW)      if (txt.includes(kw)) return 'valorant';
-          for (const kw of TP_FOOTBALL_KW) if (txt.includes(kw)) { dbg(`TP e-football: ${txt.substring(0,40)}`); return 'football'; }
-          for (const kw of TP_BASKET_KW)   if (txt.includes(kw)) { dbg(`TP e-basketball: ${txt.substring(0,40)}`); return 'basketball'; }
+          for (const kw of TP_FOOTBALL_KW) if (txt.includes(kw)) { dbg(`TP e-football SKIP: ${txt.substring(0,40)}`); return 'skip'; }
+          for (const kw of TP_BASKET_KW)   if (txt.includes(kw)) { dbg(`TP e-basketball SKIP: ${txt.substring(0,40)}`); return 'skip'; }
         }
         sib = sib.previousElementSibling;
         sibCount++;
@@ -270,7 +270,9 @@
 
       // Strip Tipsport garbage BEFORE team name extraction
       // Tipsport <a> tags wrap entire match row: "Team1 - Team2 0:0 2.pol - 55.min 1.03 15.00 60.00"
-      const cleanedText = stripTipsportGarbage(rawText);
+      const { cleanText, garbage } = stripTipsportGarbage(rawText);
+      const cleanedText = cleanText;
+      let detailedScore = garbage;
       if (cleanedText !== rawText) dbg(`Stripped: "${rawText.substring(0,80)}" → "${cleanedText}"`);
       if (!cleanedText || cleanedText.indexOf(' - ') < 2) continue;
 
@@ -306,13 +308,21 @@
       let matchSport = sport || "unknown";
       if (matchSport === 'esports') {
         const specific = detectEsportFromLink(link);
-        // specific: 'cs2','dota-2','lol','valorant','football','basketball',null
+        // specific: 'cs2','dota-2','lol','valorant','skip',null
+        if (specific === 'skip') {
+          dbg(`TP SKIP eFOOTBALL/eBasket: ${t1} vs ${t2}`);
+          continue; // eFOOTBALL/eBasketball → EXCLUDE from feed entirely
+        }
         if (specific) {
           matchSport = specific;
           dbg(`TP esport detected: ${matchSport} for ${t1} vs ${t2}`);
         } else {
           // Fallback: guess from team names (e.g. Houston Rockets → basketball)
           const guessed = guessEsportTypeFromTeams(t1, t2);
+          if (guessed === 'skip') {
+            dbg(`TP SKIP eFOOTBALL/eBasket (team-guess): ${t1} vs ${t2}`);
+            continue; // eFOOTBALL/eBasketball → EXCLUDE from feed entirely
+          }
           if (guessed) {
             matchSport = guessed;
             dbg(`TP esport team-guess: ${matchSport} for ${t1} vs ${t2}`);
@@ -329,6 +339,7 @@
         oddsX: rowInfo.oddsX,
         score1: rowInfo.score1,
         score2: rowInfo.score2,
+        detailedScore: detailedScore, // <-- ADDED detailed score string here
         isLive: rowInfo.isLive,
         hasOdds: rowInfo.hasOdds,
         sport: matchSport,
@@ -544,7 +555,78 @@
       }
     }
 
-    return text.substring(0, minIdx).trim();
+    const cleanText = text.substring(0, minIdx).trim();
+    
+    // Extract detailed score: everything between team names and odds values.
+    // Examples from real Tipsport data:
+    //   Tennis:     "1:0 2.set - 6:2, 5:5 (*00:00) 11.18 2.62"
+    //   Football:   "2:0 2. pol. - 55.min (2:0, 0:0) 1.03 15.00 60.00 +53"
+    //   Esports:    "0:0 Lepší ze 3 | 1.mapa - 3:612.3421.491.mapa13.7721.201.mapa-"
+    //   Basketball: "21:22 2.čt. <3min (15:13, 6:9)"
+    //
+    // KEY CHALLENGE: esport odds are GLUED to round scores without spaces!
+    //   "3:612.34" = score "3:6" + odds "12.34"
+    //
+    // Strategy: scan character by character to find the first odds-like decimal
+    // that is NOT a period/set/map/minute label.
+    let garbage = text.substring(minIdx).trim();
+    
+    // Step 1: strip trailing "+NN" bet count and trailing "-"
+    garbage = garbage.replace(/[-]?\s*\+\d+\s*$/g, '').trim();
+    garbage = garbage.replace(/-\s*$/g, '').trim();
+    
+    // Step 2: strip known Czech trailing labels (football goal markets, status messages)
+    garbage = garbage.replace(/Událost skončila.*$/i, '').trim();
+    garbage = garbage.replace(/Kurzy nejsou.*$/i, '').trim();
+    garbage = garbage.replace(/za okamžik.*$/i, '').trim();
+    // Football: "1029.gól1Nikdo2", "9.gól13.10Nikdo" — strip from N.gól onwards
+    garbage = garbage.replace(/\d+\.?\s*gól.*$/i, '').trim();
+    // Any trailing "Nikdo", "Více", "Méně" with optional digits around them
+    garbage = garbage.replace(/[\d\s]*(Nikdo|Více|Méně)[\d\s]*$/i, '').trim();
+    
+    // Step 3: find the first odds-like decimal and cut from there.
+    // Odds are ALWAYS format: \d{1,3}\.\d{2} (e.g. "1.03", "11.85", "2.62")
+    // NOT followed by common labels: set, pol, min, tř, mapa, kolo, čt, perioda
+    const oddsRe = /(\d{1,3})[,.](\d{2})/g;
+    let oddsMatch;
+    let cutIdx = -1;
+    while ((oddsMatch = oddsRe.exec(garbage)) !== null) {
+      const afterOdds = garbage.substring(oddsMatch.index + oddsMatch[0].length);
+      // Check if this is a period/set/map label (with optional space before label word)
+      // Handles: "1.set", "2.pol", "14.min", "1.mapa", "2. mapa", "3.tř", "2.čt"
+      const isLabel = /^\s*(?:set|pol|min|tř|mapa|kolo|čt|perioda|třetina|gól|s\b)/i.test(afterOdds);
+      if (isLabel) continue;
+      
+      // Validate odds range (1.01 to 500)
+      const oddsVal = parseFloat(oddsMatch[1] + '.' + oddsMatch[2]);
+      if (oddsVal < 1.01 || oddsVal > 500) continue;
+      
+      // Skip if preceded by "(" — score context like "(15:13)"
+      if (oddsMatch.index > 0 && garbage[oddsMatch.index - 1] === '(') continue;
+      
+      // Skip if preceded by "*" — tennis serve indicator like "(*15:00)"
+      if (oddsMatch.index > 0 && garbage[oddsMatch.index - 1] === '*') continue;
+      
+      // This looks like a genuine odds value — cut here!
+      cutIdx = oddsMatch.index;
+      break;
+    }
+    
+    if (cutIdx > 0) {
+      garbage = garbage.substring(0, cutIdx).trim();
+    }
+    
+    // Step 4: strip esport market labels that might remain at end
+    // Patterns: "1.mapa", "2.mapa-", "1.mapa12", "2.mapa-" etc.
+    garbage = garbage.replace(/\s*\d\.mapa[\d\s-]*$/i, '').trim();
+    
+    // Step 5: final cleanup of any remaining trailing decimal numbers/junk
+    garbage = garbage.replace(/\s*\d{1,3}[,.]\d{2}[\s\d,.+]*$/g, '').trim();
+    garbage = garbage.replace(/-\s*$/g, '').trim();
+    // Strip trailing incomplete round score like "0:" or "6:" at end of esport
+    // These appear when a map is in progress: "13:4, 8:13, 0:" → keep as-is, it's valid info
+
+    return { cleanText, garbage };
   }
 
   function cleanName(text) {
@@ -617,6 +699,7 @@
         team2: match.team2,
         score1: match.score1,
         score2: match.score2,
+        detailed_score: match.detailedScore, // NEW: Full detailed score string
         status: "Live",
         url: window.location.href,
       },
@@ -637,9 +720,19 @@
   function doScan() {
     const matches = scanTipsportMatches();
     let sentThisScan = 0;
+    let skippedPrematch = 0;
     const sportCounts = {};
 
     for (const match of matches) {
+      // SKIP eFOOTBALL/eBasketball that slipped through
+      if (match.sport === 'skip') continue;
+
+      // LIVE-ONLY FILTER — prematch is useless, our edge is LIVE score detection!
+      if (!match.isLive) {
+        skippedPrematch++;
+        continue;
+      }
+
       // Send odds (primary purpose)
       const oddsMsg = buildOddsMessage(match);
       if (sendJSON(oddsMsg)) sentThisScan++;
@@ -678,7 +771,7 @@
 
     if (matches.length > 0) {
       const sportSummary = Object.entries(sportCounts).map(([s, c]) => `${s}:${c}`).join(", ");
-      log(`Scan: ${matches.length} matches [${sportSummary}], sent ${sentThisScan}`);
+      log(`Scan: ${matches.length - skippedPrematch} LIVE [${sportSummary}], sent ${sentThisScan}, skipped ${skippedPrematch} prematch`);
     }
   }
 
