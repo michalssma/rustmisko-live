@@ -13,7 +13,11 @@ GQL subgraph polling has inherent lag (block confirmations + indexer delay).
 If odds move between our poll and the on-chain bet, relayer rejects with  
 `"Real odds less than min odds"` → wasted gas + missed opportunity.
 
-WS gives push-based `currentOdds` updates → tighter `minOdds` → fewer rejects.
+**2026-02-28 baseline update:**  
+Instrumented data shows **minOdds rejects = 0/60 attempts (0%)**.  
+All 5 failures are `"Condition is not active"` (ConditionNotRunning), 100% basketball.  
+Primary fail driver is **condition lifecycle (Active→Paused→Resolved)**, not stale odds.  
+WS value is now mainly as **state feed** (Active/Paused awareness), not odds feed.
 
 ---
 
@@ -43,9 +47,26 @@ WS gives push-based `currentOdds` updates → tighter `minOdds` → fewer reject
 
 ---
 
-## Phase 2: Guardrail → minOdds Source (NEXT)
+## Phase 2: Guardrail → State Feed + minOdds Source (NEXT)
 
-Once shadow metrics pass acceptance, use WS odds as `minOdds` validation:
+Once shadow metrics pass acceptance, use WS primarily as **condition state feed**:
+
+### 2A. State Guardrail (PRIORITY — reduces ConditionNotRunning failures)
+
+1. **WS state tracking**: On each `ConditionUpdated` event, update shared state:
+   - `condition_states: HashMap<String, (state: String, updated_at: Instant)>`
+   - States: `"Active"`, `"Paused"`, `"Created"`, `"Resolved"`, `"Canceled"`
+   - `ConditionUpdated.data.state` carries this info
+   
+2. **Pre-flight gate**: Before placing bet, check WS condition state:
+   - If state == `"Active"` AND `updated_at` < 5s ago → proceed
+   - If state != `"Active"` → drop immediately (no executor call, no retries wasted)
+   - If no WS data for condition (WS disconnected) → fall through to GQL flow
+   - Log: `CONDITION_STATE_GATE` event with state + age
+   
+3. **Acceptance metric**: `condition_not_active_rate` drops ≥ 50% vs pre-gate baseline
+
+### 2B. Odds Guardrail (secondary — only if minOdds rejects become >10%)
 
 1. **Guardrail mode**: Before placing bet, compare `state.azuro_w1` (GQL) vs `ws_latest_odds` (WS)
    - If delta > 5%, abort bet (odds moved too much since our decision)
@@ -70,10 +91,12 @@ All must pass for ≥ 24h continuous operation:
 - [ ] WS update → bet send latency p50 ≤ 500ms, p95 ≤ 2s
 - [ ] WS leads GQL by ≥ 2s median for same condition odds changes
 
-### Quality (3 guardrails)
-- [ ] `minOdds` reject rate drops ≥ 50% vs GQL-only baseline
+### Quality (5 guardrails)
+- [ ] `condition_not_active_rate` drops ≥ 50% vs pre-state-gate baseline (Track A)
+- [ ] `minOdds` reject rate stays ≤ 10% (Track B – not currently a driver)
 - [ ] Accepted bets/day does NOT decrease (no regression)
 - [ ] Duplicate-prevented/idempotence blocks do NOT increase (WS not causing spam)
+- [ ] `condition_age_ms` p50 for PLACED drops vs GQL-only baseline
 
 ---
 
@@ -115,34 +138,50 @@ Get-Content data/ledger.jsonl | Where-Object { $_ -match 'is_minodds_reject.*tru
 
 ---
 
-## Decision Tree
+## Decision Tree (Updated 2026-02-28 with baseline data)
 
 ```
 After 24h of BET_FAILED instrumentation data:
 │
-├─ minOdds rejects > 20% of all attempts
+├─ condition_not_active_rate > 10% (Track A — CURRENT PRIMARY DRIVER)
+│  ├─ AND condition_age_ms correlates (failed >> placed)
+│  │  └─ → WS STATE FEED is MUST-HAVE (stale state detection)
+│  │     Action: Implement Phase 2A state guardrail
+│  │
+│  └─ AND condition_age_ms does NOT correlate (same freshness)
+│     └─ → Conditions flip faster than any poll can catch
+│        Action: WS STATE FEED still helps (real-time flip detection)
+│        Alt: Increase retry backoff for basketball
+│
+├─ minOdds rejects > 20% (Track B — currently 0%)
 │  ├─ AND pipeline_ms correlates with reject rate
-│  │  └─ → WS is MUST-HAVE (stale GQL odds are root cause)
-│  │     Action: Implement Phase 2 guardrail mode
+│  │  └─ → WS ODDS FEED is MUST-HAVE (stale GQL odds)
+│  │     Action: Implement Phase 2B odds guardrail
 │  │
 │  └─ AND pipeline_ms does NOT correlate
-│     └─ → Problem is MIN_ODDS_FACTOR too tight, not stale odds
-│        Action: Relax MIN_ODDS_FACTOR from 0.97 to 0.95
+│     └─ → MIN_ODDS_FACTOR too tight
+│        Action: Relax from 0.97 to 0.95
 │
-├─ minOdds rejects < 20%
-│  ├─ AND most failures are "condition not active" / "paused"
-│  │  └─ → Normal Azuro behavior (score events pause conditions)
-│  │     Action: Keep current retry logic, consider longer backoff
-│  │
-│  └─ AND failures are diverse (insufficient, nonce, etc.)
-│     └─ → Infrastructure issues, not odds freshness
-│        Action: Fix specific failure modes first
+├─ Both rates low (< 10% condition, < 10% minOdds)
+│  └─ → System working well, WS is P2 optimization
+│     Action: Keep shadow, review in 1 week
 │
-└─ Very few BET_FAILED entries (< 5% rate)
-   └─ → System working well, WS is nice-to-have P2 optimization
-      Action: Keep shadow, review in 1 week
+└─ Very few BET_FAILED entries (< 5% total rate)
+   └─ → WS is nice-to-have P2
+      Action: Focus on other improvements
 ```
 
+### Baseline (2026-02-28):
+- condition_not_active_rate: **8.3%** (5/60 attempts) — **all basketball**
+- minOdds_reject_rate: **0%** (0/60)
+- Executor RTT: p50=124ms, p95=163ms
+- Worst sport: basketball 42% fail rate (5/12)
+
+### Instrumentation Fields (commit TBD):
+- `reason_code`: `"ConditionNotRunning"` | `"MinOddsReject"` | `"Dedup"` | `"Fatal"` | `"Unknown"`
+- `is_condition_state_reject`: boolean
+- `condition_age_ms`: staleness of last GQL sighting at bet time
+- Run `powershell -File tools/bet_diagnostics.ps1` for full report
 ---
 
-*Created: 2026-02-28 | Last updated: 2026-02-28*
+*Created: 2026-02-28 | Last updated: 2026-02-28 16:30 (condition-state pivot)*

@@ -47,19 +47,31 @@ if ($totalAttempts -gt 0) {
     Write-Host "   No bet attempts found"
 }
 
-# ── 2. minOdds rejects specifically ──
-$minOddsRejects = @($failed | Where-Object { $_.is_minodds_reject -eq $true })
-$dedupRejects = @($failed | Where-Object { $_.is_dedup -eq $true })
-$otherRejects = @($failed | Where-Object { $_.is_minodds_reject -ne $true -and $_.is_dedup -ne $true })
+# ── 2. Failure breakdown by reason_code ──
+$conditionStateRejects = @($failed | Where-Object { $_.is_condition_state_reject -eq $true -or $_.reason_code -eq 'ConditionNotRunning' })
+$minOddsRejects = @($failed | Where-Object { $_.is_minodds_reject -eq $true -or $_.reason_code -eq 'MinOddsReject' })
+$dedupRejects = @($failed | Where-Object { $_.is_dedup -eq $true -or $_.reason_code -eq 'Dedup' })
+$fatalRejects = @($failed | Where-Object { $_.reason_code -eq 'Fatal' })
+# Legacy entries without reason_code: classify by error string
+$legacyUnclassified = @($failed | Where-Object { $_.reason_code -eq $null -and $_.is_condition_state_reject -eq $null })
+foreach ($entry in $legacyUnclassified) {
+    $errLow = ($entry.error + '').ToLower()
+    if ($errLow -match 'not active|paused|not exist') { $conditionStateRejects += $entry }
+    elseif ($errLow -match 'min odds|minodds|real odds') { $minOddsRejects += $entry }
+    elseif ($errLow -match 'dedup|already bet') { $dedupRejects += $entry }
+}
 
 Write-Host ''
-Write-Host '2) FAILURE BREAKDOWN' -ForegroundColor Yellow
-Write-Host "   minOdds rejects:    $($minOddsRejects.Count)"
+Write-Host '2) FAILURE BREAKDOWN (by reason_code)' -ForegroundColor Yellow
+Write-Host "   ConditionNotRunning: $($conditionStateRejects.Count)  <-- PRIMARY DRIVER"
+Write-Host "   MinOddsReject:      $($minOddsRejects.Count)"
 Write-Host "   Dedup (409):        $($dedupRejects.Count)"
-Write-Host "   Other (paused/etc): $($otherRejects.Count)"
+Write-Host "   Fatal:              $($fatalRejects.Count)"
 if ($totalAttempts -gt 0) {
+    $condRate = [math]::Round($conditionStateRejects.Count / $totalAttempts * 100, 1)
     $minOddsRate = [math]::Round($minOddsRejects.Count / $totalAttempts * 100, 1)
-    Write-Host "   minOdds reject rate: ${minOddsRate}% of all attempts"
+    Write-Host "   condition_not_active_rate: $condRate%"
+    Write-Host "   minOdds_reject_rate: $minOddsRate%"
 }
 
 # ── 3. Pipeline latency: PLACED vs minOdds rejects ──
@@ -138,34 +150,62 @@ if ($totalAttempts -lt 10) {
     Write-Host "   Currently: $totalAttempts total, $($placedWithTiming.Count + $minOddsWithTiming.Count) with timing"
     Write-Host "   Wait for more bets (daily limit resets at midnight UTC)"
 }
-elseif ($minOddsRejects.Count -eq 0) {
-    Write-Host '   NO minOdds REJECTS - odds freshness is not an issue' -ForegroundColor Green
-    Write-Host '   WS primary switch is P2 optimization, not P0'
-}
 else {
-    $minOddsRatePct = [math]::Round($minOddsRejects.Count / $totalAttempts * 100, 1)
-    if ($minOddsRatePct -ge 20) {
-        # Check latency correlation
-        if ($placedWithTiming.Count -ge 3 -and $minOddsWithTiming.Count -ge 3) {
-            $placedP50 = Get-Percentile @($placedWithTiming | ForEach-Object { $_.pipeline_ms }) 50
-            $minOddsP50 = Get-Percentile @($minOddsWithTiming | ForEach-Object { $_.pipeline_ms }) 50
-            if ($minOddsP50 -gt ($placedP50 * 1.5)) {
-                Write-Host "   STALE ODDS CONFIRMED - minOdds rejects $minOddsRatePct pct, latency correlated" -ForegroundColor Red
-                Write-Host "   minOdds p50=$($minOddsP50)ms >> placed p50=$($placedP50)ms"
-                Write-Host '   -> WS is MUST-HAVE. Implement Phase 2 guardrail.'
-            }
-            else {
-                Write-Host "   HIGH REJECT RATE $minOddsRatePct pct but latency NOT correlated" -ForegroundColor Yellow
-                Write-Host "   minOdds p50=$($minOddsP50)ms ~= placed p50=$($placedP50)ms"
-                Write-Host '   -> Likely MIN_ODDS_FACTOR too tight. Try 0.95 instead of 0.97.'
-            }
+    # === Track A: Condition state rejects (primary driver) ===
+    $condRatePct = if ($totalAttempts -gt 0) { [math]::Round($conditionStateRejects.Count / $totalAttempts * 100, 1) } else { 0 }
+    if ($conditionStateRejects.Count -gt 0) {
+        Write-Host "   TRACK A (ConditionNotRunning): $condRatePct% of attempts" -ForegroundColor Yellow
+        if ($condRatePct -ge 10) {
+            Write-Host '     HIGH condition-state fail rate.' -ForegroundColor Red
+            Write-Host '     -> P0: WS state feed or condition-state gating needed' -ForegroundColor Red
         }
         else {
-            Write-Host "   HIGH REJECT RATE $minOddsRatePct pct - need more timing data for correlation" -ForegroundColor Yellow
+            Write-Host '     Low condition-state fail rate. Acceptable.' -ForegroundColor Green
         }
     }
     else {
-        Write-Host "   LOW REJECT RATE $minOddsRatePct pct - WS is nice-to-have P2" -ForegroundColor Green
+        Write-Host '   TRACK A: Zero ConditionNotRunning rejects' -ForegroundColor Green
+    }
+
+    # === Track B: minOdds rejects ===
+    $minOddsRatePct = if ($totalAttempts -gt 0) { [math]::Round($minOddsRejects.Count / $totalAttempts * 100, 1) } else { 0 }
+    if ($minOddsRejects.Count -gt 0) {
+        Write-Host "   TRACK B (MinOddsReject): $minOddsRatePct% of attempts" -ForegroundColor Yellow
+        if ($minOddsRatePct -ge 20) {
+            if ($placedWithTiming.Count -ge 3 -and $minOddsWithTiming.Count -ge 3) {
+                $placedP50 = Get-Percentile @($placedWithTiming | ForEach-Object { $_.pipeline_ms }) 50
+                $minOddsP50 = Get-Percentile @($minOddsWithTiming | ForEach-Object { $_.pipeline_ms }) 50
+                if ($minOddsP50 -gt ($placedP50 * 1.5)) {
+                    Write-Host "     Latency correlated: p50 $($minOddsP50)ms >> $($placedP50)ms" -ForegroundColor Red
+                    Write-Host '     -> WS odds feed MUST-HAVE' -ForegroundColor Red
+                }
+                else {
+                    Write-Host "     NO latency correlation: p50 $($minOddsP50)ms ~= $($placedP50)ms" -ForegroundColor Yellow
+                    Write-Host '     -> Relax MIN_ODDS_FACTOR (0.97 -> 0.95)' -ForegroundColor Yellow
+                }
+            }
+            else {
+                Write-Host '     Need more timing data for latency correlation' -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host '     Low minOdds rate. WS odds feed is P2.' -ForegroundColor Green
+        }
+    }
+    else {
+        Write-Host '   TRACK B: Zero MinOddsReject. Odds freshness OK.' -ForegroundColor Green
+    }
+
+    # === WS Decision ===
+    Write-Host ''
+    if ($condRatePct -ge 10) {
+        Write-Host '   WS VERDICT: MUST-HAVE as STATE FEED (Active/Paused awareness)' -ForegroundColor Red
+    }
+    elseif ($minOddsRatePct -ge 20) {
+        Write-Host '   WS VERDICT: MUST-HAVE as ODDS FEED (stale odds mitigation)' -ForegroundColor Red
+    }
+    else {
+        Write-Host '   WS VERDICT: Nice-to-have P2 optimization' -ForegroundColor Green
     }
 }
 
@@ -176,17 +216,61 @@ $allBets = @($all | Where-Object { $_.event -eq 'PLACED' -or $_.event -eq 'BET_F
 $sports = @{}
 foreach ($b in $allBets) {
     $sport = if ($b.match_key) { ($b.match_key -split '::')[0] } else { 'unknown' }
-    if (-not $sports.ContainsKey($sport)) { $sports[$sport] = @{placed=0; failed=0; minodds=0} }
+    if (-not $sports.ContainsKey($sport)) { $sports[$sport] = @{placed=0; failed=0; cond_state=0; minodds=0} }
     if ($b.event -eq 'PLACED') { $sports[$sport].placed++ }
     else { 
         $sports[$sport].failed++
-        if ($b.is_minodds_reject -eq $true) { $sports[$sport].minodds++ }
+        # Classify: check new fields first, fallback to error string for legacy
+        $isCond = $b.is_condition_state_reject -eq $true -or $b.reason_code -eq 'ConditionNotRunning'
+        $isMinOdds = $b.is_minodds_reject -eq $true -or $b.reason_code -eq 'MinOddsReject'
+        if (-not $isCond -and -not $isMinOdds -and $b.reason_code -eq $null) {
+            $errLow = ($b.error + '').ToLower()
+            if ($errLow -match 'not active|paused|not exist') { $isCond = $true }
+            elseif ($errLow -match 'min odds|minodds|real odds') { $isMinOdds = $true }
+        }
+        if ($isCond) { $sports[$sport].cond_state++ }
+        if ($isMinOdds) { $sports[$sport].minodds++ }
     }
 }
 foreach ($kv in $sports.GetEnumerator() | Sort-Object { $_.Value.placed + $_.Value.failed } -Descending) {
     $total = $kv.Value.placed + $kv.Value.failed
     $rate = if ($total -gt 0) { [math]::Round($kv.Value.failed / $total * 100, 0) } else { 0 }
-    Write-Host "   $($kv.Key): $($kv.Value.placed) placed, $($kv.Value.failed) failed ($rate%), $($kv.Value.minodds) minOdds"
+    Write-Host "   $($kv.Key): $($kv.Value.placed) placed, $($kv.Value.failed) failed ($rate%), $($kv.Value.cond_state) CondNotActive, $($kv.Value.minodds) minOdds"
+}
+
+# ── 8. Condition age analysis ──
+$withAge = @($allBets | Where-Object { $_.condition_age_ms -ne $null })
+$placedWithAge = @($placed | Where-Object { $_.condition_age_ms -ne $null })
+$failedWithAge = @($conditionStateRejects | Where-Object { $_.condition_age_ms -ne $null })
+
+Write-Host ''
+Write-Host '7) CONDITION AGE AT BET TIME (ms)' -ForegroundColor Yellow
+Write-Host '   (How stale was the last Active sighting from GQL poll)'
+if ($placedWithAge.Count -gt 0) {
+    $ages = @($placedWithAge | ForEach-Object { $_.condition_age_ms })
+    Write-Host "   PLACED (n=$($placedWithAge.Count)): p50=$(Get-Percentile $ages 50)ms  p95=$(Get-Percentile $ages 95)ms"
+}
+else {
+    Write-Host '   PLACED: No entries with condition_age_ms yet' -ForegroundColor DarkGray
+}
+if ($failedWithAge.Count -gt 0) {
+    $ages = @($failedWithAge | ForEach-Object { $_.condition_age_ms })
+    Write-Host "   CondNotActive (n=$($failedWithAge.Count)): p50=$(Get-Percentile $ages 50)ms  p95=$(Get-Percentile $ages 95)ms"
+}
+else {
+    Write-Host '   CondNotActive: No entries with condition_age_ms yet' -ForegroundColor DarkGray
+}
+if ($placedWithAge.Count -ge 3 -and $failedWithAge.Count -ge 3) {
+    $placedAge50 = Get-Percentile @($placedWithAge | ForEach-Object { $_.condition_age_ms }) 50
+    $failedAge50 = Get-Percentile @($failedWithAge | ForEach-Object { $_.condition_age_ms }) 50
+    if ($failedAge50 -gt ($placedAge50 * 1.5)) {
+        Write-Host "   CORRELATION: failed bets have STALER conditions (p50: $($failedAge50)ms vs $($placedAge50)ms)" -ForegroundColor Red
+        Write-Host '   -> WS state feed is HIGH PRIORITY (reduces staleness)' -ForegroundColor Red
+    }
+    else {
+        Write-Host "   NO AGE CORRELATION: p50 failed=$($failedAge50)ms vs placed=$($placedAge50)ms" -ForegroundColor Green
+        Write-Host '   -> State changes happen faster than any poll can catch' -ForegroundColor Green
+    }
 }
 
 Write-Host ''

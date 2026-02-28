@@ -2594,6 +2594,10 @@ async fn main() -> Result<()> {
     // === RESYNC FREEZE: track cross-validation mismatches per match ===
     let mut resync_freeze: HashMap<String, ResyncState> = HashMap::new();
 
+    // === CONDITION FRESHNESS: track when each condition was last seen Active in /state ===
+    // Used to measure staleness at bet time — feeds into WS state-feed decision
+    let mut condition_last_seen: HashMap<String, std::time::Instant> = HashMap::new();
+
     // === BANKROLL: fetched from executor at startup, updated on claims ===
     let mut current_bankroll: f64 = 65.0; // default, updated from /health
     // Start-of-day bankroll: frozen at day start, used for daily loss limit calc
@@ -3001,6 +3005,18 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
+                                // === CONDITION FRESHNESS: update last-seen for all active conditions ===
+                                let poll_instant = std::time::Instant::now();
+                                for item in &state.odds {
+                                    if let Some(cid) = &item.payload.condition_id {
+                                        if !cid.is_empty() {
+                                            condition_last_seen.insert(cid.clone(), poll_instant);
+                                        }
+                                    }
+                                }
+                                // GC: remove conditions not seen in 10 minutes
+                                condition_last_seen.retain(|_, ts| poll_instant.duration_since(*ts).as_secs() < 600);
+
                                 // === 1. SCORE EDGE detection (primary strategy!) ===
                                 let score_edges = find_score_edges(&state, &mut score_tracker, &mut resync_freeze);
                                 let mut sent_score_edges = 0usize;
@@ -3248,6 +3264,11 @@ async fn main() -> Result<()> {
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
+                                        // Condition freshness: how stale is our last sighting?
+                                        let condition_age_ms = condition_last_seen.get(&condition_id)
+                                            .map(|ts| ts.elapsed().as_millis() as u64)
+                                            .unwrap_or(999999);
+
                                         // RACE CONDITION FIX: mark in-flight BEFORE sending to executor
                                         inflight_conditions.insert(cond_id_str.clone());
                                         inflight_conditions.insert(match_key_for_bet.clone());
@@ -3355,13 +3376,20 @@ async fn main() -> Result<()> {
                                                             let is_minodds_reject = err_lower.contains("min odds") || err_lower.contains("minodds")
                                                                 || err_lower.contains("real odds");
                                                             let is_dedup = err_lower.contains("dedup") || err_lower.contains("already bet");
-                                                            error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={}, rtt={}ms, pipeline={}ms, requested_odds={:.4}, min_odds={:.4})",
+                                                            let is_condition_state_reject = is_condition_paused;
+                                                            let reason_code = if is_condition_state_reject { "ConditionNotRunning" }
+                                                                else if is_minodds_reject { "MinOddsReject" }
+                                                                else if is_dedup { "Dedup" }
+                                                                else if is_fatal { "Fatal" }
+                                                                else { "Unknown" };
+                                                            error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={}, rtt={}ms, pipeline={}ms, requested_odds={:.4}, min_odds={:.4}, reason={})",
                                                                 aid, err,
                                                                 &condition_id,
                                                                 &outcome_id,
                                                                 match_key_for_bet,
                                                                 rtt_ms, pipeline_ms,
-                                                                azuro_odds, min_odds_display);
+                                                                azuro_odds, min_odds_display,
+                                                                reason_code);
                                                             // === LEDGER: BET_FAILED (timing instrumentation) ===
                                                             ledger_write("BET_FAILED", &serde_json::json!({
                                                                 "alert_id": aid, "match_key": match_key_for_bet,
@@ -3376,6 +3404,9 @@ async fn main() -> Result<()> {
                                                                 "pipeline_ms": pipeline_ms as u64,
                                                                 "is_minodds_reject": is_minodds_reject,
                                                                 "is_dedup": is_dedup,
+                                                                "is_condition_state_reject": is_condition_state_reject,
+                                                                "reason_code": reason_code,
+                                                                "condition_age_ms": condition_age_ms,
                                                             }));
                                                             // Don't spam TG for dedup (409) — it's normal operational behavior
                                                             if !is_dedup {
@@ -3519,6 +3550,7 @@ async fn main() -> Result<()> {
                                                                     "rtt_ms": rtt_ms as u64,
                                                                     "pipeline_ms": pipeline_ms as u64,
                                                                     "min_odds": min_odds_display,
+                                                                    "condition_age_ms": condition_age_ms,
                                                                     "flags": {
                                                                         "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
                                                                         "FF_REBET_ENABLED": FF_REBET_ENABLED,
@@ -3746,6 +3778,11 @@ async fn main() -> Result<()> {
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
+                                        // Condition freshness: how stale is our last sighting?
+                                        let condition_age_ms_b = condition_last_seen.get(&condition_id)
+                                            .map(|ts| ts.elapsed().as_millis() as u64)
+                                            .unwrap_or(999999);
+
                                         let conf_emoji = if anomaly.confidence == "HIGH" { "🟢" } else { "🟡" };
                                         let pre_msg = format!(
                                             "🤖 <b>#{} AUTO-BET ODDS ANOMALY</b> {} {}\n\
@@ -3832,14 +3869,22 @@ async fn main() -> Result<()> {
                                                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue;
                                                             }
-                                                            let is_minodds_b = err_lower.contains("min odds") || err_lower.contains("real odds");
+                                                            let is_minodds_b = err_lower.contains("min odds") || err_lower.contains("minodds")
+                                                                || err_lower.contains("real odds");
                                                             let is_dedup_b = err_lower.contains("dedup") || err_lower.contains("already bet");
-                                                            error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={}, rtt={}ms, pipeline={}ms, odds={:.4}, min={:.4})",
+                                                            let is_condition_state_reject_b = is_condition_paused;
+                                                            let reason_code_b = if is_condition_state_reject_b { "ConditionNotRunning" }
+                                                                else if is_minodds_b { "MinOddsReject" }
+                                                                else if is_dedup_b { "Dedup" }
+                                                                else if is_fatal { "Fatal" }
+                                                                else { "Unknown" };
+                                                            error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={}, rtt={}ms, pipeline={}ms, odds={:.4}, min={:.4}, reason={})",
                                                                 aid, err,
                                                                 &condition_id,
                                                                 match_key_for_bet,
                                                                 rtt_ms_b, pipeline_ms_b,
-                                                                azuro_odds, min_odds_display_b);
+                                                                azuro_odds, min_odds_display_b,
+                                                                reason_code_b);
                                                             // === LEDGER: BET_FAILED (Path B) ===
                                                             ledger_write("BET_FAILED", &serde_json::json!({
                                                                 "alert_id": aid, "match_key": match_key_for_bet,
@@ -3854,6 +3899,9 @@ async fn main() -> Result<()> {
                                                                 "pipeline_ms": pipeline_ms_b as u64,
                                                                 "is_minodds_reject": is_minodds_b,
                                                                 "is_dedup": is_dedup_b,
+                                                                "is_condition_state_reject": is_condition_state_reject_b,
+                                                                "reason_code": reason_code_b,
+                                                                "condition_age_ms": condition_age_ms_b,
                                                             }));
                                                             if !is_dedup_b {
                                                                 let _ = tg_send_message(&client, &token, chat_id,
@@ -3953,6 +4001,7 @@ async fn main() -> Result<()> {
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
                                                                     "path": "anomaly_odds",
+                                                                    "condition_age_ms": condition_age_ms_b,
                                                                     "flags": {
                                                                         "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
                                                                         "FF_REBET_ENABLED": FF_REBET_ENABLED,

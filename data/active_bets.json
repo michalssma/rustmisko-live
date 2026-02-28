@@ -344,21 +344,6 @@
     "state": "Accepted"
   },
   {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772269451303",
-    "tokenId": null,
-    "graphBetId": null,
-    "conditionId": "300610060000000000291349290000000000001725186993",
-    "outcomeId": "7014",
-    "stake": 1.849263,
-    "odds": 1.4938,
-    "sport": "?",
-    "matchKey": "",
-    "team": "SPARTA",
-    "placedAt": "2026-02-28T09:04:11.547Z",
-    "status": "pending",
-    "state": "Settled"
-  },
-  {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772269545914",
     "tokenId": null,
     "graphBetId": null,
@@ -387,35 +372,6 @@
     "placedAt": "2026-02-28T09:23:39.081Z",
     "status": "pending",
     "state": "Accepted"
-  },
-  {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772275252239",
-    "tokenId": null,
-    "graphBetId": null,
-    "conditionId": "300610060000000000291124090000000000001716984076",
-    "outcomeId": "7013",
-    "stake": 1.964731,
-    "odds": 1.649,
-    "sport": "?",
-    "matchKey": "",
-    "team": "Algo",
-    "placedAt": "2026-02-28T10:40:52.359Z",
-    "status": "pending",
-    "state": "Created"
-  },
-  {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772275591568",
-    "tokenId": null,
-    "graphBetId": null,
-    "conditionId": "300610060000000000810792810000000000001703006940",
-    "outcomeId": "26",
-    "stake": 0.846362,
-    "odds": 1.4841,
-    "sport": "?",
-    "matchKey": "",
-    "team": "Bodrumspor",
-    "placedAt": "2026-02-28T10:46:31.706Z",
-    "status": "pending"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772281064457",
