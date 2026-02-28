@@ -70,9 +70,15 @@ const SIGNAL_TTL_SECS: u64 = 3;
 /// === PRE-FLIGHT GATING (condition-state pivot, 2026-02-28) ===
 /// Max age since last GQL sighting of this condition as Active
 /// If condition_age_ms > this, DROP before sending to executor
+/// ROLLBACK: set to 999_999 to effectively disable pre-flight gate
 const CONDITION_MAX_AGE_MS: u64 = 2000;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
+/// ROLLBACK: set to 999_999 to effectively disable pipeline budget
 const PIPELINE_BUDGET_MS: u64 = 1500;
+/// Suspended market odds thresholds — market odds outside this range → skip
+/// ROLLBACK: set MIN to 0.0 and MAX to 999_999.0 to disable
+const SUSPENDED_MARKET_MIN_ODDS: f64 = 1.05;
+const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
 const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
 const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
@@ -2169,7 +2175,7 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
         // placeholder odds like 1.01-1.05 / 50-120+. These are NOT real prices.
         let min_market = avg_w1.min(avg_w2);
         let max_market = avg_w1.max(avg_w2);
-        if min_market <= 1.05 || max_market >= 50.0 {
+        if min_market <= SUSPENDED_MARKET_MIN_ODDS || max_market >= SUSPENDED_MARKET_MAX_ODDS {
             reasons.push(format!("⚠️ SUSPENDED MARKET: trh odds {:.2}/{:.2} — placeholder/suspended!", avg_w1, avg_w2));
             penalty += 6; // Guarantees LOW → skip entirely
         }
