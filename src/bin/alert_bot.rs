@@ -3287,7 +3287,9 @@ async fn main() -> Result<()> {
 
                                         // Place the bet — with retry on "condition not active"
                                         let decision_instant = std::time::Instant::now();
+                                        let decision_ts = Utc::now();
                                         let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
+                                        let min_odds_display = azuro_odds * min_odds_factor_for_match(&match_key_for_bet);
                                         let amount_raw = (stake * 1e6) as u64;
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
@@ -3318,9 +3320,14 @@ async fn main() -> Result<()> {
                                             ).await;
                                             break;
                                         }
+                                        let send_ts = Utc::now();
+                                        let send_instant = std::time::Instant::now();
                                         match client.post(format!("{}/bet", executor_url))
                                             .json(&bet_body).send().await {
                                             Ok(resp) => {
+                                                let response_ts = Utc::now();
+                                                let rtt_ms = send_instant.elapsed().as_millis();
+                                                let pipeline_ms = decision_instant.elapsed().as_millis();
                                                 match resp.json::<ExecutorBetResponse>().await {
                                                     Ok(br) => {
                                                         let is_rejected = br.state.as_deref()
@@ -3344,18 +3351,46 @@ async fn main() -> Result<()> {
                                                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue; // retry the loop
                                                             }
-                                                            error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={})",
+                                                            // Classify error for noise reduction
+                                                            let is_minodds_reject = err_lower.contains("min odds") || err_lower.contains("minodds")
+                                                                || err_lower.contains("real odds");
+                                                            let is_dedup = err_lower.contains("dedup") || err_lower.contains("already bet");
+                                                            error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={}, rtt={}ms, pipeline={}ms, requested_odds={:.4}, min_odds={:.4})",
                                                                 aid, err,
                                                                 &condition_id,
                                                                 &outcome_id,
-                                                                match_key_for_bet);
-                                                            let _ = tg_send_message(&client, &token, chat_id,
-                                                                &format!("❌ <b>AUTO-BET #{} FAILED</b>\n\nError: {}\nCondition: {}\nMatch: {}\nRetries: {}",
-                                                                    aid, err,
-                                                                    &condition_id,
-                                                                    match_key_for_bet,
-                                                                    attempt)
-                                                            ).await;
+                                                                match_key_for_bet,
+                                                                rtt_ms, pipeline_ms,
+                                                                azuro_odds, min_odds_display);
+                                                            // === LEDGER: BET_FAILED (timing instrumentation) ===
+                                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                                "alert_id": aid, "match_key": match_key_for_bet,
+                                                                "condition_id": condition_id, "outcome_id": outcome_id,
+                                                                "error": err, "retries": attempt,
+                                                                "requested_odds": azuro_odds, "min_odds": min_odds_display,
+                                                                "stake": stake, "path": "edge",
+                                                                "decision_ts": decision_ts.to_rfc3339(),
+                                                                "send_ts": send_ts.to_rfc3339(),
+                                                                "response_ts": response_ts.to_rfc3339(),
+                                                                "rtt_ms": rtt_ms as u64,
+                                                                "pipeline_ms": pipeline_ms as u64,
+                                                                "is_minodds_reject": is_minodds_reject,
+                                                                "is_dedup": is_dedup,
+                                                            }));
+                                                            // Don't spam TG for dedup (409) — it's normal operational behavior
+                                                            if !is_dedup {
+                                                                let _ = tg_send_message(&client, &token, chat_id,
+                                                                    &format!("❌ <b>AUTO-BET #{} FAILED</b>\n\nError: {}\nCondition: {}\nMatch: {}\nRetries: {}\n⏱ RTT: {}ms | Pipeline: {}ms\nOdds: {:.4} → min {:.4}",
+                                                                        aid, err,
+                                                                        &condition_id,
+                                                                        match_key_for_bet,
+                                                                        attempt,
+                                                                        rtt_ms, pipeline_ms,
+                                                                        azuro_odds, min_odds_display)
+                                                                ).await;
+                                                            } else {
+                                                                info!("🔇 Suppressed TG for dedup rejection #{}: {}", aid, err);
+                                                            }
                                                             // Remove from inflight so we can retry on next edge
                                                             inflight_conditions.remove(&cond_id_str);
                                                             inflight_conditions.remove(&match_key_for_bet);
@@ -3478,6 +3513,12 @@ async fn main() -> Result<()> {
                                                                     "path": "edge",
                                                                     "edge_pct": edge.edge_pct,
                                                                     "cv_stake_mult": cv_sm,
+                                                                    "decision_ts": decision_ts.to_rfc3339(),
+                                                                    "send_ts": send_ts.to_rfc3339(),
+                                                                    "response_ts": response_ts.to_rfc3339(),
+                                                                    "rtt_ms": rtt_ms as u64,
+                                                                    "pipeline_ms": pipeline_ms as u64,
+                                                                    "min_odds": min_odds_display,
                                                                     "flags": {
                                                                         "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
                                                                         "FF_REBET_ENABLED": FF_REBET_ENABLED,
@@ -3732,7 +3773,9 @@ async fn main() -> Result<()> {
                                         }
 
                                         let decision_instant = std::time::Instant::now();
+                                        let decision_ts_b = Utc::now();
                                         let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
+                                        let min_odds_display_b = azuro_odds * min_odds_factor_for_match(&match_key_for_bet);
                                         let amount_raw = (stake * 1e6) as u64;
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
@@ -3759,9 +3802,14 @@ async fn main() -> Result<()> {
                                             ).await;
                                             break;
                                         }
+                                        let send_ts_b = Utc::now();
+                                        let send_instant_b = std::time::Instant::now();
                                         match client.post(format!("{}/bet", executor_url))
                                             .json(&bet_body).send().await {
                                             Ok(resp) => {
+                                                let response_ts_b = Utc::now();
+                                                let rtt_ms_b = send_instant_b.elapsed().as_millis();
+                                                let pipeline_ms_b = decision_instant.elapsed().as_millis();
                                                 match resp.json::<ExecutorBetResponse>().await {
                                                     Ok(br) => {
                                                         let is_rejected = br.state.as_deref()
@@ -3784,14 +3832,37 @@ async fn main() -> Result<()> {
                                                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue;
                                                             }
-                                                            error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={})",
+                                                            let is_minodds_b = err_lower.contains("min odds") || err_lower.contains("real odds");
+                                                            let is_dedup_b = err_lower.contains("dedup") || err_lower.contains("already bet");
+                                                            error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={}, rtt={}ms, pipeline={}ms, odds={:.4}, min={:.4})",
                                                                 aid, err,
                                                                 &condition_id,
-                                                                match_key_for_bet);
-                                                            let _ = tg_send_message(&client, &token, chat_id,
-                                                                &format!("❌ <b>AUTO-BET ODDS #{} FAILED</b>\n\nError: {}\nCondition: {}",
-                                                                    aid, err, &condition_id)
-                                                            ).await;
+                                                                match_key_for_bet,
+                                                                rtt_ms_b, pipeline_ms_b,
+                                                                azuro_odds, min_odds_display_b);
+                                                            // === LEDGER: BET_FAILED (Path B) ===
+                                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                                "alert_id": aid, "match_key": match_key_for_bet,
+                                                                "condition_id": condition_id, "outcome_id": outcome_id,
+                                                                "error": err, "retries": attempt,
+                                                                "requested_odds": azuro_odds, "min_odds": min_odds_display_b,
+                                                                "stake": stake, "path": "anomaly_odds",
+                                                                "decision_ts": decision_ts_b.to_rfc3339(),
+                                                                "send_ts": send_ts_b.to_rfc3339(),
+                                                                "response_ts": response_ts_b.to_rfc3339(),
+                                                                "rtt_ms": rtt_ms_b as u64,
+                                                                "pipeline_ms": pipeline_ms_b as u64,
+                                                                "is_minodds_reject": is_minodds_b,
+                                                                "is_dedup": is_dedup_b,
+                                                            }));
+                                                            if !is_dedup_b {
+                                                                let _ = tg_send_message(&client, &token, chat_id,
+                                                                    &format!("❌ <b>AUTO-BET ODDS #{} FAILED</b>\n\nError: {}\nCondition: {}\n⏱ RTT: {}ms | Pipeline: {}ms",
+                                                                        aid, err, &condition_id, rtt_ms_b, pipeline_ms_b)
+                                                                ).await;
+                                                            } else {
+                                                                info!("🔇 Suppressed TG for dedup rejection odds #{}: {}", aid, err);
+                                                            }
                                                             inflight_conditions.remove(&cond_id_str);
                                                             inflight_conditions.remove(&match_key_for_bet);
                                                             break;
