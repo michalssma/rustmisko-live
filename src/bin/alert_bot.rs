@@ -972,6 +972,23 @@ fn cs2_dynamic_max_odds(tier: &str) -> f64 {
     }
 }
 
+/// Sanitize tokenId from executor — reject bogus values < 1000
+/// (false positives from recursive extraction hitting boolean/index fields)
+fn sanitize_token_id(token_id: Option<String>) -> Option<String> {
+    token_id.and_then(|tid| {
+        if let Ok(num) = tid.parse::<u64>() {
+            if num < 1000 {
+                warn!("⚠️ Rejecting bogus tokenId {} from executor (< 1000)", tid);
+                None
+            } else {
+                Some(tid)
+            }
+        } else {
+            Some(tid) // non-numeric tokenId, keep as-is
+        }
+    })
+}
+
 fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
     let diff = leading_score - losing_score;
     if diff <= 0 { return None; }
@@ -980,21 +997,15 @@ fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
 
     if max_score > 3 {
         // ROUND scores within a map (CS2 MR12: first to 13)
-        let total = leading_score + losing_score;
-        let map_win_prob = cs2_map_win_prob(diff, total);
-
-        if leading_score >= 13 {
-            return None; // Map already won, too late
-        }
-
-        // Map win → match impact (assumes this map matters)
-        let match_prob = 0.50 + (map_win_prob - 0.50) * 0.55;
-
-        if diff >= 3 {
-            Some(match_prob)
-        } else {
-            None // Too close to call from rounds alone
-        }
+        // BUG FIX: Round-level leads predict MAP wins, NOT MATCH wins.
+        // The old `* 0.55` conversion was fabricated and empirically wrong:
+        //   - fluxo_vs_oddik: 3 match_winner bets from round leads → ALL LOST
+        //   - liquid_vs_lyon: match_winner from round lead → LOST
+        // Round edges should ONLY generate map_winner bets (via find_score_edges
+        // STEP 1). If no map_winner market exists, we skip entirely.
+        // Returning None here ensures match_winner fallback never triggers
+        // from round-level scores.
+        return None;
     } else {
         // MAP scores (Bo3/Bo5 format)
         // IMPORTANT: (1, 0) is REMOVED — in CS2/LoL Bo3, winning map 1
@@ -2706,8 +2717,16 @@ async fn main() -> Result<()> {
                     let amount_usd: f64 = parts[4].parse().unwrap_or(2.0);
                     let odds: f64 = parts[5].parse().unwrap_or(1.5);
                     // "?" means tokenId not yet discovered — set to None so PATH B will discover it
+                    // Also treat tokenId < 1000 as bogus (false positive from recursive extraction)
                     let token_id = if token_id_raw == "?" || token_id_raw.is_empty() {
                         None
+                    } else if let Ok(tid_num) = token_id_raw.parse::<u64>() {
+                        if tid_num < 1000 {
+                            info!("⚠️ Bogus tokenId {} for bet {} — treating as undiscovered", token_id_raw, bet_id);
+                            None
+                        } else {
+                            Some(token_id_raw)
+                        }
                     } else {
                         Some(token_id_raw)
                     };
@@ -3326,7 +3345,7 @@ async fn main() -> Result<()> {
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
-                                                            let token_id_opt = br.token_id.clone();
+                                                            let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
 
                                                             // === DEDUP: record bet to prevent duplicates ===
@@ -3565,6 +3584,14 @@ async fn main() -> Result<()> {
                                     // Score-edge path has sport_auto_bet_guard + model validation;
                                     // anomaly path is purely odds-comparison → needs stricter sport rules.
                                     let anomaly_sport_allowed = match anomaly_sport {
+                                        // Football: DISABLED completely — single-source Tipsport data
+                                        // for obscure leagues is unreliable. No cross-validation.
+                                        // Score-edge also disabled. Football OFF across all paths.
+                                        "football" => {
+                                            info!("⚽ ANOMALY SPORT GUARD: {} — football DISABLED for all auto-bet paths",
+                                                anomaly.match_key);
+                                            false
+                                        }
                                         // Basketball: DISABLED for anomaly path. NBA/basket odds on Azuro
                                         // are too noisy/stale — nearly all "anomalies" are false signals.
                                         // Score-edge path (with point-diff model) is the only valid path.
@@ -3745,7 +3772,7 @@ async fn main() -> Result<()> {
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
-                                                            let token_id_opt = br.token_id.clone();
+                                                            let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
 
                                                             already_bet_matches.insert(match_key_for_bet.clone());
@@ -3924,7 +3951,7 @@ async fn main() -> Result<()> {
                                             v.as_u64().map(|n| n.to_string())
                                                 .or_else(|| v.as_str().map(|s| s.to_string()))
                                         }));
-                                    if let Some(tid) = discovered_tid {
+                                    if let Some(tid) = sanitize_token_id(discovered_tid) {
                                         info!("🔍 Discovered tokenId {} for bet {} (cashout)", tid, bet.bet_id);
                                         bet.token_id = Some(tid.clone());
                                         tid
@@ -4033,11 +4060,14 @@ async fn main() -> Result<()> {
                                         let sb_cond = sb.get("conditionId").and_then(|v| v.as_str()).unwrap_or("");
                                         if !ab.condition_id.is_empty() && sb_cond == ab.condition_id {
                                             if let Some(tid) = sb.get("tokenId").and_then(|v| v.as_str()) {
-                                                info!("🔍 /my-bets discovered tokenId {} for bet {} (cond={})",
-                                                    tid, ab.bet_id, ab.condition_id);
-                                                ab.token_id = Some(tid.to_string());
-                                                if let Some(gid) = sb.get("graphBetId").and_then(|v| v.as_str()) {
-                                                    ab.graph_bet_id = Some(gid.to_string());
+                                                let sanitized = sanitize_token_id(Some(tid.to_string()));
+                                                if let Some(clean_tid) = sanitized {
+                                                    info!("🔍 /my-bets discovered tokenId {} for bet {} (cond={})",
+                                                        clean_tid, ab.bet_id, ab.condition_id);
+                                                    ab.token_id = Some(clean_tid);
+                                                    if let Some(gid) = sb.get("graphBetId").and_then(|v| v.as_str()) {
+                                                        ab.graph_bet_id = Some(gid.to_string());
+                                                    }
                                                 }
                                             }
                                             break;
@@ -4238,7 +4268,7 @@ async fn main() -> Result<()> {
                                 v.as_u64().map(|n| n.to_string())
                                     .or_else(|| v.as_str().map(|s| s.to_string()))
                             }));
-                        if let Some(tid) = discovered_tid {
+                        if let Some(tid) = sanitize_token_id(discovered_tid) {
                             bet.token_id = Some(tid.clone());
                             info!("🔍 Discovered tokenId {} for bet {}", tid, bet.bet_id);
                             // Flag: rewrite pending_claims after this loop ends
@@ -5180,7 +5210,7 @@ async fn main() -> Result<()> {
                                                         } else {
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let state = br.state.as_deref().unwrap_or("?");
-                                                            let token_id_opt = br.token_id.clone();
+                                                            let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
 
                                                             let is_dry_run = state == "DRY-RUN" || bet_id.starts_with("dry-");

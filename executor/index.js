@@ -257,6 +257,18 @@ async function autoPruneSettled() {
 setTimeout(() => autoPruneSettled().catch(e => console.error(`Auto-prune error: ${e.message}`)), 10000);
 
 function extractTokenIdFromUnknown(value) {
+  const raw = _extractTokenIdRaw(value);
+  // SAFETY: Azuro NFT tokenIds are large numbers (220000+).
+  // Values < 1000 are false positives from recursive search hitting
+  // boolean-like fields, array indices, or status codes. Reject them.
+  if (raw !== null && parseInt(raw, 10) < 1000) {
+    console.warn(`⚠️ extractTokenIdFromUnknown: rejecting bogus tokenId=${raw} (< 1000)`);
+    return null;
+  }
+  return raw;
+}
+
+function _extractTokenIdRaw(value) {
   if (value === null || value === undefined) return null;
   if (typeof value === "bigint") return value.toString();
   if (typeof value === "number" && Number.isFinite(value))
@@ -267,7 +279,7 @@ function extractTokenIdFromUnknown(value) {
   }
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = extractTokenIdFromUnknown(item);
+      const found = _extractTokenIdRaw(item);
       if (found) return found;
     }
     return null;
@@ -276,20 +288,20 @@ function extractTokenIdFromUnknown(value) {
     // Prefer explicit token keys
     for (const k of ["tokenId", "tokenID", "betTokenId"]) {
       if (Object.prototype.hasOwnProperty.call(value, k)) {
-        const found = extractTokenIdFromUnknown(value[k]);
+        const found = _extractTokenIdRaw(value[k]);
         if (found) return found;
       }
     }
     // Common Azuro key: betId (NFT token id)
     for (const k of ["betId"]) {
       if (Object.prototype.hasOwnProperty.call(value, k)) {
-        const found = extractTokenIdFromUnknown(value[k]);
+        const found = _extractTokenIdRaw(value[k]);
         if (found) return found;
       }
     }
     // Recursive search fallback
     for (const v of Object.values(value)) {
-      const found = extractTokenIdFromUnknown(v);
+      const found = _extractTokenIdRaw(v);
       if (found) return found;
     }
   }
