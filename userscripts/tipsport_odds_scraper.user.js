@@ -394,9 +394,12 @@
           odds1 = odds[0]; oddsX = 0; odds2 = odds[1];
         }
 
+        // Filter suspended/placeholder odds:
+        // odds ≤ 1.05 or ≥ 50.0 = market suspended (Tipsport shows 1.01/120.00 during VAR/goals)
+        const isSuspended = odds1 <= 1.05 || odds2 <= 1.05 || odds1 >= 50.0 || odds2 >= 50.0;
         return {
           odds1, odds2, oddsX, score1, score2, isLive,
-          hasOdds: odds1 > 1.0 && odds2 > 1.0,
+          hasOdds: odds1 > 1.0 && odds2 > 1.0 && !isSuspended,
         };
       }
 

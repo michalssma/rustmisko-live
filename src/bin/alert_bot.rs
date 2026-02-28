@@ -2164,6 +2164,16 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
             penalty += 2;
         }
 
+        // CRITICAL: Suspended/placeholder MARKET odds detection
+        // When a bookmaker suspends a market (goal, VAR, red card), they show
+        // placeholder odds like 1.01-1.05 / 50-120+. These are NOT real prices.
+        let min_market = avg_w1.min(avg_w2);
+        let max_market = avg_w1.max(avg_w2);
+        if min_market <= 1.05 || max_market >= 50.0 {
+            reasons.push(format!("⚠️ SUSPENDED MARKET: trh odds {:.2}/{:.2} — placeholder/suspended!", avg_w1, avg_w2));
+            penalty += 6; // Guarantees LOW → skip entirely
+        }
+
         // PENALTY: very high discrepancy is suspicious
         let max_disc = disc_w1.max(disc_w2);
         if max_disc > 40.0 {
