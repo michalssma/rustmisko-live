@@ -179,6 +179,56 @@ const ACTIVE_BETS_PATH = path.resolve(
 // Condition dedup: prevent duplicate on-chain bets
 const bettedConditions = new Set();
 
+// IDEMPOTENCE GUARD: in-flight + recently-sent tracking with TTL
+// Prevents race conditions where two requests arrive within ms of each other
+// Key: "conditionId:outcomeId", Value: { ts: Date.now(), status: 'inflight'|'sent' }
+const recentBetFingerprints = new Map();
+const FINGERPRINT_TTL_MS = 180_000; // 3 minutes — covers retry + relayer processing
+
+function betFingerprint(conditionId, outcomeId) {
+  return `${conditionId}:${outcomeId || '*'}`;
+}
+
+function isRecentlyBet(conditionId, outcomeId) {
+  const fp = betFingerprint(conditionId, outcomeId);
+  const entry = recentBetFingerprints.get(fp);
+  if (!entry) return false;
+  if (Date.now() - entry.ts > FINGERPRINT_TTL_MS) {
+    recentBetFingerprints.delete(fp);
+    return false;
+  }
+  return true;
+}
+
+function markBetInflight(conditionId, outcomeId) {
+  const fp = betFingerprint(conditionId, outcomeId);
+  recentBetFingerprints.set(fp, { ts: Date.now(), status: 'inflight' });
+}
+
+function markBetSent(conditionId, outcomeId) {
+  const fp = betFingerprint(conditionId, outcomeId);
+  recentBetFingerprints.set(fp, { ts: Date.now(), status: 'sent' });
+}
+
+function rollbackBetInflight(conditionId, outcomeId) {
+  const fp = betFingerprint(conditionId, outcomeId);
+  const entry = recentBetFingerprints.get(fp);
+  // Only rollback if still in 'inflight' state (not promoted to 'sent')
+  if (entry && entry.status === 'inflight') {
+    recentBetFingerprints.delete(fp);
+  }
+}
+
+// Periodic cleanup of expired fingerprints (every 60s)
+setInterval(() => {
+  const now = Date.now();
+  for (const [fp, entry] of recentBetFingerprints) {
+    if (now - entry.ts > FINGERPRINT_TTL_MS) {
+      recentBetFingerprints.delete(fp);
+    }
+  }
+}, 60_000);
+
 function loadActiveBetsFromDisk() {
   try {
     if (!fs.existsSync(ACTIVE_BETS_PATH)) return [];
@@ -488,14 +538,38 @@ app.post("/bet", async (req, res) => {
       .json({ error: "Missing: conditionId, outcomeId, amount" });
   }
 
-  // DEDUP: prevent duplicate on-chain bets for same condition
+  // ============================================================
+  // IDEMPOTENCE GUARD — 3-layer dedup (P0 fix for double-bet race)
+  // Layer 1: bettedConditions Set (persisted across restarts)
+  // Layer 2: recentBetFingerprints Map (TTL-based, catches in-flight races)
+  // Layer 3: Optimistic lock (add BEFORE async call, rollback on failure)
+  // ============================================================
+
+  // Layer 1: Persistent condition dedup
   if (bettedConditions.has(conditionId)) {
-    console.log(`🚫 DEDUP: condition ${conditionId} already bet — rejecting`);
+    console.log(`🚫 DEDUP-L1: condition ${conditionId} already bet (persistent) — rejecting`);
     return res.status(409).json({
       error: "DEDUP: Already bet on this condition",
       conditionId,
+      layer: "persistent",
     });
   }
+
+  // Layer 2: In-flight / recently-sent fingerprint (race condition guard)
+  if (isRecentlyBet(conditionId, outcomeId)) {
+    console.log(`🚫 DEDUP-L2: ${conditionId}:${outcomeId} in-flight or recently sent — rejecting`);
+    return res.status(409).json({
+      error: "DEDUP: Bet in-flight or recently sent for this condition+outcome",
+      conditionId,
+      outcomeId,
+      layer: "inflight",
+    });
+  }
+
+  // Layer 3: Optimistic lock — mark as in-flight BEFORE any async work
+  markBetInflight(conditionId, outcomeId);
+  bettedConditions.add(conditionId);
+  console.log(`🔒 IDEM: Locked condition=${conditionId} outcome=${outcomeId} (optimistic)`);
 
   // === DRY-RUN: simulate bet ===
   if (DRY_RUN) {
@@ -591,6 +665,9 @@ app.post("/bet", async (req, res) => {
 
       console.log(`✅ Bet placed: id=${result.id} state=${result.state}`);
 
+      // Promote fingerprint from 'inflight' to 'sent' (permanent for TTL duration)
+      markBetSent(conditionId, outcomeId);
+
       // Track for auto-cashout
       if (
         result.state === "Accepted" ||
@@ -619,9 +696,14 @@ app.post("/bet", async (req, res) => {
           status: "pending",
         };
         activeBets.set(result.id, betData);
-        bettedConditions.add(conditionId);
+        // bettedConditions already added by optimistic lock (Layer 3)
         saveActiveBetsToDisk();
         console.log(`💾 Saved active bet: ${result.id} condition=${conditionId}`);
+      } else if (result.state === "Rejected" || result.state === "Failed") {
+        // Rejected/Failed — rollback optimistic lock so condition can be retried
+        console.log(`🔓 IDEM: Rollback lock for rejected bet: condition=${conditionId}`);
+        bettedConditions.delete(conditionId);
+        rollbackBetInflight(conditionId, outcomeId);
       }
 
       res.json({
@@ -641,7 +723,10 @@ app.post("/bet", async (req, res) => {
       });
     }
   } catch (e) {
-    console.error(`❌ Bet error: ${e.message}`);
+    // Rollback optimistic lock on error — allow retry
+    console.error(`❌ Bet error: ${e.message} — rolling back idempotence lock`);
+    bettedConditions.delete(conditionId);
+    rollbackBetInflight(conditionId, outcomeId);
     res.status(500).json({ error: e.message, details: e.stack });
   }
 });

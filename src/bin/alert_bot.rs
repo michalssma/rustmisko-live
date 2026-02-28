@@ -229,13 +229,15 @@ fn trim_stake(
     sport_exposure: f64,      // already wagered on this sport today
     sport: &str,              // sport key for per-sport cap
     cross_val_multiplier: f64, // 1.0 or 1.25 — boosted stake for cross-validated bets
+    sod_bankroll: f64,        // start-of-day bankroll for daily loss limit (prevents shrinking box)
 ) -> f64 {
     // Effective daily limit: min(hard_limit, tier-based cap)
+    // Uses SOD bankroll so the limit doesn't shrink as you lose bets during the day
     let effective_daily_limit = if !FF_EXPOSURE_CAPS {
         DAILY_LOSS_LIMIT_USD
     } else {
-        let (_, _, _, daily_loss_frac, _) = get_exposure_caps(bankroll);
-        DAILY_LOSS_LIMIT_USD.min(bankroll * daily_loss_frac)
+        let (_, _, _, daily_loss_frac, _) = get_exposure_caps(sod_bankroll);
+        DAILY_LOSS_LIMIT_USD.min(sod_bankroll * daily_loss_frac)
     };
 
     if !FF_EXPOSURE_CAPS {
@@ -2584,6 +2586,9 @@ async fn main() -> Result<()> {
 
     // === BANKROLL: fetched from executor at startup, updated on claims ===
     let mut current_bankroll: f64 = 65.0; // default, updated from /health
+    // Start-of-day bankroll: frozen at day start, used for daily loss limit calc
+    // Prevents "shrinking box" where losing bets reduce bankroll → reduce limit → stop earlier
+    let mut start_of_day_bankroll: f64 = 65.0;
 
     // BUG #6 FIX: Persist auto_bet_count across restarts (daily file)
     let bet_count_path = "data/bet_count_daily.txt";
@@ -2803,7 +2808,8 @@ async fn main() -> Result<()> {
                     // Update bankroll from executor balance
                     if let Ok(bal) = balance.parse::<f64>() {
                         current_bankroll = bal;
-                        info!("💰 Bankroll set from executor: ${:.2}", current_bankroll);
+                        start_of_day_bankroll = bal;
+                        info!("💰 Bankroll set from executor: ${:.2} (SOD locked)", current_bankroll);
                     }
                     format!("✅ Executor ONLINE\n   Wallet: <code>{}</code>\n   Balance: {} USDT\n   Allowance: {}", wallet, balance, allowance)
                 }
@@ -2912,6 +2918,9 @@ async fn main() -> Result<()> {
                                     daily_date = today_now;
                                     daily_loss_alert_sent = false;
                                     daily_loss_last_reminder = None;
+                                    // Lock start-of-day bankroll for today's loss limit calc
+                                    start_of_day_bankroll = current_bankroll;
+                                    info!("📅 SOD bankroll locked: ${:.2}", start_of_day_bankroll);
                                     // === RESET EXPOSURE + REBET TRACKERS ===
                                     condition_exposure.clear();
                                     match_exposure.clear();
@@ -2926,10 +2935,11 @@ async fn main() -> Result<()> {
                                 // NET loss = settled losses minus claimed returns
                                 // e.g. wagered=$20 on losses, returned=$30 from wins => net = -$10 (profit!)
                                 let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
-                                // Effective daily limit: min(hard $20, tier-based cap)
+                                // Effective daily limit: min(hard $30, tier-based cap)
+                                // Uses START-OF-DAY bankroll to prevent "shrinking box" during losing streaks
                                 let effective_daily_limit = {
-                                    let (_, _, _, dl_frac, _) = get_exposure_caps(current_bankroll);
-                                    DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac)
+                                    let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
+                                    DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
                                 };
                                 if daily_net_loss >= effective_daily_limit {
                                     let now_utc = Utc::now();
@@ -3058,7 +3068,7 @@ async fn main() -> Result<()> {
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
                                     let cv_sm = edge.cv_stake_mult;
                                     let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
-                                        inflight_wagered_total, sport_exp, sport, cv_sm);
+                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll);
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -3571,7 +3581,7 @@ async fn main() -> Result<()> {
                                     let anomaly_daily_loss = (daily_wagered - daily_returned).max(0.0);
                                     let anomaly_raw_stake = AUTO_BET_ODDS_ANOMALY_STAKE_USD;
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
-                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0);
+                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll);
 
                                     // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
                                     let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;

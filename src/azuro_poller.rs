@@ -14,10 +14,15 @@
 //! Sporty: cs2, tennis, football, basketball, dota-2, mma
 
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn, debug};
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{
     match_key, FeedHubState, OddsKey, OddsState, OddsPayload,
@@ -104,6 +109,46 @@ const AZURO_SPORTS: &[&str] = &[
 /// 3s = 12 sports × 2 chains = 24 parallel queries per cycle = 480 req/min to The Graph.
 /// Aggressive but within typical subgraph rate limits.
 const AZURO_POLL_INTERVAL_SECS: u64 = 3;
+
+// ====================================================================
+// WS Shadow Mode — real-time condition updates from Azuro V3 streams
+// ====================================================================
+
+/// Azuro V3 WebSocket streams endpoint (production)
+const AZURO_WS_URL: &str = "wss://streams.onchainfeed.org/v1/streams/feed";
+
+/// Minimum interval between SubscribeConditions messages (throttle)
+const WS_RESUBSCRIBE_MIN_SECS: u64 = 10;
+
+/// Reconnect backoff sequence (ms)
+const WS_RECONNECT_BACKOFF_MS: &[u64] = &[1_000, 2_000, 5_000, 10_000, 30_000];
+
+/// Shadow WS metrics (shared across tasks)
+struct WsShadowMetrics {
+    updates_received: AtomicU64,
+    reconnects: AtomicU64,
+    last_update_epoch_ms: AtomicI64,
+    subscribes_sent: AtomicU64,
+}
+
+/// WS subscribe message format
+#[derive(Serialize)]
+struct WsSubscribeMsg {
+    event: String,
+    conditions: Vec<String>,
+    environment: String,
+}
+
+/// WS incoming message (generic — we match on event field)
+#[derive(Deserialize, Debug)]
+struct WsIncoming {
+    event: Option<String>,
+    id: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+/// Condition set per environment: (polygon_ids, base_ids)
+type ConditionSets = (Vec<String>, Vec<String>);
 
 /// GraphQL query — data-feed schema (state, not status; Active conditions)
 fn build_sport_query(sport_slug: &str) -> String {
@@ -465,6 +510,239 @@ async fn poll_subgraph(
 }
 
 // ====================================================================
+// WS Shadow Mode — daemon task
+// ====================================================================
+
+/// Run the WS shadow observer. Receives condition ID sets via watch channel,
+/// subscribes to Azuro WS stream, and logs all ConditionUpdated events
+/// with timing delta vs GQL polling for comparison.
+///
+/// This task does NOT modify FeedHubState — it's purely observational.
+async fn run_shadow_ws(
+    mut condition_rx: watch::Receiver<ConditionSets>,
+    metrics: Arc<WsShadowMetrics>,
+) {
+    let mut backoff_idx: usize = 0;
+
+    loop {
+        info!("[SHADOW-WS] Connecting to {}", AZURO_WS_URL);
+
+        let ws_stream = match tokio_tungstenite::connect_async(AZURO_WS_URL).await {
+            Ok((stream, resp)) => {
+                info!("[SHADOW-WS] Connected! HTTP {}", resp.status());
+                backoff_idx = 0; // Reset backoff on successful connect
+                stream
+            }
+            Err(e) => {
+                let delay = WS_RECONNECT_BACKOFF_MS
+                    .get(backoff_idx)
+                    .copied()
+                    .unwrap_or(30_000);
+                warn!(
+                    "[SHADOW-WS] Connect failed: {} — reconnecting in {}ms (attempt #{})",
+                    e,
+                    delay,
+                    backoff_idx + 1
+                );
+                metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+                backoff_idx = (backoff_idx + 1).min(WS_RECONNECT_BACKOFF_MS.len() - 1);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
+            }
+        };
+
+        let (mut ws_sink, mut ws_read) = ws_stream.split();
+
+        // Track what we've subscribed to, for diffing
+        let mut subscribed_polygon: HashSet<String> = HashSet::new();
+        let mut subscribed_base: HashSet<String> = HashSet::new();
+        let mut last_subscribe_ts = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(WS_RESUBSCRIBE_MIN_SECS + 1))
+            .unwrap_or_else(std::time::Instant::now);
+
+        // Inner loop: read messages + periodic resubscribe
+        let disconnect_reason: String;
+        loop {
+            // Check if we need to (re)subscribe (new conditions from GQL poller)
+            if condition_rx.has_changed().unwrap_or(false)
+                && last_subscribe_ts.elapsed() >= Duration::from_secs(WS_RESUBSCRIBE_MIN_SECS)
+            {
+                let (poly_ids, base_ids) = condition_rx.borrow_and_update().clone();
+                let poly_set: HashSet<String> = poly_ids.into_iter().collect();
+                let base_set: HashSet<String> = base_ids.into_iter().collect();
+
+                // Diff: only subscribe to NEW conditions (Azuro docs: additive subscribe)
+                let new_poly: Vec<String> = poly_set.difference(&subscribed_polygon).cloned().collect();
+                let new_base: Vec<String> = base_set.difference(&subscribed_base).cloned().collect();
+
+                if !new_poly.is_empty() {
+                    let msg = serde_json::to_string(&WsSubscribeMsg {
+                        event: "SubscribeConditions".to_string(),
+                        conditions: new_poly.clone(),
+                        environment: "polygon".to_string(),
+                    })
+                    .unwrap();
+                    if let Err(e) = ws_sink.send(WsMessage::Text(msg.into())).await {
+                        disconnect_reason = format!("send error (polygon subscribe): {}", e);
+                        break;
+                    }
+                    info!(
+                        "[SHADOW-WS] Subscribed {} new Polygon conditions (total: {})",
+                        new_poly.len(),
+                        poly_set.len()
+                    );
+                    subscribed_polygon = poly_set;
+                    metrics.subscribes_sent.fetch_add(1, Ordering::Relaxed);
+                }
+
+                if !new_base.is_empty() {
+                    let msg = serde_json::to_string(&WsSubscribeMsg {
+                        event: "SubscribeConditions".to_string(),
+                        conditions: new_base.clone(),
+                        environment: "base".to_string(),
+                    })
+                    .unwrap();
+                    if let Err(e) = ws_sink.send(WsMessage::Text(msg.into())).await {
+                        disconnect_reason = format!("send error (base subscribe): {}", e);
+                        break;
+                    }
+                    info!(
+                        "[SHADOW-WS] Subscribed {} new Base conditions (total: {})",
+                        new_base.len(),
+                        base_set.len()
+                    );
+                    subscribed_base = base_set;
+                    metrics.subscribes_sent.fetch_add(1, Ordering::Relaxed);
+                }
+
+                last_subscribe_ts = std::time::Instant::now();
+            }
+
+            // Read next WS message with timeout (so we can check for resubscribe)
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await;
+
+            match msg {
+                Ok(Some(Ok(WsMessage::Text(txt)))) => {
+                    let now_ms = Utc::now().timestamp_millis();
+                    metrics.last_update_epoch_ms.store(now_ms, Ordering::Relaxed);
+
+                    // Parse incoming JSON
+                    match serde_json::from_str::<WsIncoming>(&txt) {
+                        Ok(incoming) => {
+                            let event = incoming.event.as_deref().unwrap_or("?");
+                            match event {
+                                "ConditionUpdated" => {
+                                    metrics.updates_received.fetch_add(1, Ordering::Relaxed);
+                                    let cid = incoming.id.as_deref().unwrap_or("?");
+
+                                    // Extract odds from data.outcomes
+                                    let odds_str = if let Some(data) = &incoming.data {
+                                        if let Some(outcomes) = data.get("outcomes").and_then(|v| v.as_array()) {
+                                            outcomes
+                                                .iter()
+                                                .filter_map(|o| {
+                                                    let oid = o.get("outcomeId").and_then(|v| v.as_u64());
+                                                    let odds = o.get("currentOdds").and_then(|v| v.as_str());
+                                                    match (oid, odds) {
+                                                        (Some(id), Some(o)) => Some(format!("{}={}", id, o)),
+                                                        _ => None,
+                                                    }
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        } else {
+                                            "no-outcomes".to_string()
+                                        }
+                                    } else {
+                                        "no-data".to_string()
+                                    };
+
+                                    let state_str = incoming.data
+                                        .as_ref()
+                                        .and_then(|d| d.get("state"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
+
+                                    let total = metrics.updates_received.load(Ordering::Relaxed);
+                                    debug!(
+                                        "[SHADOW-WS] ConditionUpdated cid={} state={} odds=[{}] (total: {})",
+                                        &cid[..cid.len().min(20)],
+                                        state_str,
+                                        odds_str,
+                                        total
+                                    );
+                                }
+                                "SubscribedToConditions" => {
+                                    let count = incoming.data
+                                        .as_ref()
+                                        .and_then(|d| d.as_array())
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    info!(
+                                        "[SHADOW-WS] SubscribedToConditions: {} IDs confirmed",
+                                        count
+                                    );
+                                }
+                                _ => {
+                                    debug!("[SHADOW-WS] Unknown event: {} data={:?}",
+                                        event,
+                                        incoming.data.as_ref().map(|d| {
+                                            let s = d.to_string();
+                                            if s.len() > 100 { format!("{}...", &s[..100]) } else { s }
+                                        })
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("[SHADOW-WS] JSON parse error: {} raw={}", e, &txt[..txt.len().min(200)]);
+                        }
+                    }
+                }
+                Ok(Some(Ok(WsMessage::Ping(payload)))) => {
+                    let _ = ws_sink.send(WsMessage::Pong(payload)).await;
+                }
+                Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                    disconnect_reason = format!(
+                        "server close: {:?}",
+                        frame.map(|f| format!("{} {}", f.code, f.reason))
+                    );
+                    break;
+                }
+                Ok(Some(Err(e))) => {
+                    disconnect_reason = format!("read error: {}", e);
+                    break;
+                }
+                Ok(None) => {
+                    disconnect_reason = "stream ended (None)".to_string();
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — normal, loop back to check resubscribe
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Disconnected — reconnect with backoff
+        metrics.reconnects.fetch_add(1, Ordering::Relaxed);
+        let delay = WS_RECONNECT_BACKOFF_MS
+            .get(backoff_idx)
+            .copied()
+            .unwrap_or(30_000);
+        warn!(
+            "[SHADOW-WS] Disconnected: {} — reconnecting in {}ms (reconnects: {})",
+            disconnect_reason,
+            delay,
+            metrics.reconnects.load(Ordering::Relaxed)
+        );
+        backoff_idx = (backoff_idx + 1).min(WS_RECONNECT_BACKOFF_MS.len() - 1);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+}
+
+// ====================================================================
 // Main polling loop
 // ====================================================================
 
@@ -480,6 +758,20 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         .pool_max_idle_per_host(6)
         .build()
         .expect("failed to create reqwest client");
+
+    // ── Shadow WS spawn ──
+    let ws_metrics = Arc::new(WsShadowMetrics {
+        updates_received: AtomicU64::new(0),
+        reconnects: AtomicU64::new(0),
+        last_update_epoch_ms: AtomicI64::new(0),
+        subscribes_sent: AtomicU64::new(0),
+    });
+    let (condition_tx, condition_rx) = watch::channel::<ConditionSets>((vec![], vec![]));
+    let ws_metrics_clone = ws_metrics.clone();
+    tokio::spawn(async move {
+        run_shadow_ws(condition_rx, ws_metrics_clone).await;
+    });
+    info!("[SHADOW-WS] Shadow WebSocket daemon spawned");
 
     // Minimal startup delay
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -646,6 +938,41 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
             );
         } else {
             debug!("azuro poll: 0 games with odds right now");
+        }
+
+        // ── Feed active condition IDs to WS Shadow daemon ──
+        {
+            let mut poly_conds: Vec<String> = Vec::new();
+            let mut base_conds: Vec<String> = Vec::new();
+            for result in &all_results {
+                for game in &result.games {
+                    if let Some(cid) = &game.condition_id {
+                        match result.chain {
+                            "polygon" => poly_conds.push(cid.clone()),
+                            "base" => base_conds.push(cid.clone()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            poly_conds.sort();
+            poly_conds.dedup();
+            base_conds.sort();
+            base_conds.dedup();
+            let total_ws = poly_conds.len() + base_conds.len();
+            if total_ws > 0 {
+                let _ = condition_tx.send((poly_conds, base_conds));
+            }
+            // Periodic shadow metrics log (every ~30s = every 10th cycle)
+            let ws_updates = ws_metrics.updates_received.load(Ordering::Relaxed);
+            let ws_reconnects = ws_metrics.reconnects.load(Ordering::Relaxed);
+            let ws_subs = ws_metrics.subscribes_sent.load(Ordering::Relaxed);
+            if ws_updates > 0 || ws_subs > 0 {
+                debug!(
+                    "[SHADOW-WS] stats: {} updates, {} reconnects, {} subscribes, {} active conditions",
+                    ws_updates, ws_reconnects, ws_subs, total_ws
+                );
+            }
         }
 
         tokio::time::sleep(Duration::from_secs(AZURO_POLL_INTERVAL_SECS)).await;
