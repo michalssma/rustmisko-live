@@ -60,12 +60,19 @@ const MANUAL_ALERT_MAX_AGE_SECS: i64 = 25;
 /// already ensures we only bet on real Azuro markets. esports:: keys from
 /// Tipsport resolve to cs2:: via alt-key lookup → safe to bet.
 const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
-/// Retry settings — exponential backoff for live market condition pauses
-const AUTO_BET_RETRY_MAX: usize = 3;
-/// Exponential backoff delays per retry attempt (ms) — total worst-case = 600ms
-const AUTO_BET_RETRY_DELAYS_MS: [u64; 3] = [50, 150, 400];
+/// Retry settings — jittered backoff for live market condition pauses
+/// GPT audit: max 2 retry for ConditionNotRunning; 3rd attempt is wasted latency
+const AUTO_BET_RETRY_MAX: usize = 2;
+/// Jitter base delays per retry attempt — actual = base + rand(0..base/2)
+const AUTO_BET_RETRY_DELAYS_MS: [u64; 2] = [200, 500];
 /// Signal TTL — reject bet if decision is older than this (seconds)
 const SIGNAL_TTL_SECS: u64 = 3;
+/// === PRE-FLIGHT GATING (condition-state pivot, 2026-02-28) ===
+/// Max age since last GQL sighting of this condition as Active
+/// If condition_age_ms > this, DROP before sending to executor
+const CONDITION_MAX_AGE_MS: u64 = 2000;
+/// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
+const PIPELINE_BUDGET_MS: u64 = 1500;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
 const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
 const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
@@ -3269,6 +3276,31 @@ async fn main() -> Result<()> {
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
 
+                                        // === PRE-FLIGHT GATE: condition freshness check ===
+                                        // If condition was not seen Active recently → DROP immediately
+                                        // Saves executor round-trip + gas on doomed attempts
+                                        if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                            warn!("🚫 PRE-FLIGHT GATE #{}: condition {} stale (age={}ms > {}ms) — dropping",
+                                                aid, &condition_id, condition_age_ms, CONDITION_MAX_AGE_MS);
+                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                "alert_id": aid, "match_key": match_key_for_bet,
+                                                "condition_id": condition_id, "outcome_id": outcome_id,
+                                                "error": "pre-flight gate: condition stale",
+                                                "reason_code": "PreFlightStale",
+                                                "is_condition_state_reject": true,
+                                                "condition_age_ms": condition_age_ms,
+                                                "requested_odds": azuro_odds,
+                                                "stake": stake, "path": "edge",
+                                                "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                            }));
+                                            log_event("PREFLIGHT_GATE", &serde_json::json!({
+                                                "alert_id": aid, "condition_id": condition_id,
+                                                "condition_age_ms": condition_age_ms, "reason": "stale",
+                                            }));
+                                            // Don't mark inflight — we never sent it
+                                            // Continue to normal alert flow (no auto-bet)
+                                        } else {
+
                                         // RACE CONDITION FIX: mark in-flight BEFORE sending to executor
                                         inflight_conditions.insert(cond_id_str.clone());
                                         inflight_conditions.insert(match_key_for_bet.clone());
@@ -3341,6 +3373,27 @@ async fn main() -> Result<()> {
                                             ).await;
                                             break;
                                         }
+                                        // Pipeline budget check — abort if processing took too long
+                                        let elapsed_pipeline = decision_instant.elapsed().as_millis() as u64;
+                                        if elapsed_pipeline > PIPELINE_BUDGET_MS {
+                                            warn!("⏰ AUTO-BET #{}: Pipeline budget exceeded ({}ms > {}ms) — dropping",
+                                                aid, elapsed_pipeline, PIPELINE_BUDGET_MS);
+                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                "alert_id": aid, "match_key": &match_key_for_bet,
+                                                "condition_id": &cond_id_str, "outcome_id": &outcome_id,
+                                                "error": "pipeline budget exceeded",
+                                                "reason_code": "PipelineBudgetExceeded",
+                                                "is_condition_state_reject": false,
+                                                "condition_age_ms": condition_age_ms,
+                                                "pipeline_ms": elapsed_pipeline,
+                                                "requested_odds": azuro_odds, "stake": stake,
+                                                "path": "score_edge", "retries": attempt,
+                                                "rtt_ms": 0,
+                                            }));
+                                            inflight_conditions.remove(&cond_id_str);
+                                            inflight_conditions.remove(&match_key_for_bet);
+                                            break;
+                                        }
                                         let send_ts = Utc::now();
                                         let send_instant = std::time::Instant::now();
                                         match client.post(format!("{}/bet", executor_url))
@@ -3366,9 +3419,11 @@ async fn main() -> Result<()> {
                                                                 || err_lower.contains("nonce");
                                                             if is_condition_paused && !is_fatal && attempt < max_retries {
                                                                 attempt += 1;
-                                                                let delay_ms = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(400);
-                                                                info!("🔄 AUTO-BET #{} retry {}/{}: condition paused, waiting {}ms... ({})",
-                                                                    aid, attempt, max_retries, delay_ms, err);
+                                                                let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
+                                                                let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
+                                                                let delay_ms = base_delay + jitter;
+                                                                info!("🔄 AUTO-BET #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
+                                                                    aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
                                                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue; // retry the loop
                                                             }
@@ -3603,6 +3658,8 @@ async fn main() -> Result<()> {
                                         }
                                         break; // exit retry loop (success, parse error, or executor offline)
                                         } // end retry loop
+
+                                        } // end pre-flight gate else block
                                     } else if !mute_manual_alerts {
                                         // Manual alert (MEDIUM confidence or auto-bet disabled)
                                         let msg = format_score_edge_alert(edge, aid);
@@ -3783,6 +3840,27 @@ async fn main() -> Result<()> {
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
 
+                                        // === PRE-FLIGHT GATE: condition freshness check (Path B) ===
+                                        if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                            warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} stale (age={}ms > {}ms) — dropping",
+                                                aid, &condition_id, condition_age_ms_b, CONDITION_MAX_AGE_MS);
+                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                "alert_id": aid, "match_key": anomaly.match_key,
+                                                "condition_id": condition_id, "outcome_id": outcome_id,
+                                                "error": "pre-flight gate: condition stale",
+                                                "reason_code": "PreFlightStale",
+                                                "is_condition_state_reject": true,
+                                                "condition_age_ms": condition_age_ms_b,
+                                                "requested_odds": azuro_odds,
+                                                "stake": stake, "path": "anomaly_odds",
+                                                "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                            }));
+                                            log_event("PREFLIGHT_GATE", &serde_json::json!({
+                                                "alert_id": aid, "condition_id": condition_id,
+                                                "condition_age_ms": condition_age_ms_b, "reason": "stale",
+                                            }));
+                                        } else {
+
                                         let conf_emoji = if anomaly.confidence == "HIGH" { "🟢" } else { "🟡" };
                                         let pre_msg = format!(
                                             "🤖 <b>#{} AUTO-BET ODDS ANOMALY</b> {} {}\n\
@@ -3839,6 +3917,27 @@ async fn main() -> Result<()> {
                                             ).await;
                                             break;
                                         }
+                                        // Pipeline budget check — abort if processing took too long
+                                        let elapsed_pipeline_b = decision_instant.elapsed().as_millis() as u64;
+                                        if elapsed_pipeline_b > PIPELINE_BUDGET_MS {
+                                            warn!("⏰ AUTO-BET ODDS #{}: Pipeline budget exceeded ({}ms > {}ms) — dropping",
+                                                aid, elapsed_pipeline_b, PIPELINE_BUDGET_MS);
+                                            ledger_write("BET_FAILED", &serde_json::json!({
+                                                "alert_id": aid, "match_key": &match_key_for_bet,
+                                                "condition_id": &condition_id, "outcome_id": &outcome_id,
+                                                "error": "pipeline budget exceeded",
+                                                "reason_code": "PipelineBudgetExceeded",
+                                                "is_condition_state_reject": false,
+                                                "condition_age_ms": condition_age_ms_b,
+                                                "pipeline_ms": elapsed_pipeline_b,
+                                                "requested_odds": azuro_odds, "stake": stake,
+                                                "path": "anomaly_odds", "retries": attempt,
+                                                "rtt_ms": 0,
+                                            }));
+                                            inflight_conditions.remove(&cond_id_str);
+                                            inflight_conditions.remove(&match_key_for_bet);
+                                            break;
+                                        }
                                         let send_ts_b = Utc::now();
                                         let send_instant_b = std::time::Instant::now();
                                         match client.post(format!("{}/bet", executor_url))
@@ -3863,9 +3962,11 @@ async fn main() -> Result<()> {
                                                                 || err_lower.contains("nonce");
                                                             if is_condition_paused && !is_fatal && attempt < max_retries {
                                                                 attempt += 1;
-                                                                let delay_ms = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(400);
-                                                                info!("🔄 AUTO-BET ODDS #{} retry {}/{}: condition paused, waiting {}ms... ({})",
-                                                                    aid, attempt, max_retries, delay_ms, err);
+                                                                let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
+                                                                let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
+                                                                let delay_ms = base_delay + jitter;
+                                                                info!("🔄 AUTO-BET ODDS #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
+                                                                    aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
                                                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue;
                                                             }
@@ -4050,6 +4151,7 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         } // end loop
+                                        } // end pre-flight gate else block (Path B)
                                     } else if !mute_manual_alerts {
                                         let msg = format_anomaly_alert(&anomaly, aid);
                                         match tg_send_message(&client, &token, chat_id, &msg).await {
