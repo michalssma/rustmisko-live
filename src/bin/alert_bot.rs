@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, HashMap};
 use std::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use tracing_subscriber::{EnvFilter, fmt};
 use std::path::Path;
 
@@ -279,6 +279,16 @@ fn trim_stake(
         .min(daily_room)
         .min(inflight_room)
         .min(sport_room);
+
+    // OBSERVABILITY: log trim_stake evaluation for every bet attempt
+    if final_stake < boosted_stake * 0.99 || final_stake < 0.50 {
+        tracing::debug!(
+            "📊 TRIM_STAKE: raw={:.2} boosted={:.2} final={:.2} | caps: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2}",
+            calculated_stake, boosted_stake, final_stake,
+            per_bet_cap, cond_room, match_room, daily_room, inflight_room, sport_room,
+            sod_bankroll, bankroll, effective_daily_limit
+        );
+    }
 
     if final_stake < 0.50 { 0.0 } else { final_stake }
 }
@@ -2614,7 +2624,7 @@ async fn main() -> Result<()> {
     let mut daily_date = Utc::now().format("%Y-%m-%d").to_string();
     let mut daily_loss_alert_sent = false;
     let mut daily_loss_last_reminder: Option<DateTime<Utc>> = None;
-    // Load from daily_pnl.json if exists
+    // Load from daily_pnl.json if exists (includes SOD bankroll persistence)
     {
         let pnl_path = "data/daily_pnl.json";
         if Path::new(pnl_path).exists() {
@@ -2623,12 +2633,15 @@ async fn main() -> Result<()> {
                     if v["date"].as_str() == Some(&daily_date) {
                         daily_wagered = v["wagered"].as_f64().unwrap_or(0.0);
                         daily_returned = v["returned"].as_f64().unwrap_or(0.0);
-                        info!("📋 Loaded daily P&L: wagered={:.2} returned={:.2} net={:.2}",
-                            daily_wagered, daily_returned, daily_returned - daily_wagered);
-
-                        // False-loss bug is fixed: daily_wagered now only counts
-                        // REAL confirmed Lost settlements (verified via /bet/:id API).
-                        // No migration reset needed — data is trustworthy.
+                        // Restore SOD bankroll from file (survives mid-day restarts)
+                        if let Some(sod) = v["sod_bankroll"].as_f64() {
+                            if sod > 0.0 {
+                                start_of_day_bankroll = sod;
+                                info!("📋 Restored SOD bankroll from file: ${:.2}", sod);
+                            }
+                        }
+                        info!("📋 Loaded daily P&L: wagered={:.2} returned={:.2} net={:.2} sod_br=${:.2}",
+                            daily_wagered, daily_returned, daily_returned - daily_wagered, start_of_day_bankroll);
                     } else {
                         info!("📋 daily_pnl.json is from different day, resetting");
                     }
@@ -2921,6 +2934,12 @@ async fn main() -> Result<()> {
                                     // Lock start-of-day bankroll for today's loss limit calc
                                     start_of_day_bankroll = current_bankroll;
                                     info!("📅 SOD bankroll locked: ${:.2}", start_of_day_bankroll);
+                                    // Persist SOD bankroll for day-rollover
+                                    {
+                                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                                        let _ = std::fs::write("data/daily_pnl.json",
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                    }
                                     // === RESET EXPOSURE + REBET TRACKERS ===
                                     condition_exposure.clear();
                                     match_exposure.clear();
@@ -2941,6 +2960,9 @@ async fn main() -> Result<()> {
                                     let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
                                     DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
                                 };
+                                // OBSERVABILITY: log daily loss evaluation every cycle
+                                debug!("📊 DAILY_LOSS_EVAL: net_loss=${:.2} limit=${:.2} sod_br=${:.2} cur_br=${:.2} wagered=${:.2} returned=${:.2}",
+                                    daily_net_loss, effective_daily_limit, start_of_day_bankroll, current_bankroll, daily_wagered, daily_returned);
                                 if daily_net_loss >= effective_daily_limit {
                                     let now_utc = Utc::now();
                                     let reminder_due = daily_loss_last_reminder
@@ -3351,7 +3373,7 @@ async fn main() -> Result<()> {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
                                                                 let _ = std::fs::write("data/daily_pnl.json",
-                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
@@ -3778,7 +3800,7 @@ async fn main() -> Result<()> {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
                                                                 let _ = std::fs::write("data/daily_pnl.json",
-                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
@@ -4107,7 +4129,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                     }
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         &format!("💰 <b>AUTO-CLAIM (safety net)</b>\n\nVyplaceno {} sázek, ${:.2}\n💰 Nový zůstatek: {} USDT",
@@ -4218,7 +4240,7 @@ async fn main() -> Result<()> {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write(
                                             "data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string(),
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string(),
                                         );
                                     }
                                     let loss_msg = format!(
@@ -4348,7 +4370,7 @@ async fn main() -> Result<()> {
                                 {
                                     let today = Utc::now().format("%Y-%m-%d").to_string();
                                     let _ = std::fs::write("data/daily_pnl.json",
-                                        serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                        serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                 }
                                 // Notify about loss immediately
                                 let loss_msg = format!(
@@ -4453,7 +4475,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                     }
 
                                     // Build detailed notification
@@ -4552,7 +4574,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
                                     }
                                     info!("💰 Safety-net auto-claim: {} bets, ${:.2} (daily_returned now ${:.2})", claimed, payout, daily_returned);
                                     let _ = tg_send_message(&client, &token, chat_id,
@@ -4968,7 +4990,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": 0.0, "returned": 0.0}).to_string());
+                                            serde_json::json!({"date": today, "wagered": 0.0, "returned": 0.0, "sod_bankroll": start_of_day_bankroll}).to_string());
                                     }
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         &format!(

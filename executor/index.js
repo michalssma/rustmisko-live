@@ -723,11 +723,37 @@ app.post("/bet", async (req, res) => {
       });
     }
   } catch (e) {
-    // Rollback optimistic lock on error — allow retry
-    console.error(`❌ Bet error: ${e.message} — rolling back idempotence lock`);
-    bettedConditions.delete(conditionId);
-    rollbackBetInflight(conditionId, outcomeId);
-    res.status(500).json({ error: e.message, details: e.stack });
+    const errMsg = (e.message || '').toLowerCase();
+    const errCode = (e.code || '').toUpperCase();
+    const isTimeout = errMsg.includes('timeout') || errMsg.includes('etimedout') || errMsg.includes('econnreset')
+      || errMsg.includes('socket hang up') || errMsg.includes('und_err_connect_timeout')
+      || errCode === 'ETIMEDOUT' || errCode === 'ECONNRESET' || errCode === 'UND_ERR_CONNECT_TIMEOUT';
+    const isNetworkError = errMsg.includes('fetch') || errMsg.includes('network') || errMsg.includes('enotfound')
+      || errMsg.includes('econnrefused') || errMsg.includes('epipe') || errMsg.includes('fetch failed')
+      || errCode === 'ENOTFOUND' || errCode === 'ECONNREFUSED' || errCode === 'EPIPE';
+
+    if (isTimeout || isNetworkError) {
+      // CRITICAL: Timeout/network error = bet MAY have been sent to relayer.
+      // Do NOT rollback — keep lock to prevent double-bet.
+      // Alert_bot should query GET /bet/:id to check status before retrying.
+      console.error(`⚠️ Bet TIMEOUT/NETWORK: ${errMsg} — KEEPING lock (bet may have been sent!)`);
+      console.error(`   condition=${conditionId} outcome=${outcomeId} — query /bet/:id before retry`);
+      // Promote to 'sent' status since we don't know if it went through
+      markBetSent(conditionId, outcomeId);
+      res.status(504).json({
+        error: 'TIMEOUT: Bet may have been sent — query status before retry',
+        conditionId,
+        outcomeId,
+        hint: 'GET /bet/:id to check',
+        keepLock: true,
+      });
+    } else {
+      // Definitive error (bad params, rejected pre-send, etc.) — safe to rollback
+      console.error(`❌ Bet error: ${errMsg} — rolling back idempotence lock`);
+      bettedConditions.delete(conditionId);
+      rollbackBetInflight(conditionId, outcomeId);
+      res.status(500).json({ error: e.message, details: e.stack });
+    }
   }
 });
 
