@@ -14,7 +14,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 8000; // 8s — tennis points change slower than CS2 rounds
+  const SCAN_INTERVAL_MS = 3000; // 3s — tennis points still need fast detection for live edge
   const RECONNECT_MS = 3000;
   const HEARTBEAT_MS = 15000;
   const SOURCE_NAME = "flashscore-tennis";

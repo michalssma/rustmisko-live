@@ -60,9 +60,12 @@ const MANUAL_ALERT_MAX_AGE_SECS: i64 = 25;
 /// already ensures we only bet on real Azuro markets. esports:: keys from
 /// Tipsport resolve to cs2:: via alt-key lookup → safe to bet.
 const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
-/// Retry settings for live markets (short bursts, many attempts)
-const AUTO_BET_RETRY_MAX: usize = 8;
-const AUTO_BET_RETRY_SLEEP_MS: u64 = 900;
+/// Retry settings — exponential backoff for live market condition pauses
+const AUTO_BET_RETRY_MAX: usize = 3;
+/// Exponential backoff delays per retry attempt (ms) — total worst-case = 600ms
+const AUTO_BET_RETRY_DELAYS_MS: [u64; 3] = [50, 150, 400];
+/// Signal TTL — reject bet if decision is older than this (seconds)
+const SIGNAL_TTL_SECS: u64 = 3;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
 const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
 const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
@@ -3208,6 +3211,7 @@ async fn main() -> Result<()> {
                                         }
 
                                         // Place the bet — with retry on "condition not active"
+                                        let decision_instant = std::time::Instant::now();
                                         let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
                                         let amount_raw = (stake * 1e6) as u64;
                                         let bet_body = serde_json::json!({
@@ -3227,6 +3231,18 @@ async fn main() -> Result<()> {
                                         let mut attempt = 0;
                                         let mut bet_success = false;
                                         loop {
+                                        // Signal TTL check — abort if decision is stale
+                                        if decision_instant.elapsed() > std::time::Duration::from_secs(SIGNAL_TTL_SECS) {
+                                            warn!("⏰ AUTO-BET #{}: Signal TTL expired ({}ms elapsed) — aborting stale bet",
+                                                aid, decision_instant.elapsed().as_millis());
+                                            inflight_conditions.remove(&cond_id_str);
+                                            inflight_conditions.remove(&match_key_for_bet);
+                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                &format!("⏰ <b>AUTO-BET #{} TTL EXPIRED</b> ({}ms) — sázka zastaralá, zrušeno.",
+                                                    aid, decision_instant.elapsed().as_millis())
+                                            ).await;
+                                            break;
+                                        }
                                         match client.post(format!("{}/bet", executor_url))
                                             .json(&bet_body).send().await {
                                             Ok(resp) => {
@@ -3237,14 +3253,20 @@ async fn main() -> Result<()> {
                                                             .unwrap_or(false);
                                                         if let Some(err) = &br.error {
                                                             // Check if retryable (condition paused/not active)
-                                                            let is_condition_paused = err.to_lowercase().contains("not active")
-                                                                || err.to_lowercase().contains("paused")
-                                                                || err.to_lowercase().contains("not exist");
-                                                            if is_condition_paused && attempt < max_retries {
+                                                            let err_lower = err.to_lowercase();
+                                                            let is_condition_paused = err_lower.contains("not active")
+                                                                || err_lower.contains("paused")
+                                                                || err_lower.contains("not exist");
+                                                            let is_fatal = err_lower.contains("insufficient")
+                                                                || err_lower.contains("allowance")
+                                                                || err_lower.contains("revert")
+                                                                || err_lower.contains("nonce");
+                                                            if is_condition_paused && !is_fatal && attempt < max_retries {
                                                                 attempt += 1;
+                                                                let delay_ms = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(400);
                                                                 info!("🔄 AUTO-BET #{} retry {}/{}: condition paused, waiting {}ms... ({})",
-                                                                    aid, attempt, max_retries, AUTO_BET_RETRY_SLEEP_MS, err);
-                                                                tokio::time::sleep(std::time::Duration::from_millis(AUTO_BET_RETRY_SLEEP_MS)).await;
+                                                                    aid, attempt, max_retries, delay_ms, err);
+                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue; // retry the loop
                                                             }
                                                             error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={})",
@@ -3626,6 +3648,7 @@ async fn main() -> Result<()> {
                                             anomaly_alert_sent = true;
                                         }
 
+                                        let decision_instant = std::time::Instant::now();
                                         let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
                                         let amount_raw = (stake * 1e6) as u64;
                                         let bet_body = serde_json::json!({
@@ -3641,6 +3664,18 @@ async fn main() -> Result<()> {
                                         let max_retries = AUTO_BET_RETRY_MAX;
                                         let mut attempt = 0;
                                         loop {
+                                        // Signal TTL check — abort if decision is stale
+                                        if decision_instant.elapsed() > std::time::Duration::from_secs(SIGNAL_TTL_SECS) {
+                                            warn!("⏰ AUTO-BET ODDS #{}: Signal TTL expired ({}ms elapsed) — aborting stale bet",
+                                                aid, decision_instant.elapsed().as_millis());
+                                            inflight_conditions.remove(&cond_id_str);
+                                            inflight_conditions.remove(&match_key_for_bet);
+                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                &format!("⏰ <b>AUTO-BET ODDS #{} TTL EXPIRED</b> ({}ms) — sázka zastaralá, zrušeno.",
+                                                    aid, decision_instant.elapsed().as_millis())
+                                            ).await;
+                                            break;
+                                        }
                                         match client.post(format!("{}/bet", executor_url))
                                             .json(&bet_body).send().await {
                                             Ok(resp) => {
@@ -3650,14 +3685,20 @@ async fn main() -> Result<()> {
                                                             .map(|s| s == "Rejected" || s == "Failed" || s == "Cancelled")
                                                             .unwrap_or(false);
                                                         if let Some(err) = &br.error {
-                                                            let is_condition_paused = err.to_lowercase().contains("not active")
-                                                                || err.to_lowercase().contains("paused")
-                                                                || err.to_lowercase().contains("not exist");
-                                                            if is_condition_paused && attempt < max_retries {
+                                                            let err_lower = err.to_lowercase();
+                                                            let is_condition_paused = err_lower.contains("not active")
+                                                                || err_lower.contains("paused")
+                                                                || err_lower.contains("not exist");
+                                                            let is_fatal = err_lower.contains("insufficient")
+                                                                || err_lower.contains("allowance")
+                                                                || err_lower.contains("revert")
+                                                                || err_lower.contains("nonce");
+                                                            if is_condition_paused && !is_fatal && attempt < max_retries {
                                                                 attempt += 1;
+                                                                let delay_ms = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(400);
                                                                 info!("🔄 AUTO-BET ODDS #{} retry {}/{}: condition paused, waiting {}ms... ({})",
-                                                                    aid, attempt, max_retries, AUTO_BET_RETRY_SLEEP_MS, err);
-                                                                tokio::time::sleep(std::time::Duration::from_millis(AUTO_BET_RETRY_SLEEP_MS)).await;
+                                                                    aid, attempt, max_retries, delay_ms, err);
+                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                                                                 continue;
                                                             }
                                                             error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={})",

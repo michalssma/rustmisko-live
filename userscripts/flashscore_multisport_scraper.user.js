@@ -14,7 +14,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 5000;
+  const SCAN_INTERVAL_MS = 3000; // 3s — faster detection for football/basketball score changes
   const RECONNECT_MS = 3000;
   const HEARTBEAT_MS = 15000;
   const SOURCE_NAME = "flashscore-multi";

@@ -210,21 +210,6 @@
     "state": "Accepted"
   },
   {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772248301142",
-    "tokenId": null,
-    "graphBetId": null,
-    "conditionId": "300610060000000000291290740000000000001721002648",
-    "outcomeId": "7012",
-    "stake": 2,
-    "odds": 1.7557,
-    "sport": "?",
-    "matchKey": "",
-    "team": "RED Canids",
-    "placedAt": "2026-02-28T03:11:41.857Z",
-    "status": "pending",
-    "state": "Accepted"
-  },
-  {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772249687723",
     "tokenId": null,
     "graphBetId": null,
@@ -236,21 +221,6 @@
     "matchKey": "",
     "team": "Voca Pgl Bucharest 2026 North America",
     "placedAt": "2026-02-28T03:34:47.997Z",
-    "status": "pending",
-    "state": "Accepted"
-  },
-  {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772250600363",
-    "tokenId": null,
-    "graphBetId": null,
-    "conditionId": "300610060000000000291266080000000000001720139155",
-    "outcomeId": "306",
-    "stake": 2,
-    "odds": 1.7557,
-    "sport": "?",
-    "matchKey": "",
-    "team": "Katie Boulter",
-    "placedAt": "2026-02-28T03:50:00.724Z",
     "status": "pending",
     "state": "Accepted"
   },
@@ -285,17 +255,32 @@
     "state": "Accepted"
   },
   {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772254690729",
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772258891015",
     "tokenId": null,
     "graphBetId": null,
-    "conditionId": "300610060000000000799286230000000000001715731748",
-    "outcomeId": "26",
-    "stake": 2.377046,
-    "odds": 1.6781,
+    "conditionId": "300610060000000000291344040000000000001725243540",
+    "outcomeId": "7013",
+    "stake": 2,
+    "odds": 1.3677,
     "sport": "?",
     "matchKey": "",
-    "team": "Metro Stars",
-    "placedAt": "2026-02-28T04:58:11.010Z",
+    "team": "Deep Cross Gaming",
+    "placedAt": "2026-02-28T06:08:11.421Z",
+    "status": "pending",
+    "state": "Sent"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772259635356",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000812722790000000000001713120596",
+    "outcomeId": "25",
+    "stake": 2,
+    "odds": 1.5811,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Sydney Olympic",
+    "placedAt": "2026-02-28T06:20:35.735Z",
     "status": "pending"
   }
 ]

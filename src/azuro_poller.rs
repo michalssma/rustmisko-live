@@ -101,9 +101,9 @@ const AZURO_SPORTS: &[&str] = &[
 ];
 
 /// Poll interval — ULTRA-FAST for live score-edge detection!
-/// 5s = 12 sports × 2 chains = 24 parallel queries per cycle = 288 req/min to The Graph.
-/// Slightly slower than 3s to account for doubled sport count (was 12 queries, now 24).
-const AZURO_POLL_INTERVAL_SECS: u64 = 5;
+/// 3s = 12 sports × 2 chains = 24 parallel queries per cycle = 480 req/min to The Graph.
+/// Aggressive but within typical subgraph rate limits.
+const AZURO_POLL_INTERVAL_SECS: u64 = 3;
 
 /// GraphQL query — data-feed schema (state, not status; Active conditions)
 fn build_sport_query(sport_slug: &str) -> String {

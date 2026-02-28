@@ -21,7 +21,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 8000;
+  const SCAN_INTERVAL_MS = 4000; // 4s — faster odds detection for arb/anomaly
   const RECONNECT_MS = 3000;
   const HEARTBEAT_MS = 20000;
   const SOURCE_NAME = "odds-tm";

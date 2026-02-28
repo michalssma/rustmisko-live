@@ -14,7 +14,7 @@
   "use strict";
 
   const WS_URL = "ws://localhost:8080/feed";
-  const SCAN_INTERVAL_MS = 5000;
+  const SCAN_INTERVAL_MS = 2000; // 2s — CS2 rounds change fast, match scraper speed!
   const RECONNECT_MS = 3000;
   const HEARTBEAT_MS = 15000;
   const SOURCE_NAME = "dust2";
