@@ -356,7 +356,7 @@
     "team": "SPARTA",
     "placedAt": "2026-02-28T09:04:11.547Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772269545914",
@@ -415,6 +415,20 @@
     "matchKey": "",
     "team": "Bodrumspor",
     "placedAt": "2026-02-28T10:46:31.706Z",
+    "status": "pending"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772281064457",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000291349300000000000001725187000",
+    "outcomeId": "502",
+    "stake": 1.946915,
+    "odds": 1.716899999999,
+    "sport": "?",
+    "matchKey": "",
+    "team": "WhiteBird",
+    "placedAt": "2026-02-28T12:17:44.589Z",
     "status": "pending"
   }
 ]
