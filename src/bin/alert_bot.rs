@@ -2599,6 +2599,7 @@ async fn main() -> Result<()> {
     // Start-of-day bankroll: frozen at day start, used for daily loss limit calc
     // Prevents "shrinking box" where losing bets reduce bankroll → reduce limit → stop earlier
     let mut start_of_day_bankroll: f64 = 65.0;
+    let mut sod_loaded_from_file = false; // guard: don't overwrite SOD from executor if file had valid value
 
     // BUG #6 FIX: Persist auto_bet_count across restarts (daily file)
     let bet_count_path = "data/bet_count_daily.txt";
@@ -2637,8 +2638,16 @@ async fn main() -> Result<()> {
                         if let Some(sod) = v["sod_bankroll"].as_f64() {
                             if sod > 0.0 {
                                 start_of_day_bankroll = sod;
+                                sod_loaded_from_file = true;
                                 info!("📋 Restored SOD bankroll from file: ${:.2}", sod);
                             }
+                        }
+                        // Fallback: if no sod_bankroll in file but we have daily P&L data,
+                        // mark as loaded to prevent executor overwrite (SOD = default, which is
+                        // better than using current depleted balance)
+                        if !sod_loaded_from_file && daily_wagered > 0.0 {
+                            sod_loaded_from_file = true;
+                            info!("📋 SOD bankroll not in file, but mid-day restart detected (wagered > 0). Keeping default SOD=${:.2} to prevent shrinking-box", start_of_day_bankroll);
                         }
                         info!("📋 Loaded daily P&L: wagered={:.2} returned={:.2} net={:.2} sod_br=${:.2}",
                             daily_wagered, daily_returned, daily_returned - daily_wagered, start_of_day_bankroll);
@@ -2821,8 +2830,14 @@ async fn main() -> Result<()> {
                     // Update bankroll from executor balance
                     if let Ok(bal) = balance.parse::<f64>() {
                         current_bankroll = bal;
-                        start_of_day_bankroll = bal;
-                        info!("💰 Bankroll set from executor: ${:.2} (SOD locked)", current_bankroll);
+                        // Only set SOD from executor if NOT already loaded from daily_pnl.json
+                        // (mid-day restart: file has the real SOD, executor has current depleted balance)
+                        if !sod_loaded_from_file {
+                            start_of_day_bankroll = bal;
+                            info!("💰 Bankroll set from executor: ${:.2} (SOD locked)", current_bankroll);
+                        } else {
+                            info!("💰 Bankroll from executor: ${:.2} (SOD kept from file: ${:.2})", bal, start_of_day_bankroll);
+                        }
                     }
                     format!("✅ Executor ONLINE\n   Wallet: <code>{}</code>\n   Balance: {} USDT\n   Allowance: {}", wallet, balance, allowance)
                 }
@@ -2971,13 +2986,14 @@ async fn main() -> Result<()> {
 
                                     if !daily_loss_alert_sent || reminder_due {
                                         let msg = format!(
-                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b> (min of ${:.0} hard, {:.0}% BR)\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.",
+                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b> (min of ${:.0} hard, {:.0}% SOD BR=${:.0})\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.",
                                             daily_net_loss,
                                             daily_wagered,
                                             daily_returned,
                                             effective_daily_limit,
                                             DAILY_LOSS_LIMIT_USD,
-                                            get_exposure_caps(current_bankroll).3 * 100.0,
+                                            get_exposure_caps(start_of_day_bankroll).3 * 100.0,
+                                            start_of_day_bankroll,
                                         );
                                         let _ = tg_send_message(&client, &token, chat_id, &msg).await;
                                         daily_loss_alert_sent = true;
