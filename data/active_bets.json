@@ -311,6 +311,35 @@
     "matchKey": "",
     "team": "APIA Leichhardt",
     "placedAt": "2026-02-28T06:51:02.824Z",
+    "status": "pending",
+    "state": "Accepted"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772261722841",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000799286270000000000001713324794",
+    "outcomeId": "26",
+    "stake": 1.910075,
+    "odds": 1.5811,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Gold Coast United",
+    "placedAt": "2026-02-28T06:55:22.938Z",
+    "status": "pending"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772261723790",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000812349980000000000001719969559",
+    "outcomeId": "24",
+    "stake": 1.910075,
+    "odds": 1.5811,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Tokushima Vortis",
+    "placedAt": "2026-02-28T06:55:23.883Z",
     "status": "pending"
   }
 ]

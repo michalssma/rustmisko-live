@@ -1304,6 +1304,14 @@ fn find_score_edges(
         let is_basketball = match_key.starts_with("basketball::");
         let is_mma = match_key.starts_with("mma::");
 
+        // ⛔ FOOTBALL SCORE-EDGE DISABLED — single-source Tipsport data unreliable
+        // for obscure leagues (J3 League, Australian NPL), no cross-validation.
+        // Campbelltown vs Metro Stars LOST despite 85% model prob → model/data broken.
+        if is_football {
+            info!("  ⏭️ {} {}-{}: football score-edge DISABLED (single-source risk)", match_key, s1, s2);
+            continue;
+        }
+
         let expected_prob = if is_tennis {
             // Tennis: scores are SET counts (0-2)
             match tennis_score_to_win_prob(leading_maps, losing_maps) {
