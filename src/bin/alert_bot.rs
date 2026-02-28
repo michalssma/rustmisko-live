@@ -72,7 +72,7 @@ const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
 const MAX_ODDS_AGE_SECS: i64 = 20;
 /// === RISK MANAGEMENT ===
 /// Daily settled-loss limit HARD ceiling — min(this, tier_daily_cap) is effective limit
-const DAILY_LOSS_LIMIT_USD: f64 = 20.0;
+const DAILY_LOSS_LIMIT_USD: f64 = 30.0;
 /// When daily loss cap is hit, resend reminder to Telegram every N seconds
 const DAILY_LOSS_REMINDER_SECS: i64 = 900;
 /// === AUTO-CLAIM CONFIG ===
@@ -2610,6 +2610,11 @@ async fn main() -> Result<()> {
         }
     }
 
+    // === MUTE MANUAL ALERTS (toggle via /nabidka and /nabidkaup) ===
+    // When true, only auto-bet confirmations + portfolio + claim messages are sent.
+    // Manual "opportunity" alerts (score-edge MEDIUM, odds anomaly manual) are suppressed.
+    let mut mute_manual_alerts = false;
+
     // === WATCHDOG: SAFE MODE ===
     let mut safe_mode = false;
     let mut last_good_data = std::time::Instant::now();
@@ -3428,7 +3433,7 @@ async fn main() -> Result<()> {
                                         }
                                         break; // exit retry loop (success, parse error, or executor offline)
                                         } // end retry loop
-                                    } else {
+                                    } else if !mute_manual_alerts {
                                         // Manual alert (MEDIUM confidence or auto-bet disabled)
                                         let msg = format_score_edge_alert(edge, aid);
                                         match tg_send_message(&client, &token, chat_id, &msg).await {
@@ -3440,6 +3445,9 @@ async fn main() -> Result<()> {
                                                 error!("Failed to send score edge alert: {}", e);
                                             }
                                         }
+                                    } else {
+                                        info!("🔇 MUTED manual score-edge alert #{}: {} edge={:.1}%",
+                                            aid, edge.match_key, edge.edge_pct);
                                     }
 
                                     if score_alert_sent {
@@ -3523,12 +3531,57 @@ async fn main() -> Result<()> {
                                             anomaly.match_key, anomaly.azuro_w1, anomaly.azuro_w2);
                                     }
 
+                                    // === SPORT-SPECIFIC ANOMALY GUARD ===
+                                    // Score-edge path has sport_auto_bet_guard + model validation;
+                                    // anomaly path is purely odds-comparison → needs stricter sport rules.
+                                    let anomaly_sport_allowed = match anomaly_sport {
+                                        // Basketball: DISABLED for anomaly path. NBA/basket odds on Azuro
+                                        // are too noisy/stale — nearly all "anomalies" are false signals.
+                                        // Score-edge path (with point-diff model) is the only valid path.
+                                        "basketball" => {
+                                            info!("🏀 ANOMALY SPORT GUARD: {} — basketball disabled for anomaly auto-bet (score-edge only)",
+                                                anomaly.match_key);
+                                            false
+                                        }
+                                        // Tennis: only auto-bet via anomaly when there's a SET LEAD (≥1 set diff).
+                                        // At match start (0-0) or equal sets (1-1), odds discrepancy is noise,
+                                        // not a real signal. Prevents betting on every new tennis match.
+                                        "tennis" => {
+                                            let tennis_ok = if let Some(ref score) = anomaly.live_score {
+                                                let parts: Vec<&str> = score.split('-').collect();
+                                                if parts.len() == 2 {
+                                                    if let (Ok(s1), Ok(s2)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
+                                                        (s1 - s2).abs() >= 1 // require ≥1 set difference
+                                                    } else { false }
+                                                } else { false }
+                                            } else {
+                                                false // no live score → cannot validate → skip
+                                            };
+                                            if !tennis_ok {
+                                                info!("🎾 ANOMALY SPORT GUARD: {} score={:?} — tennis needs ≥1 set lead for anomaly auto-bet",
+                                                    anomaly.match_key, anomaly.live_score);
+                                            }
+                                            tennis_ok
+                                        }
+                                        _ => true,
+                                    };
+
+                                    // Check daily NET LOSS limit for anomaly path too
+                                    let anomaly_within_daily_limit = {
+                                        let net = (daily_wagered - daily_returned).max(0.0);
+                                        let (_, _, _, dl_frac, _) = get_exposure_caps(current_bankroll);
+                                        net < DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac)
+                                    };
+
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
+                                        && anomaly.confidence == "HIGH" // BUG FIX: was missing! MEDIUM anomalies were auto-bet
                                         && anomaly_odds_ok
-                                        && azuro_odds >= AUTO_BET_MIN_ODDS // BUG FIX: was missing! (1.07 got through)
-                                        && !azuro_odds_identical // BUG FIX: block identical Azuro odds (1.84/1.84)
+                                        && anomaly_sport_allowed // sport-specific anomaly guard
+                                        && anomaly_within_daily_limit // BUG FIX: anomaly path was missing explicit daily limit check
+                                        && azuro_odds >= AUTO_BET_MIN_ODDS
+                                        && !azuro_odds_identical
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
                                         && anomaly.condition_id.is_some()
@@ -3547,8 +3600,9 @@ async fn main() -> Result<()> {
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
+                                        let conf_emoji = if anomaly.confidence == "HIGH" { "🟢" } else { "🟡" };
                                         let pre_msg = format!(
-                                            "🤖 <b>#{} AUTO-BET ODDS ANOMALY</b> 🟢 HIGH\n\
+                                            "🤖 <b>#{} AUTO-BET ODDS ANOMALY</b> {} {}\n\
                                              \n\
                                              <b>{}</b> vs <b>{}</b>\n\
                                              🎯 Value side: <b>{}</b> @ <b>{:.2}</b>\n\
@@ -3557,6 +3611,8 @@ async fn main() -> Result<()> {
                                              \n\
                                              ⏳ Automaticky sázím...",
                                             aid,
+                                            conf_emoji,
+                                            anomaly.confidence,
                                             anomaly.team1,
                                             anomaly.team2,
                                             value_team,
@@ -3750,7 +3806,7 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         } // end loop
-                                    } else {
+                                    } else if !mute_manual_alerts {
                                         let msg = format_anomaly_alert(&anomaly, aid);
                                         match tg_send_message(&client, &token, chat_id, &msg).await {
                                             Ok(msg_id) => {
@@ -3761,6 +3817,9 @@ async fn main() -> Result<()> {
                                                 error!("Failed to send alert: {}", e);
                                             }
                                         }
+                                    } else {
+                                        info!("🔇 MUTED manual anomaly alert #{}: {} disc={:.1}%",
+                                            aid, anomaly.match_key, anomaly.discrepancy_pct);
                                     }
 
                                     if anomaly_alert_sent {
@@ -4406,7 +4465,14 @@ async fn main() -> Result<()> {
                                     let payout = cr.get("totalPayoutUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                     let new_bal = cr.get("newBalanceUsd").and_then(|v| v.as_str()).unwrap_or("?");
                                     total_returned += payout;
-                                    info!("💰 Safety-net auto-claim: {} bets, ${:.2}", claimed, payout);
+                                    // BUG FIX: Update DAILY returned for safety-net claims (main loop) too
+                                    daily_returned += payout;
+                                    {
+                                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                                        let _ = std::fs::write("data/daily_pnl.json",
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned}).to_string());
+                                    }
+                                    info!("💰 Safety-net auto-claim: {} bets, ${:.2} (daily_returned now ${:.2})", claimed, payout, daily_returned);
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         &format!("💰 <b>AUTO-CLAIM (safety net)</b>\n\nVyplaceno {} sázek, ${:.2}\n💰 Nový zůstatek: {} USDT",
                                             claimed, payout, new_bal)
@@ -4790,6 +4856,51 @@ async fn main() -> Result<()> {
                                         }
                                     }
 
+                                } else if text == "/nabidka" {
+                                    mute_manual_alerts = true;
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        "🔇 <b>Manuální nabídky VYPNUTY</b>\n\n\
+                                         Anomaly + score-edge alerty pro manuální sázení nebudou chodit.\n\
+                                         Auto-bety, portfolio, claimy a status běží normálně.\n\n\
+                                         Pro zapnutí pošli: /nabidkaup"
+                                    ).await;
+
+                                } else if text == "/nabidkaup" {
+                                    mute_manual_alerts = false;
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        "🔔 <b>Manuální nabídky ZAPNUTY</b>\n\n\
+                                         Anomaly + score-edge alerty opět chodí.\n\
+                                         Pokud chceš vypnout: /nabidka"
+                                    ).await;
+
+                                } else if text == "/reset_daily" || text == "/resetdaily" {
+                                    let old_w = daily_wagered;
+                                    let old_r = daily_returned;
+                                    let old_net = (old_w - old_r).max(0.0);
+                                    daily_wagered = 0.0;
+                                    daily_returned = 0.0;
+                                    daily_loss_alert_sent = false;
+                                    daily_loss_last_reminder = None;
+                                    {
+                                        let today = Utc::now().format("%Y-%m-%d").to_string();
+                                        let _ = std::fs::write("data/daily_pnl.json",
+                                            serde_json::json!({"date": today, "wagered": 0.0, "returned": 0.0}).to_string());
+                                    }
+                                    let _ = tg_send_message(&client, &token, chat_id,
+                                        &format!(
+                                            "🔄 <b>DAILY P&L RESET</b>\n\n\
+                                             Předchozí: wagered ${:.2} / returned ${:.2} (net loss ${:.2})\n\
+                                             Nový stav: wagered $0.00 / returned $0.00\n\n\
+                                             ✅ Daily loss limit odemčen, auto-bety jedou dál.",
+                                            old_w, old_r, old_net
+                                        )
+                                    ).await;
+                                    info!("🔄 /reset_daily: wagered {:.2}->{:.2}, returned {:.2}->{:.2}", old_w, 0.0, old_r, 0.0);
+                                    ledger_write("DAILY_RESET", &serde_json::json!({
+                                        "old_wagered": old_w, "old_returned": old_r,
+                                        "old_net_loss": old_net, "trigger": "manual_command"
+                                    }));
+
                                 } else if text == "/help" {
                                     let lim_h = "∞".to_string();
                                     let _ = tg_send_message(&client, &token, chat_id,
@@ -4801,6 +4912,9 @@ async fn main() -> Result<()> {
                                          /portfolio — wallet + P/L + report\n\
                                          /bets — sázky ze subgraphu (live) + lokální\n\
                                          /odds — aktuální odds anomálie\n\
+                                         /nabidka — vypnout manuální alerty (tichý mód)\n\
+                                         /nabidkaup — zapnout manuální alerty\n\
+                                         /reset_daily — reset daily loss limitu\n\
                                          /claim — manuální auto-claim výher\n\
                                          /help — tato zpráva\n\n\
                                          <b>Na alert odpověz:</b>\n\
