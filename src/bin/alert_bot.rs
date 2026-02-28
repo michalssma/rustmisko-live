@@ -4082,6 +4082,7 @@ async fn main() -> Result<()> {
                 let mut bets_to_remove: Vec<String> = Vec::new();
                 let mut tokens_to_claim: Vec<String> = Vec::new();
                 let mut claim_details: Vec<(u32, String, String, String, f64, f64, String)> = Vec::new(); // (alert_id, team1, team2, value_team, amount, odds, result)
+                let mut needs_pending_rewrite = false;
 
                 for bet in &mut active_bets {
                     // Skip already settled
@@ -4231,17 +4232,9 @@ async fn main() -> Result<()> {
                             }));
                         if let Some(tid) = discovered_tid {
                             bet.token_id = Some(tid.clone());
-                            // Update pending_claims file with real tokenId
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true)
-                                .open(pending_claims_path) {
-                                use std::io::Write;
-                                let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}",
-                                    tid, bet.bet_id, bet.match_key,
-                                    bet.value_team, bet.amount_usd, bet.odds,
-                                    Utc::now().to_rfc3339());
-                            }
                             info!("🔍 Discovered tokenId {} for bet {}", tid, bet.bet_id);
+                            // Flag: rewrite pending_claims after this loop ends
+                            needs_pending_rewrite = true;
                         }
                     }
 
@@ -4430,18 +4423,18 @@ async fn main() -> Result<()> {
                                         ));
                                     }
 
-                                    let pnl = total_returned - total_wagered;
-                                    let pnl_sign = if pnl >= 0.0 { "+" } else { "" };
+                                    let daily_pnl_claim = daily_returned - daily_wagered;
+                                    let pnl_sign = if daily_pnl_claim >= 0.0 { "+" } else { "" };
 
                                     msg.push_str(&format!(
                                         "\n💵 Vyplaceno: <b>${:.2}</b>\n\
                                          📤 TX: <code>{}</code>\n\
                                          💰 <b>Nový zůstatek: {} USDT</b>\n\n\
-                                         📊 Session P/L: <b>{}{:.2} USDT</b>\n\
+                                         📊 Daily P/L: <b>{}{:.2} USDT</b>\n\
                                          (vsazeno: ${:.2}, vráceno: ${:.2})",
                                         total_payout, tx, new_balance,
-                                        pnl_sign, pnl,
-                                        total_wagered, total_returned
+                                        pnl_sign, daily_pnl_claim,
+                                        daily_wagered, daily_returned
                                     ));
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;
@@ -4478,8 +4471,8 @@ async fn main() -> Result<()> {
                 // Remove settled bets from active list
                 active_bets.retain(|b| !bets_to_remove.contains(&b.bet_id));
 
-                // Rewrite pending_claims file with remaining active bets only
-                if !bets_to_remove.is_empty() {
+                // Rewrite pending_claims file when bets removed OR tokenIds discovered
+                if !bets_to_remove.is_empty() || needs_pending_rewrite {
                     if let Ok(mut f) = std::fs::OpenOptions::new()
                         .create(true).write(true).truncate(true)
                         .open(pending_claims_path) {
@@ -4609,9 +4602,10 @@ async fn main() -> Result<()> {
 
                 // Local tracked active bets
                 if active_bets.is_empty() {
-                    msg.push_str("🎰 Lokálně sledovaných sázek: 0\n");
+                    msg.push_str("🎰 Pending sázek: 0\n");
                 } else {
-                    msg.push_str(&format!("🎰 Lokálně sledovaných: <b>{}</b>\n", active_bets.len()));
+                    let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
+                    msg.push_str(&format!("🎰 Pending sázek: <b>{}</b> (ve hře: ${:.2})\n", active_bets.len(), total_at_risk));
                     for b in &active_bets {
                         msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
                     }
@@ -5021,7 +5015,7 @@ async fn main() -> Result<()> {
 
                                     // Local tracked
                                     if !active_bets.is_empty() {
-                                        msg.push_str(&format!("\n🎰 <b>Lokálně sledované ({})</b>\n", active_bets.len()));
+                                        msg.push_str(&format!("\n🎰 <b>Pending sázky ({})</b>\n", active_bets.len()));
                                         let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
                                         for b in &active_bets {
                                             msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
