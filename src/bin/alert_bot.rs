@@ -4617,13 +4617,14 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Session P&L
-                let pnl = total_returned - total_wagered;
-                let (pnl_sign, pnl_emoji) = if pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
-                msg.push_str(&format!("\n{} Session P/L: <b>{}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, pnl));
-                msg.push_str(&format!("   Vsazeno: ${:.2} | Vráceno: ${:.2}\n", total_wagered, total_returned));
-                let limit_display = "∞".to_string();
-                msg.push_str(&format!("   Auto-bets dnes: {}/{}\n", auto_bet_count, limit_display));
+                // Daily P&L (persisted across restarts)
+                let daily_pnl = daily_returned - daily_wagered;
+                let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
+                msg.push_str(&format!("\n{} Daily P/L: <b>{}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
+                msg.push_str(&format!("   Vsazeno: ${:.2} | Vráceno: ${:.2}\n", daily_wagered, daily_returned));
+                let daily_loss = daily_wagered - daily_returned;
+                msg.push_str(&format!("   Loss limit: ${:.2} / ${:.0}\n", if daily_loss > 0.0 { daily_loss } else { 0.0 }, DAILY_LOSS_LIMIT_USD));
+                msg.push_str(&format!("   Auto-bets dnes: {}\n", auto_bet_count));
 
                 // Feed-hub live info
                 match client.get(format!("{}/state", feed_hub_url)).send().await {
@@ -5030,12 +5031,13 @@ async fn main() -> Result<()> {
                                         msg.push_str("\n🎰 Žádné lokálně sledované sázky\n");
                                     }
 
-                                    let pnl = total_returned - total_wagered;
-                                    let (pnl_sign, pnl_emoji) = if pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
-                                    msg.push_str(&format!("\n{} <b>Session P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, pnl));
-                                    msg.push_str(&format!("Vsazeno: ${:.2} | Vráceno: ${:.2}\n", total_wagered, total_returned));
-                                    let lim = "∞".to_string();
-                                    msg.push_str(&format!("Auto-bets dnes: {}/{}\n", auto_bet_count, lim));
+                                    let daily_pnl = daily_returned - daily_wagered;
+                                    let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
+                                    msg.push_str(&format!("\n{} <b>Daily P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
+                                    msg.push_str(&format!("Vsazeno: ${:.2} | Vráceno: ${:.2}\n", daily_wagered, daily_returned));
+                                    let daily_loss = daily_wagered - daily_returned;
+                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.0}\n", if daily_loss > 0.0 { daily_loss } else { 0.0 }, DAILY_LOSS_LIMIT_USD));
+                                    msg.push_str(&format!("Auto-bets dnes: {}\n", auto_bet_count));
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;
 

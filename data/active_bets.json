@@ -267,7 +267,7 @@
     "team": "Deep Cross Gaming",
     "placedAt": "2026-02-28T06:08:11.421Z",
     "status": "pending",
-    "state": "Sent"
+    "state": "Accepted"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772259635356",
@@ -281,6 +281,21 @@
     "matchKey": "",
     "team": "Sydney Olympic",
     "placedAt": "2026-02-28T06:20:35.735Z",
+    "status": "pending",
+    "state": "Accepted"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772260735870",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000813782930000000000001713354605",
+    "outcomeId": "23",
+    "stake": 2,
+    "odds": 1.5326,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Lambton Jaffas",
+    "placedAt": "2026-02-28T06:38:56.111Z",
     "status": "pending"
   }
 ]
