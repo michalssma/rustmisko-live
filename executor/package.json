@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js"
+    "dev": "node --watch index.js",
+    "paper": "node overtime_paper.mjs",
+    "paper:watch": "node --watch overtime_paper.mjs"
   },
   "dependencies": {
     "@azuro-org/toolkit": "^5",

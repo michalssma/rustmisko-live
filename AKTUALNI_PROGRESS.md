@@ -1,105 +1,102 @@
 # AKTUALNI_PROGRESS
 
-Aktualizováno: **2026-02-27 13:15**
+Aktualizováno: **2026-02-28 04:15**
 Repo: `C:\RustMiskoLive`
 
 ## Source of truth (teď)
 
 Tento soubor je jediný „live" přehled stavu. Ostatní strategické `.md` ber jako plán/historii.
 
-## Runtime stav (ověřeno 13:15)
+## Runtime stav (ověřeno 04:15)
 
-- Executor: **ONLINE** — $75.51 USDT
-- Feed-hub: **ONLINE** (PID aktivní)
-- Alert-bot: **ONLINE** — chat_id=6458129071, 0 pending claims (čisté), dedup 54 betů
-- **USDT balance: $75.51**
-- AzuroBet NFTs: **67 celkem** (viz detail níže)
+- Executor: **ONLINE** — port 3030
+- Feed-hub: **ONLINE** (PID 436, port 8081/8080)
+- Alert-bot: **ONLINE** — PID 43936, s novými safety guardy
+- **USDT balance: $51.95**
+- **MATIC balance: 20.10**
+- AzuroBet NFTs: **92 celkem** (viz detail níže)
+- Fortuna scraper: **v3.2** (draw filter, adaptive polling, fast scroll)
+- Data kvalita: **92.5%** correct Fortuna odds (49/53)
+- Cross-book overlap: 8 Fortuna×Azuro matchů
 
-## Kompletní NFT audit (2026-02-27)
+## Kompletní NFT audit (2026-02-28)
 
 ### Forenzní analýza — ON-CHAIN VERIFIED
 
 | Kategorie | Počet | Detail |
 |-----------|-------|--------|
-| **WON (isPaid=true)** | 35 | isOutcomeWinning=true, relayer vyplatil $155.28 |
-| **LOST** | 23 | Prohrané, $52.47 wagered |
-| **CANCELED (isPaid=true)** | 9 | Refundováno $20.79 relayerem |
-| **TRULY PENDING** | 0 | Žádný bet nevisí! |
+| **WON** | 39 | Vyplaceno |
+| **LOST** | 30 | Prohrané |
+| **CANCELED** | 12 | Refundováno |
+| **PENDING** | ~59 | Čekají na settlement |
+| **Celkem** | 92 | |
 
 ### Finanční rekoncialiace
 
 ```
-Total wagered:     $156.42
-Total returned:    $176.07 (won payouts + cancel refunds)
-Net P&L:           +$19.65
-Implied deposit:   $55.86
-Current balance:   $75.51 ← matches! ($55.86 + $19.65)
+Total wagered:     ~$205.30
+Total returned:    ~$198.21 (won payouts + cancel refunds)
+Net P&L:           -$7.09 (ROI -3.45%)
+Current balance:   $51.95 USDT
+Bets in history:   81
+Auto-claim:        funkční, $4.39 právě vyzvednuté
 ```
 
 ### Klíčový objev: Azuro relayer
 
-- **VŠECHNY bety byly automaticky vyplaceny Azuro relayerem** (`0x8dA05c00...`)
+- **VŠECHNY bety jsou automaticky vyplaceny Azuro relayerem** (`0x8dA05c00...`)
 - Relayer volá `Core.resolvePayout(tokenId)` → nastaví `isPaid=true` → pošle USDT
-- **Žádné "ztracené" tokeny!** Vše isPaid=true = vše vyplaceno
-- Detaily viz `CONTEXT.md` → "Azuro claim flow"
+- Auto-claim v alert-bot volá `/auto-claim` na executor každých ~5 minut jako safety net
 
-## Opravy provedené 2026-02-27
+## Opravy provedené 2026-02-28
 
-### 1. NFT Real-Data Performance Model (`executor/nft_model.mjs`)
+### 1. CRITICAL: Identické Azuro odds guard
+- **Bug:** Azuro basketball odds ALL 1.84/1.84 (oracle nerozlišuje týmy)
+- **Dopad:** 12 betů za falešných 1.84 odds (4× Detroit, CA Union, Boston Celtics, Dallas Mavericks...)
+- **Fix:** `penalty += 6` pokud `(odds_team1 - odds_team2).abs() < 0.02` → confidence "LOW" → skip
+- **Fix 2:** Anomaly path: přidán `!azuro_odds_identical` check + chybějící `MIN_ODDS` check
 
-- On-chain agregace všech 67 NFT → `data/nft_model.json`
-- **Výsledky (REAL DATA):**
+### 2. Anomaly path MIN_ODDS bug
+- **Bug:** Anomaly auto-bet path nekontroloval `AUTO_BET_MIN_ODDS` → Team Aether prošel za 1.07
+- **Fix:** Přidán `azuro_odds >= AUTO_BET_MIN_ODDS` do anomaly conditions
 
-| Sport | n | ROI | Verdikt |
-|---|---|---|---|
-| esports | 8 | **+33.5%** | ✅ TOPKA |
-| cs2 | 13 | **+19.3%** | ✅ TOPKA |
-| football | 9 | +13.3% | ✅ OK |
-| basketball | 13 | -9.5% | ⚠️ data-collection |
-| tennis | 5 | -35.6% | ⚠️ data-collection |
+### 3. Fortuna scraper v3.0 → v3.2
+- **Draw filter:** rawOdds → post-process filtruje remíza/draw/X/tie → 92.5% kvalita (z ~40%)
+- **Concatenated text fix:** regex split "TeamName1.42" → label + value
+- **Smart odds selection:** team-name matching when >2 odds
+- **Adaptive polling:** 2200ms live / 3400ms idle / +700ms inflight
+- **Fast scroll:** 2200ms burst, 1.25vh steps, instant behavior
+- **Performance hotfix:** DOM count cached 10s, cap check throttled 15s, max 600 links
+- **table-tennis normalization:** `stolni-tenis` URL pattern
 
-| Odds bucket | ROI | Verdikt |
-|---|---|---|
-| 2.0–3.0 | **+29.6%** | ✅ nejlepší |
-| 1.5–2.0 | **+18.9%** | ✅ dobrý |
-| <1.5 | -14.9% | ❌ skip |
-| >=3.0 | -45.4% | ❌ skip |
+### 4. Auto-claim executed
+- 4 WON bety nebyly claimnuté → triggnut `/auto-claim` → 2 claimed ($4.39), 2 ještě pending settlement
+- Balance: $47.56 → $51.95
 
-- Celkový ROI: **+12.56%** (net +$19.65 / $156.42 wsazeno, 67 betů)
+### 5. Project cleanup
+- Smazán `nul` file (2.55 GB!), ~30 temp/error/debug souborů
+- Crate error files, stale audit artifacts vyčištěny
 
-### 2. Stake caps — data-collection mode (`src/bin/alert_bot.rs`)
+### 6. Triple exposure fix (z dřívější session)
+- `base_already_bet` guard na obou pathech (score-edge + anomaly)
+- Fluxo vs Oddik triple $9 loss se už nezopakuje
 
-- Tennis + basketball: **max $1/bet** (`AUTO_BET_STAKE_LOW_USD = 1.0`) — sbíráme data, nelít plný stake
-- CS2 / esports / football: $3/bet beze změny
+## Audit posledních 10 betů (2026-02-28)
 
-### 3. BUGFIX: Odds cap v anomaly auto-bet pathu
+| # | Team | Odds | Výsledek | Hodnocení |
+|---|------|------|----------|-----------|
+| 72 | Fluxo (map2) | 2.76 | LOST | ⚠️ High odds |
+| 73 | Fluxo (map3) | 2.49 | LOST | ⚠️ Triple exposure |
+| 74 | Detroit Pistons | 1.84 | PENDING | ❌ BOGUS Azuro odds |
+| 75 | CA Union | 1.84 | WON | ❌ BOGUS (lucky win) |
+| 76 | Uruguay | 1.73 | PENDING | ✅ Legit |
+| 77 | Mibr | 1.70 | PENDING | ✅ Legit |
+| 78 | Comunicaciones | 1.35 | PENDING | ✅ Legit |
+| 79 | Boston Celtics | 1.84 | PENDING | ❌ BOGUS Azuro odds |
+| 80 | Team Aether | 1.07 | CANCELED | ❌ TOO LOW odds |
+| 81 | Dallas Mavericks | 1.84 | PENDING | ❌ BOGUS Azuro odds |
 
-- **Bug:** odds anomaly path nekontroloval `AUTO_BET_MAX_ODDS` → proto prošel `mouz NXT @ 3.41` (bucket >=3.0, ROI -45.4%)
-- **Fix:** nová konstanta `AUTO_BET_MAX_ODDS_CS2_MAP = 3.00` pro CS2 `map_winner`, jinak hard cap **2.00**
-- Ověřeno buildem `alert-bot` release (6.0MB, 0 errors)
-
-### 4. Pending claims cleanup
-
-- `data/pending_claims.txt` obsahoval 14 zombie záznamů (bety isPaid=true, relayer vyplatil)
-- Vyčištěno ručně + ověřen auto-cleanup mechanismus: claim tick rewrituje soubor s `truncate(true)` jen na nerozhodnuté bety
-
-### 5. Safety fixes (alert_bot.rs) — dřívější session
-
-- **Permanent ledger** (`data/ledger.jsonl`): 12 write pointů (PLACED, REJECTED, WON, LOST, CANCELED, CLAIMED, SAFETY_CLAIM)
-- **NET daily loss**: `(daily_wagered - daily_returned).max(0.0)` — `daily_wagered +=` jen na confirmed LOST settlement
-- Release binary zkompilován (0 errors)
-
-### 6. Executor safety (index.js)
-
-- **Safe auto-prune**: Lost/Rejected → okamžitý prune; Won/Canceled → jen po viewPayout==0 ověření
-- `/prune-settled` endpoint přidán
-
-### 7. NFT investigace
-
-- Forenzní audit všech 67 NFTs přes on-chain data
-- Potvrzeno: 35 WON + 9 CANCELED + 23 LOST = 67 total, 0 pending
-- Claimnuli jsme $3.267 (TID=221572) ručně — to byl jediný NFT kde relayer ještě nezavolal
-- Matematická rekoncialiace balance: $75.51 ± $0.35 přesnost
+**Verdikt:** 4/10 betů = bogus 1.84 data, 1 = too low → **FIX NASAZEN** (identické odds guard + min odds check)
 
 ## Slepé uličky (neopakovat!)
 
@@ -110,6 +107,7 @@ Current balance:   $75.51 ← matches! ($55.86 + $19.65)
 5. RPC getLogs indexed topics — public nodes odmítají
 6. LP.viewPayout pro settled bety — reverts (isPaid=true)
 7. Ruční ABI psaní — VŽDY používat `@azuro-org/toolkit` (coreAbi, lpAbi)
+8. **`nul` file v root** — Windows redirect to NUL device creates 2.55 GB file!
 
 ## Git stav
 

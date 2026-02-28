@@ -42,10 +42,10 @@ const CHAIN_ID = parseInt(process.env.CHAIN_ID || "137");
 const RPC_URL = process.env.RPC_URL || "https://polygon-bor-rpc.publicnode.com";
 
 // Multiple RPC endpoints for reliability (fallback chain)
+// NOTE: Ankr + polygon-rpc.com removed — require API keys since ~Feb 2026
 const RPC_URLS = [
   RPC_URL,
-  "https://polygon-rpc.com",
-  "https://rpc.ankr.com/polygon",
+  "https://1rpc.io/matic",
   "https://polygon.drpc.org",
 ];
 

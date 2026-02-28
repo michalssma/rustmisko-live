@@ -86,6 +86,65 @@ Nový agent: přečti CONTEXT.md → pak tento soubor → pak kóduj.
 
 ---
 
+## 2026-02-25 — NFT Data-Driven Stake Model
+
+**Rozhodnutí:** Sport-specific stake caps založené na reálném ROI z 67 NFTs.
+**Data:** esports +33.5%, cs2 +19.3%, football +13.3%, basketball -9.5%, tennis -35.6%.
+**Implementace:** Tennis + basketball: max $1/bet (data-collection). CS2/esports/football: $3/bet.
+
+---
+
+## 2026-02-25 — Odds bucket caps
+
+**Rozhodnutí:** Odds 1.5–3.0 = sweet spot. <1.5 a >=3.0 mají negativní ROI.
+**Implementace:** `AUTO_BET_MIN_ODDS=1.15`, `AUTO_BET_MAX_ODDS=2.00`, CS2 map_winner exception `3.00`.
+
+---
+
+## 2026-02-26 — Fortuna scraper v3.0
+
+**Rozhodnutí:** Kompletní rewrite Fortuna scraperu — auto-refresh, stale detection, DOM cap.
+**Proč:** v2 padal po ~10 min, missing sports, no error recovery.
+
+---
+
+## 2026-02-27 — Opus peer review (12 items)
+
+**Rozhodnutí:** Implementovat všech 12 feedback items z Opus code review.
+**Klíčové:** Triple exposure fix, basketball guard, esports map-level guard, exposure caps.
+
+---
+
+## 2026-02-27 — 3-way AI debate (Opus/Gemini/GPT)
+
+**Rozhodnutí:** Strategický audit od 3 AI modelů → 5 upgrade priorit.
+**Výsledek:** Score-edge detection, cross-book comparison, exposure management → all implemented.
+
+---
+
+## 2026-02-28 — CRITICAL: Identické Azuro odds guard
+
+**Rozhodnutí:** HARD BLOCK na bety kde Azuro odds team1 ≈ team2 (diff < 0.02).
+**Proč:** 12 basketball betů za falešných 1.84 (Azuro oracle nerozlišuje týmy).
+**Implementace:** `penalty += 6` (→ LOW confidence → skip) + anomaly path `!azuro_odds_identical`.
+
+---
+
+## 2026-02-28 — Anomaly path MIN_ODDS fix
+
+**Rozhodnutí:** Přidat `azuro_odds >= AUTO_BET_MIN_ODDS` do anomaly auto-bet podmínek.
+**Proč:** Team Aether prošel za 1.07 (pod 1.15 min) — score-edge path měl guard, anomaly ne.
+
+---
+
+## 2026-02-28 — Fortuna draw filter (v3.2)
+
+**Rozhodnutí:** Post-process rawOdds: filtrovat remíza/draw/X/tie + smart team matching.
+**Proč:** ~60% Fortuna odds byly SAME (draw odds posílané jako team odds).
+**Výsledek:** Kvalita 92.5% (z ~40%).
+
+---
+
 ## Pravidla
 
 1. **Jazyk:** VŽDY česky.

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fortuna Live Scraper → Feed Hub
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Scrape live odds/scores from ifortuna.cz live page and POST to feed-hub
+// @version      3.0
+// @description  Scrape live odds/scores from ifortuna.cz live page and POST to feed-hub (crash-proof)
 // @author       MiskoLive
 // @match        https://www.ifortuna.cz/sazeni?filter=live*
 // @match        https://www.ifortuna.cz/sazeni/*filter=live*
@@ -19,12 +19,31 @@
 
     // === CONFIG ===
     const FEED_HUB_URL = 'http://127.0.0.1:8081/fortuna';
-    const POLL_INTERVAL_MS = 1800;
+    const POLL_INTERVAL_MS = 2200; // FAST base for live mode
     const SEND_TIMEOUT_MS = 3500;
     const FULL_SYNC_EVERY_MS = 45000;
-    const DEBUG = true;
+    const DEBUG = false; // HOTFIX: avoid console/memory spam in long runs
+    const MAX_MATCH_WINNER_ODDS = 80; // odds > 80 are almost certainly noise
+    const DOM_COUNT_SAMPLE_MS = 10000; // HOTFIX: don't count DOM every second
+    const DOM_CAP_CHECK_MS = 15000; // HOTFIX: throttle expensive cap check
+    const MAX_LINKS_PER_SCAN = 600; // HOTFIX: cap per-tick DOM traversal
+    const IDLE_POLL_INTERVAL_MS = 3400; // when no matches found
+    const INFLIGHT_PENALTY_MS = 700; // when previous send still in flight
+
+    // === AUTO-REFRESH CONFIG (crash-proof) ===
+    // Fortuna SPA DOM bloats over time → RESULT_CODE_HUNG crash
+    // Periodic reload prevents DOM bloat and keeps data fresh
+    const AUTO_REFRESH_MS = 150 * 1000;       // 2.5 minutes — full page reload
+    const STALE_DETECT_MS = 45 * 1000;        // 45s — if same data, refresh early
+    const ZERO_MATCHES_REFRESH_MS = 25 * 1000; // 25s — if no matches found, refresh
+    const DOM_ELEMENT_CAP = 8000;              // if DOM exceeds this, force refresh
+    const SCROLL_BURST_COUNT = 2;              // fast burst: 2 jumps each cycle
+    const SCROLL_BURST_INTERVAL_MS = 2200;     // burst every ~2.2s (LIVE fast mode)
+    const SCROLL_STEP_RATIO = 1.25;            // jump 125% of viewport per step
+    const SCROLL_RESET_DELAY_MS = 120;         // short pause before top reset
 
     // === STATE ===
+    let refreshPending = false; // guard: stop processing after doPageRefresh
     let connected = false;
     let sentCount = 0;
     let lastMatchCount = 0;
@@ -39,6 +58,18 @@
     let backoffMs = 0;
     let lastFullSyncAt = 0;
     const lastFingerprintByKey = new Map();
+
+    // === AUTO-REFRESH STATE ===
+    let refreshTimer = null;
+    let refreshAt = 0;
+    let lastScanHash = '';
+    let staleStartedAt = 0;
+    let zeroMatchesSince = 0;
+    let lastScrollBurstAt = 0;
+    let scrollBurstStep = 0;
+    let cachedDomCount = 0;
+    let lastDomCountAt = 0;
+    let lastDomCapCheckAt = 0;
 
     function log(...args) {
         if (DEBUG) console.log('[FORTUNA]', ...args);
@@ -60,7 +91,7 @@
         `;
         panel.innerHTML = `
             <div style="font-weight:bold; margin-bottom:6px; font-size:13px; color:#f80;">
-                🏢 Fortuna → Feed Hub v2
+                🏢 Fortuna → Feed Hub v3
             </div>
             <div id="ft-status">⏳ Initializing...</div>
             <div id="ft-sport" style="color:#aaa;">Sport: –</div>
@@ -140,7 +171,7 @@
         el('ft-matches').textContent = `Matches: ${lastMatchCount}`;
         el('ft-sent').textContent = `Sent: ${sentCount}`;
         el('ft-last').textContent = `Last scan: ${new Date().toLocaleTimeString()}`;
-        el('ft-refresh').textContent = `🔄 Refresh: ${(getAdaptiveTickDelay()/1000).toFixed(1)}s | Scroll:${autoScrollEnabled ? 'ON' : 'OFF'}`;
+        // Refresh countdown is updated by its own 1s timer (updateRefreshCountdown)
 
         // Recent detail lines
         if (recentLines.length > 0) {
@@ -166,20 +197,148 @@
     }
 
     function getAdaptiveTickDelay() {
-        return Math.min(9000, POLL_INTERVAL_MS + backoffMs);
+        const hasLiveData = lastMatchCount > 0;
+        const base = hasLiveData ? POLL_INTERVAL_MS : IDLE_POLL_INTERVAL_MS;
+        const inflightPenalty = inFlight ? INFLIGHT_PENALTY_MS : 0;
+        return Math.min(9000, base + backoffMs + inflightPenalty);
     }
 
+    function getDomCountCached() {
+        const now = Date.now();
+        if ((now - lastDomCountAt) < DOM_COUNT_SAMPLE_MS && cachedDomCount > 0) {
+            return cachedDomCount;
+        }
+        cachedDomCount = document.querySelectorAll('*').length;
+        lastDomCountAt = now;
+        return cachedDomCount;
+    }
+
+    // ================================================================
+    // AUTO-REFRESH — prevents DOM bloat crash (RESULT_CODE_HUNG)
+    // Pattern proven by HLTV scraper v3.1
+    // ================================================================
+    function doPageRefresh(reason) {
+        if (refreshPending) return; // already refreshing
+        refreshPending = true;
+        log(`🔄 Page refresh (${reason})...`);
+        try {
+            sessionStorage.setItem('ft_refresh_reason', reason);
+            sessionStorage.setItem('ft_refresh_time', Date.now().toString());
+            sessionStorage.setItem('ft_sent_count', sentCount.toString());
+        } catch (e) {}
+        location.reload();
+    }
+
+    function scheduleAutoRefresh() {
+        if (refreshTimer) clearTimeout(refreshTimer);
+        refreshAt = Date.now() + AUTO_REFRESH_MS;
+        refreshTimer = setTimeout(() => doPageRefresh('auto-timer'), AUTO_REFRESH_MS);
+        log(`🔄 Auto-refresh scheduled in ${AUTO_REFRESH_MS / 1000}s`);
+    }
+
+    function updateRefreshCountdown() {
+        const el = document.getElementById('ft-refresh');
+        if (!el) return;
+        const remaining = Math.max(0, Math.round((refreshAt - Date.now()) / 1000));
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        const domCount = getDomCountCached();
+        el.textContent = `🔄 Refresh: ${mins}:${secs.toString().padStart(2, '0')} | DOM:${domCount} | Scroll:${autoScrollEnabled ? 'ON' : 'OFF'}`;
+        if (remaining < 15) el.style.color = '#f00';
+        else if (remaining < 60) el.style.color = '#ff0';
+        else el.style.color = '#8f8';
+    }
+
+    function checkStaleData(matches) {
+        const hash = matches.map(m =>
+            `${m.team1}|${m.team2}|${m.score1}-${m.score2}`
+        ).sort().join(';');
+
+        if (hash === lastScanHash && hash.length > 0) {
+            if (staleStartedAt === 0) {
+                staleStartedAt = Date.now();
+                log('⚠️ Stale data detected, starting timer...');
+            } else if (Date.now() - staleStartedAt > STALE_DETECT_MS) {
+                log('⚠️ Data stale for >45s — refreshing early');
+                doPageRefresh('stale-data');
+                return;
+            }
+        } else {
+            staleStartedAt = 0;
+            lastScanHash = hash;
+        }
+    }
+
+    function checkZeroMatches(matchCount) {
+        if (matchCount === 0) {
+            if (zeroMatchesSince === 0) {
+                zeroMatchesSince = Date.now();
+                log('⚠️ Zero matches found, starting timer...');
+            } else if (Date.now() - zeroMatchesSince > ZERO_MATCHES_REFRESH_MS) {
+                log('⚠️ Zero matches for >25s — refreshing');
+                doPageRefresh('zero-matches');
+                return;
+            }
+        } else {
+            zeroMatchesSince = 0;
+        }
+    }
+
+    function checkDOMCap() {
+        const now = Date.now();
+        if (now - lastDomCapCheckAt < DOM_CAP_CHECK_MS) return;
+        lastDomCapCheckAt = now;
+        const count = getDomCountCached();
+        if (count > DOM_ELEMENT_CAP) {
+            log(`🚨 DOM element count ${count} > cap ${DOM_ELEMENT_CAP} — force refresh`);
+            doPageRefresh('dom-cap-exceeded');
+        }
+    }
+
+    function recoverPostReload() {
+        try {
+            const reason = sessionStorage.getItem('ft_refresh_reason');
+            const time = sessionStorage.getItem('ft_refresh_time');
+            const savedSent = sessionStorage.getItem('ft_sent_count');
+            if (reason && time) {
+                const elapsed = Math.round((Date.now() - parseInt(time)) / 1000);
+                addRecentLine(`🔄 Reloaded (${reason}, ${elapsed}s ago)`);
+                if (savedSent) sentCount = parseInt(savedSent) || 0;
+                sessionStorage.removeItem('ft_refresh_reason');
+                sessionStorage.removeItem('ft_refresh_time');
+                sessionStorage.removeItem('ft_sent_count');
+                log(`Post-reload recovery: reason=${reason}, sentCount=${sentCount}`);
+            }
+        } catch (e) {}
+    }
+
+    // SCROLL BURST: scroll 3 viewports quickly, then stop until next burst
+    // Much less CPU/DOM stress than continuous scrolling every tick
     function autoScrollStep() {
         if (!autoScrollEnabled) return;
-        const before = document.documentElement.scrollHeight;
-        const maxY = Math.max(0, before - window.innerHeight);
-        const targetY = Math.min(window.scrollY + Math.floor(window.innerHeight * 0.8), maxY);
-        window.scrollTo({ top: targetY, behavior: 'smooth' });
+        const now = Date.now();
 
-        // if we are near bottom, jump back to top so next cycles keep page alive
-        const nearBottom = (window.innerHeight + window.scrollY) >= (before - 24);
-        if (nearBottom) {
-            setTimeout(() => window.scrollTo({ top: 0, behavior: 'smooth' }), 800);
+        // Only burst every SCROLL_BURST_INTERVAL_MS
+        if (now - lastScrollBurstAt < SCROLL_BURST_INTERVAL_MS && scrollBurstStep >= SCROLL_BURST_COUNT) return;
+
+        if (now - lastScrollBurstAt >= SCROLL_BURST_INTERVAL_MS) {
+            scrollBurstStep = 0;
+            lastScrollBurstAt = now;
+        }
+
+        if (scrollBurstStep < SCROLL_BURST_COUNT) {
+            const before = document.documentElement.scrollHeight;
+            const maxY = Math.max(0, before - window.innerHeight);
+            const targetY = Math.min(window.scrollY + Math.floor(window.innerHeight * SCROLL_STEP_RATIO), maxY);
+            window.scrollTo({ top: targetY, behavior: 'auto' });
+
+            const nearBottom = (window.innerHeight + window.scrollY) >= (before - 24);
+            if (nearBottom) {
+                setTimeout(() => window.scrollTo({ top: 0, behavior: 'auto' }), SCROLL_RESET_DELAY_MS);
+                scrollBurstStep = SCROLL_BURST_COUNT; // stop burst, we've scrolled to bottom
+            } else {
+                scrollBurstStep++;
+            }
         }
     }
 
@@ -200,6 +359,7 @@
         if (s.includes('tenis') && !s.includes('stoln')) return 'tennis';
         if (s.includes('basketbal')) return 'basketball';
         if (s.includes('hokej') || s.includes('ice hockey')) return 'ice-hockey';
+        if (s.includes('stoln') || s === 'stolni-tenis' || s.includes('table-tenis') || s.includes('table tennis') || s.includes('ping pong')) return 'table-tennis';
         if (s.includes('counter-strike') || s.includes('cs2') || s.includes('cs:go')) return 'cs2';
         if (s.includes('dota')) return 'dota-2';
         if (s.includes('league of legends') || s.includes('lol')) return 'league-of-legends';
@@ -445,9 +605,10 @@
         // === STRATEGY 1: Find match links by href pattern ===
         // Fortuna match URLs: /sazeni/<sport>/<league>/<team1-vs-team2-id>
         const matchLinks = document.querySelectorAll('a[href*="/sazeni/"]');
-        log(`Strategy 1: ${matchLinks.length} links with /sazeni/`);
+        const limitedLinks = Array.from(matchLinks).slice(0, MAX_LINKS_PER_SCAN);
+        log(`Strategy 1: ${matchLinks.length} links with /sazeni/ (processing ${limitedLinks.length})`);
 
-        for (const link of matchLinks) {
+        for (const link of limitedLinks) {
             const href = link.getAttribute('href') || '';
             // Skip navigation/category links (too few path segments)
             const pathParts = href.replace(/^\//, '').split('/');
@@ -719,7 +880,7 @@
         }
 
         // --- Extract Odds ---
-        const odds = [];
+        const rawOdds = [];
 
         // Method A: find button/clickable elements with odds values
         const buttons = el.querySelectorAll('button, [role="button"], [class*="odds"], [class*="Odds"]');
@@ -734,13 +895,23 @@
                 if (v) { value = v; }
                 else if (part.length > 1 && part.length < 40) { label = part; }
             }
+
+            // Concatenated text fix: Fortuna SPA renders "TeamName1.42" as one string
+            // without newlines. Split label from trailing odds value.
+            if (value && !label && btnLines.length === 1) {
+                const cMatch = btnLines[0].match(/^(.+?)(\d+[.,]\d{1,2})\s*$/);
+                if (cMatch && cMatch[1].trim().length >= 1) {
+                    label = cMatch[1].trim();
+                }
+            }
+
             if (value) {
-                odds.push({ market: 'match_winner', label, value });
+                rawOdds.push({ market: 'match_winner', label, value });
             }
         }
 
         // Method B: if no buttons found, scan text for decimal patterns
-        if (odds.length === 0) {
+        if (rawOdds.length === 0) {
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i];
                 // Skip known non-odds patterns
@@ -753,9 +924,54 @@
                         // Look back for label
                         const label = (i > 0 && !parseOddsValue(lines[i-1]) && lines[i-1].length < 40)
                             ? lines[i-1] : '';
-                        odds.push({ market: 'match_winner', label, value: val });
+                        rawOdds.push({ market: 'match_winner', label, value: val });
                     }
                 }
+            }
+        }
+
+        // === POST-PROCESS: filter draw odds, non-match-winner markets, noise ===
+        const odds = [];
+        for (const o of rawOdds) {
+            const lab = (o.label || '').trim();
+            const labLower = lab.toLowerCase();
+            // Skip draw labels (1X2 middle button) — this was causing ~60% wrong odds
+            if (/^(remíza|nerozhodn[ěe]?|draw|x|tie)$/i.test(lab)) {
+                log(`  [odds] SKIP draw: "${lab}" ${o.value}`);
+                continue;
+            }
+            // Skip over/under, handicap, and other non-match-winner labels
+            if (/přes\s+\d|pod\s+\d|handicap|hendikep|skóre|celkem|gól[ůuy]?|počet/i.test(labLower)) continue;
+            // Skip sub-market labels: "Vítěz 2. setu", "Vítěz 1. poloviny"
+            if (/vítěz\s+\d/i.test(labLower)) continue;
+            // Skip noise odds (>80 is almost certainly not a real match_winner)
+            if (o.value > MAX_MATCH_WINNER_ODDS) {
+                log(`  [odds] SKIP noise: "${lab}" ${o.value} (>MAX)`);
+                continue;
+            }
+            odds.push(o);
+        }
+
+        // Smart selection: try to find home/away by team name matching
+        let finalOdds = odds;
+        if (odds.length > 2) {
+            const t1p = team1.toLowerCase().substring(0, Math.min(5, team1.length));
+            const t2p = team2.toLowerCase().substring(0, Math.min(5, team2.length));
+            const home = odds.find(o => {
+                const l = (o.label || '').toLowerCase();
+                return l === '1' || (t1p.length >= 3 && l.includes(t1p));
+            });
+            const away = odds.find(o => {
+                const l = (o.label || '').toLowerCase();
+                return l === '2' || (t2p.length >= 3 && l.includes(t2p));
+            });
+            if (home && away && home !== away) {
+                finalOdds = [home, away];
+                log(`  [odds] Matched by team names: ${home.label}=${home.value}, ${away.label}=${away.value}`);
+            } else {
+                // Fallback: first + last (Fortuna order: home/draw/away → after draw filter: home/away)
+                finalOdds = [odds[0], odds[odds.length - 1]];
+                log(`  [odds] Fallback first+last: ${odds[0].value}, ${odds[odds.length-1].value}`);
             }
         }
 
@@ -767,7 +983,7 @@
             score1,
             score2,
             status,
-            odds,
+            odds: finalOdds,
             _element: el // kept temporarily for sport detection, deleted later
         };
     }
@@ -1012,8 +1228,14 @@
     // MAIN TICK
     // ================================================================
     function tick() {
+        if (refreshPending) return; // page is about to reload, skip processing
         try {
             autoScrollStep();
+
+            // DOM cap check — prevents RESULT_CODE_HUNG crash
+            checkDOMCap();
+            if (refreshPending) return; // checkDOMCap may trigger refresh
+
             const data = scrapeAll();
             lastMatchCount = data.length;
             log(`Scraped: ${data.length} matches`);
@@ -1027,6 +1249,9 @@
             }
 
             if (data.length > 0) {
+                // Stale data detection — refresh if same data for >45s
+                checkStaleData(data);
+                zeroMatchesSince = 0; // reset zero-matches timer
                 const now = Date.now();
                 const isFullSync = (now - lastFullSyncAt) >= FULL_SYNC_EVERY_MS;
                 const delta = [];
@@ -1051,11 +1276,8 @@
                     lastSendStatus = 'no delta';
                 }
             } else {
-                // First time: dump page structure for debugging
-                if (!window._fortunaDumped) {
-                    window._fortunaDumped = true;
-                    dumpPageStructure();
-                }
+                // Zero matches — auto-refresh after 25s
+                checkZeroMatches(0);
                 lastSendStatus = 'no matches found';
                 log('No matches found. Waiting for next tick...');
             }
@@ -1070,13 +1292,25 @@
     // ================================================================
     // INIT
     // ================================================================
-    log('Fortuna Live Scraper v2.0 initialized');
+    log('Fortuna Live Scraper v3.0 initialized (crash-proof)');
     log('Target URL:', FEED_HUB_URL);
     log('Poll interval:', POLL_INTERVAL_MS + 'ms');
+    log('Auto-refresh:', AUTO_REFRESH_MS / 1000 + 's');
+    log('Stale detect:', STALE_DETECT_MS / 1000 + 's');
+    log('DOM cap:', DOM_ELEMENT_CAP);
     log('Starting in 4s (waiting for SPA to render)...');
 
     // Create floating panel immediately
     createPanel();
+
+    // Recover state from previous reload
+    recoverPostReload();
+
+    // Schedule auto-refresh timer (prevents DOM bloat crash)
+    scheduleAutoRefresh();
+
+    // Start countdown display (updates every second)
+    setInterval(updateRefreshCountdown, 1000);
 
     setTimeout(() => {
         tick(); // First run

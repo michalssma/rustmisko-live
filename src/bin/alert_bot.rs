@@ -71,7 +71,7 @@ const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
 /// Ignore stale odds snapshots older than this threshold
 const MAX_ODDS_AGE_SECS: i64 = 20;
 /// === RISK MANAGEMENT ===
-/// Daily settled-loss limit — stop auto-bets after real settled losses reach this value
+/// Daily settled-loss limit HARD ceiling — min(this, tier_daily_cap) is effective limit
 const DAILY_LOSS_LIMIT_USD: f64 = 20.0;
 /// When daily loss cap is hit, resend reminder to Telegram every N seconds
 const DAILY_LOSS_REMINDER_SECS: i64 = 900;
@@ -82,6 +82,8 @@ const PORTFOLIO_REPORT_SECS: u64 = 1800;
 /// === WATCHDOG ===
 /// Seconds without feed-hub data before entering SAFE MODE
 const WATCHDOG_TIMEOUT_SECS: u64 = 120;
+/// === CASHOUT — DISABLED (no EV/fair_value calc yet, margin leak risk) ===
+const FF_CASHOUT_ENABLED: bool = false;
 
 // ====================================================================
 // FEATURE FLAGS — enable upgrades incrementally (Gemini recommendation)
@@ -89,14 +91,20 @@ const WATCHDOG_TIMEOUT_SECS: u64 = 120;
 // ====================================================================
 /// Parse Chance detailed_score for CS2 round-level data
 const FF_CHANCE_ROUND_PARSER: bool = true;
-/// Cross-validate HLTV vs Chance scores (mismatch → skip)
+/// Cross-validate HLTV vs Chance scores (mismatch → skip + resync freeze)
 const FF_CROSS_VALIDATION: bool = true;
-/// Dynamic exposure caps (per-bet, per-condition, per-match)
+/// Dynamic exposure caps (per-bet, per-condition, per-match, inflight)
 const FF_EXPOSURE_CAPS: bool = true;
 /// Allow re-bet on same condition when edge grows (tier upgrade / edge jump)
 const FF_REBET_ENABLED: bool = true;
 /// Cross-map momentum bonus (+3% for dominant previous map)
 const FF_CROSS_MAP_MOMENTUM: bool = true;
+/// Inflight exposure cap (max % of bankroll locked in pending bets)
+const FF_INFLIGHT_CAP: bool = true;
+/// Per-sport exposure caps (prevent single-model failure from draining bank)
+const FF_PER_SPORT_CAP: bool = true;
+/// Resync freeze: on cross-validation mismatch, block match 60s, require 2 agreements
+const FF_RESYNC_FREEZE: bool = true;
 
 /// Sport-specific auto-bet configuration (v2 — with sport models)
 /// Returns: (auto_bet_allowed, min_edge_pct, stake_multiplier, preferred_market)
@@ -165,69 +173,170 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_USD: f64 = 2.0;
 /// Per-bet cap as fraction of bankroll (by tier)
 /// Per-condition cap (sum of all re-bets on one condition_id)
 /// Per-match cap (sum of all markets in one match)
+/// Inflight cap (max total pending wagers as % of bankroll)
 /// Tiers: micro (<150), small (150-500), medium (500-1500), large (1500+)
-fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64) {
-    // Returns: (per_bet_frac, per_condition_frac, per_match_frac, daily_loss_frac)
+fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64, f64) {
+    // Returns: (per_bet_frac, per_condition_frac, per_match_frac, daily_loss_frac, inflight_frac)
     if bankroll < 150.0 {
-        (0.05, 0.10, 0.15, 0.30)  // micro: 5% bet, 10% condition, 15% match, 30% daily
+        (0.05, 0.10, 0.15, 0.30, 0.45)  // micro: 5% bet, 10% cond, 15% match, 30% daily, 45% inflight
     } else if bankroll < 500.0 {
-        (0.03, 0.08, 0.12, 0.20)  // small
+        (0.03, 0.08, 0.12, 0.20, 0.40)  // small
     } else if bankroll < 1500.0 {
-        (0.02, 0.06, 0.10, 0.15)  // medium
+        (0.02, 0.06, 0.10, 0.15, 0.35)  // medium
     } else {
-        (0.015, 0.05, 0.08, 0.10) // large
+        (0.015, 0.05, 0.08, 0.10, 0.30) // large
     }
 }
 
-/// Stake Trimmer: min(calculated_stake, daily_loss_left, match_cap, condition_cap)
+/// Per-sport exposure caps (fraction of bankroll) — prevents single model failure from draining bank
+/// Returns max total wagered per sport per day as fraction of bankroll
+fn get_sport_exposure_cap(sport: &str, bankroll: f64) -> f64 {
+    let frac = match sport {
+        "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => 0.40,
+        "football" => 0.25,
+        "tennis" | "basketball" => 0.10,
+        _ => 0.10, // conservative for new sports
+    };
+    bankroll * frac
+}
+
+/// Calculate dynamic base stake: 0.9 * per_bet_cap (clean, stable sizing)
+fn dynamic_base_stake(bankroll: f64, sport: &str) -> f64 {
+    let (per_bet_frac, _, _, _, _) = get_exposure_caps(bankroll);
+    let base = bankroll * per_bet_frac * 0.9;
+    // Data-collection sports: cap at $1
+    if sport == "tennis" || sport == "basketball" {
+        base.min(AUTO_BET_STAKE_LOW_USD)
+    } else {
+        base
+    }
+}
+
+/// Stake Trimmer: min(calculated_stake, per_bet, cond_left, match_left, daily_left, inflight_left, sport_left)
+/// cross_val_multiplier: 1.25 if cross-validated, 1.0 neutral — applied to STAKE, not edge threshold
 /// Returns the final safe stake, or 0.0 if bet should be skipped
 /// When FF_EXPOSURE_CAPS is off, returns calculated_stake unchanged (simple min with daily cap).
 fn trim_stake(
     calculated_stake: f64,
     bankroll: f64,
-    condition_exposure: f64,  // already wagered on this condition today (incl. inflight)
-    match_exposure: f64,      // already wagered on this match today (incl. inflight)
+    condition_exposure: f64,  // already wagered on this condition (incl. inflight)
+    match_exposure: f64,      // already wagered on this match (incl. inflight)
     daily_net_loss: f64,      // current daily net loss
+    inflight_total: f64,      // total USD in all pending bets
+    sport_exposure: f64,      // already wagered on this sport today
+    sport: &str,              // sport key for per-sport cap
+    cross_val_multiplier: f64, // 1.0 or 1.25 — boosted stake for cross-validated bets
 ) -> f64 {
+    // Effective daily limit: min(hard_limit, tier-based cap)
+    let effective_daily_limit = if !FF_EXPOSURE_CAPS {
+        DAILY_LOSS_LIMIT_USD
+    } else {
+        let (_, _, _, daily_loss_frac, _) = get_exposure_caps(bankroll);
+        DAILY_LOSS_LIMIT_USD.min(bankroll * daily_loss_frac)
+    };
+
     if !FF_EXPOSURE_CAPS {
-        // Feature flag OFF: only apply basic daily loss limit
-        return calculated_stake.min((DAILY_LOSS_LIMIT_USD - daily_net_loss).max(0.0));
+        let base = calculated_stake * cross_val_multiplier;
+        return base.min((effective_daily_limit - daily_net_loss).max(0.0));
     }
 
-    let (per_bet_frac, per_cond_frac, per_match_frac, daily_loss_frac) = get_exposure_caps(bankroll);
+    let (per_bet_frac, per_cond_frac, per_match_frac, _, inflight_frac) = get_exposure_caps(bankroll);
     let per_bet_cap = bankroll * per_bet_frac;
     let per_cond_cap = bankroll * per_cond_frac;
     let per_match_cap = bankroll * per_match_frac;
-    let daily_loss_cap = bankroll * daily_loss_frac;
 
     let cond_room = (per_cond_cap - condition_exposure).max(0.0);
     let match_room = (per_match_cap - match_exposure).max(0.0);
-    let daily_room = (daily_loss_cap - daily_net_loss).max(0.0);
+    let daily_room = (effective_daily_limit - daily_net_loss).max(0.0);
 
-    let final_stake = calculated_stake
+    // Inflight cap: prevent too much capital locked in pending bets
+    let inflight_room = if FF_INFLIGHT_CAP {
+        (bankroll * inflight_frac - inflight_total).max(0.0)
+    } else {
+        f64::MAX
+    };
+
+    // Per-sport cap: prevent single model failure from draining bank
+    let sport_room = if FF_PER_SPORT_CAP {
+        let sport_cap = get_sport_exposure_cap(sport, bankroll);
+        (sport_cap - sport_exposure).max(0.0)
+    } else {
+        f64::MAX
+    };
+
+    // Apply cross-validation multiplier to stake (NOT to edge threshold)
+    let boosted_stake = calculated_stake * cross_val_multiplier;
+
+    let final_stake = boosted_stake
         .min(per_bet_cap)
         .min(cond_room)
         .min(match_room)
-        .min(daily_room);
+        .min(daily_room)
+        .min(inflight_room)
+        .min(sport_room);
 
     if final_stake < 0.50 { 0.0 } else { final_stake }
 }
 
-/// Cross-validation multiplier: if HLTV and Chance agree on round score → 1.25x
-/// If they disagree → 0.0 (skip). If only one source → 1.0 (neutral).
-fn cross_validation_multiplier(
+/// Cross-validation result for HLTV vs Chance score comparison.
+/// Returns (skip: bool, stake_multiplier: f64)
+///   skip=true → HARD SKIP (mismatch = invalid input)
+///   stake_multiplier: 1.25 (agree) or 1.0 (single source or non-CS2)
+/// IMPORTANT: multiplier is for STAKE/PRIORITY only, NOT for edge threshold!
+fn cross_validation_check(
     hltv_score: Option<(i32, i32)>,
     chance_score: Option<(i32, i32)>,
-) -> f64 {
+) -> (bool, f64) {
     match (hltv_score, chance_score) {
         (Some(h), Some(c)) => {
             if h.0 == c.0 && h.1 == c.1 {
-                1.25  // Both agree → higher confidence
+                (false, 1.25)  // Both agree → higher stake/priority
             } else {
-                0.0   // Mismatch → HARD SKIP (stale data risk)
+                (true, 0.0)    // Mismatch → HARD SKIP (stale data risk)
             }
         }
-        _ => 1.0,  // Only one source → neutral
+        _ => (false, 1.0),  // Only one source → neutral
+    }
+}
+
+// ====================================================================
+// RESYNC FREEZE — after cross-validation mismatch, block match for 60s
+// and require 2 consecutive agreements before re-enabling
+// ====================================================================
+
+#[derive(Debug, Clone)]
+struct ResyncState {
+    /// When the mismatch was first detected
+    frozen_at: chrono::DateTime<Utc>,
+    /// Number of consecutive agreements since freeze
+    consecutive_agreements: u32,
+}
+
+impl ResyncState {
+    fn new() -> Self {
+        Self {
+            frozen_at: Utc::now(),
+            consecutive_agreements: 0,
+        }
+    }
+
+    /// Check if match is still frozen (needs 60s + 2 consecutive agreements)
+    fn is_frozen(&self) -> bool {
+        let elapsed = (Utc::now() - self.frozen_at).num_seconds();
+        elapsed < 60 || self.consecutive_agreements < 2
+    }
+
+    /// Record an agreement; returns true if resync complete (unfrozen)
+    fn record_agreement(&mut self) -> bool {
+        self.consecutive_agreements += 1;
+        let elapsed = (Utc::now() - self.frozen_at).num_seconds();
+        elapsed >= 60 && self.consecutive_agreements >= 2
+    }
+
+    /// Reset on new mismatch
+    fn record_mismatch(&mut self) {
+        self.frozen_at = Utc::now();
+        self.consecutive_agreements = 0;
     }
 }
 
@@ -262,8 +371,9 @@ impl ReBetState {
 }
 
 /// Check if re-bet is allowed on this condition
-/// Returns true if: tier improved, edge jumped ≥8%, cooldown ≥30s, count < 3
-fn rebet_allowed(state: &ReBetState, new_tier: &str, new_edge: f64) -> bool {
+/// Returns true if: tier improved OR edge jumped ≥8%, cooldown ≥30s, count < 3,
+/// AND new edge_raw (after slippage) > last edge (not just "paper" edge)
+fn rebet_allowed(state: &ReBetState, new_tier: &str, new_edge_raw: f64, cond_cap_left: f64, match_cap_left: f64) -> bool {
     let tier_value = |t: &str| -> u8 {
         match t {
             "ULTRA" => 4,
@@ -275,11 +385,17 @@ fn rebet_allowed(state: &ReBetState, new_tier: &str, new_edge: f64) -> bool {
     };
     let elapsed = (Utc::now() - state.last_bet_at).num_seconds();
     let tier_improved = tier_value(new_tier) > tier_value(&state.highest_tier);
-    let edge_jumped = new_edge - state.last_edge_pct >= 8.0;
+    let edge_jumped = new_edge_raw - state.last_edge_pct >= 8.0;
+    // Re-bet must have higher raw edge than last time (no "paper" inflation)
+    let edge_actually_higher = new_edge_raw > state.last_edge_pct;
+    // Re-bet must not exceed remaining condition/match caps
+    let caps_ok = cond_cap_left >= 0.50 && match_cap_left >= 0.50;
 
     state.bet_count < 3
         && elapsed >= 30
+        && edge_actually_higher
         && (tier_improved || edge_jumped)
+        && caps_ok
 }
 
 // ====================================================================
@@ -551,6 +667,8 @@ struct ScoreEdge {
     azuro_url: Option<String>,
     /// CS2 map confidence tier for dynamic odds cap ("ULTRA"/"HIGH"/"MEDIUM"/"LOW"/None)
     cs2_map_confidence: Option<&'static str>,
+    /// Cross-validation stake multiplier (1.0 = normal, 1.25 = boosted)
+    cv_stake_mult: f64,
 }
 
 // ====================================================================
@@ -1045,6 +1163,7 @@ fn mma_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
 fn find_score_edges(
     state: &StateResponse,
     tracker: &mut ScoreTracker,
+    resync_freeze: &mut HashMap<String, ResyncState>,
 ) -> Vec<ScoreEdge> {
     let now = Utc::now();
     let mut edges = Vec::new();
@@ -1273,9 +1392,9 @@ fn find_score_edges(
 
         // ================================================================
         // CROSS-VALIDATION: Compare HLTV score vs Chance detailed_score
-        // If both sources report different round scores → SKIP (stale risk)
-        // If both agree → 1.25x confidence boost on edge
-        // If only one source → neutral (1.0)
+        // Mismatch → HARD SKIP + resync freeze (60s + 2 agreements)
+        // Agreement → stake multiplier 1.25 (NOT applied to edge threshold!)
+        // Only one source → neutral (no skip, multiplier 1.0)
         // ================================================================
         let detailed = live.payload.detailed_score.as_deref().unwrap_or("");
         let chance_round = if FF_CHANCE_ROUND_PARSER && !detailed.is_empty() {
@@ -1284,21 +1403,50 @@ fn find_score_edges(
 
         // Only cross-validate for CS2/esports matches with round-level scores
         let is_cs2_like = match_key.starts_with("cs2::") || match_key.starts_with("esports::");
-        let cross_val = if FF_CROSS_VALIDATION && is_cs2_like && s1.max(s2) > 3 {
-            // HLTV score = (s1, s2), Chance parsed = chance_round
-            cross_validation_multiplier(Some((s1, s2)), chance_round)
+        let (cv_skip, cv_stake_mult) = if FF_CROSS_VALIDATION && is_cs2_like && s1.max(s2) > 3 {
+            cross_validation_check(Some((s1, s2)), chance_round)
         } else {
-            1.0 // non-CS2 or non-round-level → skip validation
+            (false, 1.0) // non-CS2 or non-round-level → skip validation
         };
 
-        if cross_val == 0.0 {
+        // RESYNC FREEZE: if this match was previously mismatched, check freeze status
+        if FF_RESYNC_FREEZE && is_cs2_like {
+            if cv_skip {
+                // Mismatch detected → start or extend freeze
+                let rs = resync_freeze.entry(match_key.to_string()).or_insert_with(ResyncState::new);
+                rs.record_mismatch();
+                info!("  🛑 {} CROSS-VALIDATION MISMATCH + FREEZE: HLTV={}-{} vs Chance={:?} detailed='{}' — frozen 60s",
+                    match_key, s1, s2, chance_round, detailed);
+                continue;
+            } else if let Some(rs) = resync_freeze.get_mut(&match_key.to_string()) {
+                if cv_stake_mult > 1.0 {
+                    // Agreement after previous mismatch — check if resync complete
+                    if rs.record_agreement() {
+                        info!("  ✅ {} RESYNC COMPLETE: 2 consecutive agreements after freeze — unfreezing",
+                            match_key);
+                        resync_freeze.remove(&match_key.to_string());
+                    } else if rs.is_frozen() {
+                        info!("  🧊 {} STILL FROZEN: agreement #{} but need 2 + 60s elapsed",
+                            match_key, rs.consecutive_agreements);
+                        continue;
+                    }
+                } else if rs.is_frozen() {
+                    // Single source during freeze → still frozen
+                    info!("  🧊 {} FROZEN (single source): waiting for 2 cross-validated agreements",
+                        match_key);
+                    continue;
+                }
+            }
+        } else if cv_skip {
+            // Non-freeze mode: simple skip on mismatch
             info!("  🛑 {} CROSS-VALIDATION MISMATCH: HLTV={}-{} vs Chance={:?} detailed='{}' — SKIPPING",
                 match_key, s1, s2, chance_round, detailed);
             continue;
         }
-        if cross_val > 1.0 {
-            info!("  ✅ {} CROSS-VALIDATED: HLTV={}-{} == Chance={:?} → {:.0}% confidence boost",
-                match_key, s1, s2, chance_round, (cross_val - 1.0) * 100.0);
+
+        if cv_stake_mult > 1.0 {
+            info!("  ✅ {} CROSS-VALIDATED: HLTV={}-{} == Chance={:?} → stake×{:.2} (NOT edge threshold)",
+                match_key, s1, s2, chance_round, cv_stake_mult);
         }
 
         // Cross-map momentum bonus (for match_winner, not map_winner)
@@ -1413,7 +1561,7 @@ fn find_score_edges(
                         1.0 / mw.odds_team2
                     };
 
-                    let mw_edge = (map_win_prob - mw_implied) * 100.0 * cross_val;
+                    let mw_edge = (map_win_prob - mw_implied) * 100.0;
 
                     if mw_edge < MIN_SCORE_EDGE_PCT {
                         info!("  🗺️ {} {}-{}: MW {} edge={:.1}% < min {}%",
@@ -1467,6 +1615,7 @@ fn find_score_edges(
                         chain: mw.chain.clone(),
                         azuro_url: mw.url.clone(),
                         cs2_map_confidence: Some(map_confidence_tier),
+                        cv_stake_mult,
                     });
                 }
             }
@@ -1537,9 +1686,9 @@ fn find_score_edges(
             1.0 / azuro.payload.odds_team2
         };
 
-        // EDGE = (expected + momentum) - azuro_implied, boosted by cross-validation
+        // EDGE = (expected + momentum) - azuro_implied (raw — cv_stake_mult applied to STAKE only)
         let expected_with_momentum = expected_prob + momentum_bonus;
-        let edge = (expected_with_momentum - azuro_implied) * 100.0 * cross_val;
+        let edge = (expected_with_momentum - azuro_implied) * 100.0;
         if momentum_bonus > 0.0 {
             info!("  🔥 {} MOMENTUM BONUS: +{:.1}% (prev map dominant win), prob {:.1}% → {:.1}%",
                 match_key, momentum_bonus * 100.0, expected_prob * 100.0, expected_with_momentum * 100.0);
@@ -1609,6 +1758,7 @@ fn find_score_edges(
             chain: azuro.payload.chain.clone(),
             azuro_url: azuro.payload.url.clone(),
             cs2_map_confidence: None, // match_winner, not map_winner
+            cv_stake_mult,
         });
     }
 
@@ -1994,6 +2144,15 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
         if market_count >= 2 {
             reasons.push(format!("{} market zdrojů se shoduje", market_count));
             penalty -= 1;
+        }
+
+        // CRITICAL: Identical Azuro odds guard (e.g. 1.84/1.84 = oracle didn't set real prices)
+        // When both sides have same odds, any "edge" is phantom — pure data artifact
+        let azuro_odds_diff = (azuro.odds_team1 - azuro.odds_team2).abs();
+        if azuro_odds_diff < 0.02 {
+            reasons.push(format!("⚠️ IDENTICKÉ AZURO ODDS: {:.2}/{:.2} — oracle bug, phantom edge!",
+                azuro.odds_team1, azuro.odds_team2));
+            penalty += 6; // Guarantees LOW confidence → skip entirely
         }
 
         // BONUS: Azuro odds are reasonable (1.2 - 5.0 range)
@@ -2393,6 +2552,13 @@ async fn main() -> Result<()> {
     let mut condition_exposure: HashMap<String, f64> = HashMap::new();
     // base_match_key → total USD wagered today
     let mut match_exposure: HashMap<String, f64> = HashMap::new();
+    // sport → total USD wagered today (per-sport cap)
+    let mut sport_exposure: HashMap<String, f64> = HashMap::new();
+    // Total USD in all pending/inflight bets (for inflight cap)
+    let mut inflight_wagered_total: f64 = 0.0;
+
+    // === RESYNC FREEZE: track cross-validation mismatches per match ===
+    let mut resync_freeze: HashMap<String, ResyncState> = HashMap::new();
 
     // === BANKROLL: fetched from executor at startup, updated on claims ===
     let mut current_bankroll: f64 = 65.0; // default, updated from /health
@@ -2715,14 +2881,22 @@ async fn main() -> Result<()> {
                                     condition_exposure.clear();
                                     match_exposure.clear();
                                     rebet_tracker.clear();
-                                    info!("📅 Cleared condition_exposure, match_exposure, rebet_tracker for new day");
+                                    sport_exposure.clear();
+                                    resync_freeze.clear();
+                                    inflight_wagered_total = 0.0;
+                                    info!("📅 Cleared condition_exposure, match_exposure, rebet_tracker, sport_exposure, resync_freeze for new day");
                                 }
 
                                 // === DAILY LOSS CAP NOTIFICATION ===
                                 // NET loss = settled losses minus claimed returns
                                 // e.g. wagered=$20 on losses, returned=$30 from wins => net = -$10 (profit!)
                                 let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
-                                if daily_net_loss >= DAILY_LOSS_LIMIT_USD {
+                                // Effective daily limit: min(hard $20, tier-based cap)
+                                let effective_daily_limit = {
+                                    let (_, _, _, dl_frac, _) = get_exposure_caps(current_bankroll);
+                                    DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac)
+                                };
+                                if daily_net_loss >= effective_daily_limit {
                                     let now_utc = Utc::now();
                                     let reminder_due = daily_loss_last_reminder
                                         .map(|ts| (now_utc - ts).num_seconds() >= DAILY_LOSS_REMINDER_SECS)
@@ -2730,11 +2904,13 @@ async fn main() -> Result<()> {
 
                                     if !daily_loss_alert_sent || reminder_due {
                                         let msg = format!(
-                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b>\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.",
+                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b> (min of ${:.0} hard, {:.0}% BR)\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.",
                                             daily_net_loss,
                                             daily_wagered,
                                             daily_returned,
+                                            effective_daily_limit,
                                             DAILY_LOSS_LIMIT_USD,
+                                            get_exposure_caps(current_bankroll).3 * 100.0,
                                         );
                                         let _ = tg_send_message(&client, &token, chat_id, &msg).await;
                                         daily_loss_alert_sent = true;
@@ -2743,7 +2919,7 @@ async fn main() -> Result<()> {
                                 }
 
                                 // === 1. SCORE EDGE detection (primary strategy!) ===
-                                let score_edges = find_score_edges(&state, &mut score_tracker);
+                                let score_edges = find_score_edges(&state, &mut score_tracker, &mut resync_freeze);
                                 let mut sent_score_edges = 0usize;
                                 for edge in &score_edges {
                                     let alert_key = format!("score:{}:{}:{}-{}", edge.match_key, edge.leading_side, edge.score1, edge.score2);
@@ -2794,14 +2970,29 @@ async fn main() -> Result<()> {
                                     let is_inflight = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
                                         || inflight_conditions.contains(&match_key_for_bet);
 
+                                    // BUG FIX: Also check base_match_key to prevent triple exposure
+                                    // (e.g. match_winner + map2_winner + map3_winner on same match = $9 loss)
+                                    let base_already_bet = already_bet_base_matches.contains(&base_match_key)
+                                        && match_key_for_bet != base_match_key; // only block map-variants, not the base itself re-checking
+
                                     let (already_bet_this, rebet_ok) = if is_inflight {
                                         (true, false) // In-flight → always block
+                                    } else if base_already_bet {
+                                        // Base match already has a bet → block all map-winner variants
+                                        info!("🛡️ BASE-MATCH DEDUP: {} blocked (base {} already bet)",
+                                            match_key_for_bet, base_match_key);
+                                        (true, false)
                                     } else if (!cond_id_str.is_empty() && already_bet_conditions.contains(&cond_id_str))
                                         || already_bet_matches.contains(&match_key_for_bet) {
                                         // Already bet → check if re-bet is allowed (only when FF enabled)
                                         let can_rebet = FF_REBET_ENABLED && !cond_id_str.is_empty() && {
+                                            let cond_exp_rb = condition_exposure.get(&cond_id_str).copied().unwrap_or(0.0);
+                                            let match_exp_rb = match_exposure.get(&base_match_key).copied().unwrap_or(0.0);
+                                            let (_, cond_frac, match_frac, _, _) = get_exposure_caps(current_bankroll);
+                                            let cond_cap_left = (current_bankroll * cond_frac - cond_exp_rb).max(0.0);
+                                            let match_cap_left = (current_bankroll * match_frac - match_exp_rb).max(0.0);
                                             if let Some(rb_state) = rebet_tracker.get(&cond_id_str) {
-                                                rebet_allowed(rb_state, edge.confidence, edge.edge_pct)
+                                                rebet_allowed(rb_state, edge.confidence, edge.edge_pct, cond_cap_left, match_cap_left)
                                             } else { false }
                                         };
                                         if can_rebet {
@@ -2821,15 +3012,18 @@ async fn main() -> Result<()> {
                                     // === SPORT-SPECIFIC AUTO-BET CONFIG ===
                                     let sport = edge.match_key.split("::").next().unwrap_or("?");
                                     let (sport_auto_allowed, sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
-                                    // Tennis + basketball: cap at $1 (data-collection mode; negative ROI, small sample)
-                                    let base_stake = if sport == "tennis" || sport == "basketball" { AUTO_BET_STAKE_LOW_USD } else { AUTO_BET_STAKE_USD };
+                                    // Dynamic base stake: bankroll-scaled instead of hardcoded $3
+                                    let base_stake = dynamic_base_stake(current_bankroll, sport);
                                     let raw_stake = base_stake * sport_multiplier;
 
                                     // === EXPOSURE CAPS + STAKE TRIMMER ===
                                     let cond_exp = condition_exposure.get(&cond_id_str).copied().unwrap_or(0.0);
                                     let match_exp = match_exposure.get(&base_match_key).copied().unwrap_or(0.0);
+                                    let sport_exp = sport_exposure.get(sport).copied().unwrap_or(0.0);
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
-                                    let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
+                                    let cv_sm = edge.cv_stake_mult;
+                                    let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
+                                        inflight_wagered_total, sport_exp, sport, cv_sm);
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -2847,7 +3041,7 @@ async fn main() -> Result<()> {
                                     // Check daily NET LOSS limit (settled losses minus claimed returns)
                                     // This prevents oracle lag from blocking us when we're actually in profit
                                     let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
-                                    let within_daily_limit = daily_net_loss < DAILY_LOSS_LIMIT_USD;
+                                    let within_daily_limit = daily_net_loss < effective_daily_limit;
 
                                     // Sport-specific safety guard
                                     let sport_guard_ok = match sport {
@@ -2881,7 +3075,24 @@ async fn main() -> Result<()> {
                                                 }
                                             }
                                         }
-                                        _ => true, // basketball: no extra guard
+                                        "basketball" => {
+                                            // Basketball has high scores (80-120+ total).
+                                            // Only auto-bet when game is well underway AND lead is significant.
+                                            let total_points = edge.score1 + edge.score2;
+                                            let point_diff = (edge.score1 - edge.score2).abs();
+                                            if total_points < 80 {
+                                                info!("🏀 BASKETBALL GUARD: {} score {}-{} total={} < 80 — too early, blocking auto-bet",
+                                                    edge.match_key, edge.score1, edge.score2, total_points);
+                                                false
+                                            } else if point_diff < 20 {
+                                                info!("🏀 BASKETBALL GUARD: {} score {}-{} diff={} < 20 — lead not significant enough, blocking auto-bet",
+                                                    edge.match_key, edge.score1, edge.score2, point_diff);
+                                                false
+                                            } else {
+                                                true // 80+ total points AND 20+ point lead → OK
+                                            }
+                                        }
+                                        _ => true, // other sports: no extra guard
                                     };
 
                                     // Dynamic odds cap: CS2 map_winner uses confidence-based cap, others use fixed cap
@@ -2894,6 +3105,15 @@ async fn main() -> Result<()> {
                                         AUTO_BET_MAX_ODDS
                                     };
 
+                                    // CRITICAL: Identical Azuro odds guard (score-edge path)
+                                    // When oracle hasn't set real prices (e.g. basketball 1.84/1.84),
+                                    // score-edge sees phantom 38%+ edge. Block auto-bet, allow alert.
+                                    let azuro_odds_identical_se = (edge.azuro_w1 - edge.azuro_w2).abs() < 0.02;
+                                    if azuro_odds_identical_se && edge.confidence == "HIGH" {
+                                        info!("🛡️ IDENTICAL ODDS GUARD (score-edge): {} azuro={:.2}/{:.2} — oracle bug, blocking auto-bet (alert only)",
+                                            edge.match_key, edge.azuro_w1, edge.azuro_w2);
+                                    }
+
                                     let should_auto_bet = AUTO_BET_ENABLED
                                         && sport_auto_allowed
                                         && is_preferred_market
@@ -2904,6 +3124,7 @@ async fn main() -> Result<()> {
                                         && edge.edge_pct >= sport_min_edge
                                         && azuro_odds >= AUTO_BET_MIN_ODDS
                                         && azuro_odds <= effective_max_odds
+                                        && !azuro_odds_identical_se // BUG FIX: block phantom edge from identical oracle odds
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
                                         && !generic_esports_blocked
@@ -2914,7 +3135,7 @@ async fn main() -> Result<()> {
                                         info!("📢 {} ALERT ONLY (auto-bet disabled for {})", edge.match_key, sport);
                                     }
                                     if !within_daily_limit {
-                                        info!("🛑 DAILY LOSS LIMIT: net losses={:.2} >= {:.2}, skipping auto-bet", daily_net_loss, DAILY_LOSS_LIMIT_USD);
+                                        info!("🛑 DAILY LOSS LIMIT: net losses={:.2} >= {:.2} (effective), skipping auto-bet", daily_net_loss, effective_daily_limit);
                                     }
                                     if !is_preferred_market && sport_auto_allowed {
                                         info!("🛡️ MARKET GUARD: {} needs {} but got match_winner — alert only", edge.match_key, preferred_market);
@@ -3079,9 +3300,11 @@ async fn main() -> Result<()> {
                                                             // BUG #1 FIX: Also record base match key
                                                             already_bet_base_matches.insert(base_match_key.clone());
 
-                                                            // === EXPOSURE TRACKING: update condition + match exposure ===
+                                                            // === EXPOSURE TRACKING: update condition + match + sport + inflight ===
                                                             *condition_exposure.entry(cond_id_str.clone()).or_insert(0.0) += stake;
                                                             *match_exposure.entry(base_match_key.clone()).or_insert(0.0) += stake;
+                                                            *sport_exposure.entry(sport.to_string()).or_insert(0.0) += stake;
+                                                            inflight_wagered_total += stake;
 
                                                             // === RE-BET TRACKING: update or create state ===
                                                             if let Some(rb) = rebet_tracker.get_mut(&cond_id_str) {
@@ -3150,7 +3373,18 @@ async fn main() -> Result<()> {
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
-                                                                    "path": "edge"
+                                                                    "path": "edge",
+                                                                    "edge_pct": edge.edge_pct,
+                                                                    "cv_stake_mult": cv_sm,
+                                                                    "flags": {
+                                                                        "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
+                                                                        "FF_REBET_ENABLED": FF_REBET_ENABLED,
+                                                                        "FF_CROSS_VALIDATION": FF_CROSS_VALIDATION,
+                                                                        "FF_CASHOUT_ENABLED": FF_CASHOUT_ENABLED,
+                                                                        "FF_INFLIGHT_CAP": FF_INFLIGHT_CAP,
+                                                                        "FF_PER_SPORT_CAP": FF_PER_SPORT_CAP,
+                                                                        "FF_RESYNC_FREEZE": FF_RESYNC_FREEZE,
+                                                                    }
                                                                 }));
                                                             }
 
@@ -3254,8 +3488,16 @@ async fn main() -> Result<()> {
                                     let cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
                                     let match_key_for_bet = anomaly.match_key.clone();
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
-                                    let already_bet_this = (!cond_id_str.is_empty() && already_bet_conditions.contains(&cond_id_str))
+                                    // BUG FIX: Check base_match_key too → prevents triple exposure on same match
+                                    let base_already_bet_anom = already_bet_base_matches.contains(&base_match_key)
+                                        && match_key_for_bet != base_match_key;
+                                    let already_bet_this = base_already_bet_anom
+                                        || (!cond_id_str.is_empty() && already_bet_conditions.contains(&cond_id_str))
                                         || already_bet_matches.contains(&match_key_for_bet);
+                                    if base_already_bet_anom {
+                                        info!("🛡️ BASE-MATCH DEDUP (anomaly): {} blocked (base {} already bet)",
+                                            match_key_for_bet, base_match_key);
+                                    }
 
                                     // ENABLED: Odds anomaly auto-bet (ONLY for LIVE matches)
                                     // Prefer confirmation from multiple market sources.
@@ -3267,14 +3509,26 @@ async fn main() -> Result<()> {
                                     // === EXPOSURE CAPS for odds anomaly ===
                                     let anomaly_cond_exp = condition_exposure.get(&cond_id_str).copied().unwrap_or(0.0);
                                     let anomaly_match_exp = match_exposure.get(&base_match_key).copied().unwrap_or(0.0);
+                                    let anomaly_sport = match_key_for_bet.split("::").next().unwrap_or("?");
+                                    let anomaly_sport_exp = sport_exposure.get(anomaly_sport).copied().unwrap_or(0.0);
                                     let anomaly_daily_loss = (daily_wagered - daily_returned).max(0.0);
                                     let anomaly_raw_stake = AUTO_BET_ODDS_ANOMALY_STAKE_USD;
-                                    let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss);
+                                    let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
+                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0);
+
+                                    // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
+                                    let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;
+                                    if azuro_odds_identical {
+                                        info!("🛡️ IDENTICAL ODDS GUARD (anomaly): {} azuro={:.2}/{:.2} — phantom edge, blocking",
+                                            anomaly.match_key, anomaly.azuro_w1, anomaly.azuro_w2);
+                                    }
 
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
                                         && anomaly_odds_ok
+                                        && azuro_odds >= AUTO_BET_MIN_ODDS // BUG FIX: was missing! (1.07 got through)
+                                        && !azuro_odds_identical // BUG FIX: block identical Azuro odds (1.84/1.84)
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
                                         && anomaly.condition_id.is_some()
@@ -3396,6 +3650,8 @@ async fn main() -> Result<()> {
                                                             // === EXPOSURE TRACKING (odds anomaly path) ===
                                                             *condition_exposure.entry(cond_id_str.clone()).or_insert(0.0) += stake;
                                                             *match_exposure.entry(base_match_key.clone()).or_insert(0.0) += stake;
+                                                            *sport_exposure.entry(anomaly_sport.to_string()).or_insert(0.0) += stake;
+                                                            inflight_wagered_total += stake;
 
                                                             if let Ok(mut f) = std::fs::OpenOptions::new()
                                                                 .create(true).append(true)
@@ -3445,7 +3701,16 @@ async fn main() -> Result<()> {
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
-                                                                    "path": "anomaly_odds"
+                                                                    "path": "anomaly_odds",
+                                                                    "flags": {
+                                                                        "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
+                                                                        "FF_REBET_ENABLED": FF_REBET_ENABLED,
+                                                                        "FF_CROSS_VALIDATION": FF_CROSS_VALIDATION,
+                                                                        "FF_CASHOUT_ENABLED": FF_CASHOUT_ENABLED,
+                                                                        "FF_INFLIGHT_CAP": FF_INFLIGHT_CAP,
+                                                                        "FF_PER_SPORT_CAP": FF_PER_SPORT_CAP,
+                                                                        "FF_RESYNC_FREEZE": FF_RESYNC_FREEZE,
+                                                                    }
                                                                 }));
                                                             }
 
@@ -3530,8 +3795,11 @@ async fn main() -> Result<()> {
                 // matches with better context (condition_id, numbered alerts, BET READY)
             }
 
-            // === AUTO-CASHOUT check ===
+            // === AUTO-CASHOUT check (gated by FF_CASHOUT_ENABLED) ===
             _ = cashout_ticker.tick() => {
+                if !FF_CASHOUT_ENABLED {
+                    continue; // Cashout disabled — no EV/fair_value calc = margin leak risk
+                }
                 if active_bets.is_empty() { continue; }
 
                 for bet in &mut active_bets {
@@ -4798,7 +5066,16 @@ async fn main() -> Result<()> {
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
-                                                                    "path": "bet_command"
+                                                                    "path": "bet_command",
+                                                                    "flags": {
+                                                                        "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
+                                                                        "FF_REBET_ENABLED": FF_REBET_ENABLED,
+                                                                        "FF_CROSS_VALIDATION": FF_CROSS_VALIDATION,
+                                                                        "FF_CASHOUT_ENABLED": FF_CASHOUT_ENABLED,
+                                                                        "FF_INFLIGHT_CAP": FF_INFLIGHT_CAP,
+                                                                        "FF_PER_SPORT_CAP": FF_PER_SPORT_CAP,
+                                                                        "FF_RESYNC_FREEZE": FF_RESYNC_FREEZE,
+                                                                    }
                                                                 }));
                                                             }
 
