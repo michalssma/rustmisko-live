@@ -1432,8 +1432,9 @@ app.post("/auto-claim", async (req, res) => {
     if (claimable.length === 0) {
       return res.json({
         status: "nothing",
-        message: `No claimable payouts. ${pendingCount} bets pending, ${nftCount - pendingCount - claimable.length} lost/empty.`,
+        message: `No claimable payouts. ${alreadyPaidCount} already paid, ${pendingCount} pending, ${nftCount - pendingCount - alreadyPaidCount} lost/empty.`,
         nftCount,
+        alreadyPaidCount,
         pendingCount,
       });
     }
