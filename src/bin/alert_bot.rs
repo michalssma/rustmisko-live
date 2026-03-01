@@ -5295,10 +5295,10 @@ async fn main() -> Result<()> {
                     let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
                     let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
                     let pending_sg = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let redeemable = mb.get("redeemable").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
                     let src = mb.get("source").and_then(|v| v.as_str()).unwrap_or("?");
                     msg.push_str(&format!(
-                        "📋 Bety na Azuro (subgraph, {}):\n\
+                        "📋 Bety na Azuro ({}):\n\
                          \u{2022} Celkem: {} | Won: {} | Lost: {} | Pending: {}\n\
                          \u{2022} Vyplatitelné: <b>{}</b>\n",
                         src, total, won, lost, pending_sg, redeemable
@@ -5306,9 +5306,111 @@ async fn main() -> Result<()> {
                     if redeemable > 0 {
                         msg.push_str("⚠️ <b>Nevybráno!</b> Pošlu /auto-claim...\n");
                     }
+
+                    // === RECONCILE: on-chain is source of truth for pending list ===
+                    if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
+                        // Collect on-chain pending + claimable tokenIds
+                        let onchain_pending_tids: HashSet<String> = bets_arr.iter()
+                            .filter(|b| {
+                                let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                st == "pending" || st == "claimable"
+                            })
+                            .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                            .collect();
+
+                        // Build enriched info from on-chain bets (team, odds, amount from executor metadata)
+                        let onchain_enriched: Vec<(String, String, f64, f64, String)> = bets_arr.iter()
+                            .filter(|b| {
+                                let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                st == "pending" || st == "claimable"
+                            })
+                            .map(|b| {
+                                let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                                let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                (tid, team, odds, amount, match_key)
+                            })
+                            .collect();
+
+                        let pre_count = active_bets.len();
+
+                        // 1) Remove local bets whose tokenId is NOT in on-chain pending/claimable
+                        //    (they settled on-chain — lost, already_paid, or claimed)
+                        active_bets.retain(|b| {
+                            match &b.token_id {
+                                Some(tid) => onchain_pending_tids.contains(tid),
+                                None => true, // keep bets with no tokenId yet (recently placed)
+                            }
+                        });
+
+                        // 2) For on-chain pending bets not in local list, add them
+                        //    (covers bets that were tracked only by executor, not alert-bot)
+                        let local_tids: HashSet<String> = active_bets.iter()
+                            .filter_map(|b| b.token_id.clone())
+                            .collect();
+                        for (tid, team, odds, amount, match_key) in &onchain_enriched {
+                            if !local_tids.contains(tid) && !team.is_empty() {
+                                active_bets.push(ActiveBet {
+                                    alert_id: 0,
+                                    bet_id: format!("onchain_{}", tid),
+                                    match_key: match_key.clone(),
+                                    team1: team.clone(),
+                                    team2: "?".to_string(),
+                                    value_team: team.clone(),
+                                    amount_usd: *amount,
+                                    odds: *odds,
+                                    placed_at: "onchain".to_string(),
+                                    condition_id: String::new(),
+                                    outcome_id: String::new(),
+                                    graph_bet_id: None,
+                                    token_id: Some(tid.clone()),
+                                });
+                            }
+                        }
+
+                        // 3) Update tokenIds for local bets missing them (match by team/odds)
+                        for b in active_bets.iter_mut() {
+                            if b.token_id.is_none() {
+                                // Try to find matching on-chain bet by team name
+                                if let Some((tid, _, _, _, _)) = onchain_enriched.iter()
+                                    .find(|(_, t, o, _, _)| {
+                                        !t.is_empty() && t == &b.value_team && (*o - b.odds).abs() < 0.05
+                                    })
+                                {
+                                    b.token_id = Some(tid.clone());
+                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} ({})",
+                                        tid, b.bet_id, b.value_team);
+                                }
+                            }
+                        }
+
+                        let post_count = active_bets.len();
+                        if pre_count != post_count {
+                            info!("🔄 RECONCILE: active_bets {} → {} (on-chain pending: {})",
+                                pre_count, post_count, onchain_pending_tids.len());
+                        }
+
+                        // 4) Atomic rewrite of pending_claims.txt from reconciled list
+                        if pre_count != post_count || active_bets.iter().any(|b| b.placed_at == "onchain") {
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).write(true).truncate(true)
+                                .open(pending_claims_path) {
+                                use std::io::Write;
+                                for bet in &active_bets {
+                                    let tid = bet.token_id.as_deref().unwrap_or("?");
+                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+                                        tid, bet.bet_id, bet.match_key,
+                                        bet.value_team, bet.amount_usd, bet.odds);
+                                }
+                                info!("💾 RECONCILE: pending_claims.txt rewritten ({} entries)", active_bets.len());
+                            }
+                        }
+                    }
                 }
 
-                // Local tracked active bets
+                // Pending bet list — now sourced from reconciled active_bets (on-chain truth)
                 if active_bets.is_empty() {
                     msg.push_str("🎰 Pending sázek: 0\n");
                 } else {
@@ -5327,6 +5429,24 @@ async fn main() -> Result<()> {
                 let daily_loss = daily_wagered - daily_returned;
                 msg.push_str(&format!("   Loss limit: ${:.2} / ${:.0}\n", if daily_loss > 0.0 { daily_loss } else { 0.0 }, DAILY_LOSS_LIMIT_USD));
                 msg.push_str(&format!("   Auto-bets dnes: {}\n", auto_bet_count));
+
+                // WS gate diagnostics
+                {
+                    let cache_r = ws_condition_cache.read().await;
+                    let cache_size = cache_r.len();
+                    let newest_age_ms = cache_r.values()
+                        .map(|e| e.updated_at.elapsed().as_millis())
+                        .min()
+                        .unwrap_or(0);
+                    let ws_status = if !ws_state_gate_enabled {
+                        "OFF".to_string()
+                    } else if cache_size == 0 {
+                        "ON (no data yet)".to_string()
+                    } else {
+                        format!("ON ({} conds, newest {}ms)", cache_size, newest_age_ms)
+                    };
+                    msg.push_str(&format!("\n🔌 WS gate: {}\n", ws_status));
+                }
 
                 // Feed-hub live info
                 match client.get(format!("{}/state", feed_hub_url)).send().await {
@@ -5508,10 +5628,10 @@ async fn main() -> Result<()> {
                                     }
 
                                 } else if text == "/bets" || text == "/mybets" || text == "/my-bets" {
-                                    // Show both local tracked bets AND subgraph bets (real-time)
+                                    // Show on-chain bets (real-time) with enriched metadata
                                     let mut bets_msg = String::from("🎰 <b>SÁZKY</b>\n\n");
 
-                                    // Subgraph bets (real-time from Azuro)
+                                    // On-chain bets from executor
                                     match client.get(format!("{}/my-bets", executor_url)).send().await {
                                         Ok(resp) => {
                                             match resp.json::<serde_json::Value>().await {
@@ -5520,48 +5640,54 @@ async fn main() -> Result<()> {
                                                     let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
                                                     let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
                                                     let pending_sg = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                    let redeemable = mb.get("redeemable").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    let claimable_count = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    let claimable_usd = mb.get("claimableUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                                     let src = mb.get("source").and_then(|v| v.as_str()).unwrap_or("?");
                                                     bets_msg.push_str(&format!(
-                                                        "📊 <b>Azuro subgraph</b> ({}):\n\
+                                                        "📊 <b>Azuro</b> ({}):\n\
                                                          Celkem: {} | ✅ Won: {} | ❌ Lost: {} | ⏳ Pending: {}\n\
-                                                         💰 Vyplatitelné: <b>{}</b>\n\n",
-                                                        src, total, won, lost, pending_sg, redeemable
+                                                         💰 Claimable: <b>{}</b> (${:.2})\n\n",
+                                                        src, total, won, lost, pending_sg, claimable_count, claimable_usd
                                                     ));
                                                     if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
-                                                        for b in bets_arr.iter().take(8) {
-                                                            let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?");
-                                                            let status = b.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                                                            let result = b.get("result").and_then(|v| v.as_str()).unwrap_or("");
-                                                            let odds = b.get("odds").and_then(|v| v.as_str()).unwrap_or("?");
-                                                            let redeemable_b = b.get("isRedeemable").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                            let redeemed_b = b.get("isRedeemed").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                            let emoji = if result == "Won" { "✅" } else if result == "Lost" { "❌" } else if redeemable_b && !redeemed_b { "💰" } else { "⏳" };
-                                                            bets_msg.push_str(&format!(
-                                                                "{} tokenId:{} @ {} — {} {}\n",
-                                                                emoji, &tid[..tid.len().min(12)], odds, status,
-                                                                if redeemable_b && !redeemed_b { "[CLAIM!]" } else { result }
-                                                            ));
+                                                        // Show pending bets with enriched team/odds
+                                                        let pending_bets: Vec<&serde_json::Value> = bets_arr.iter()
+                                                            .filter(|b| {
+                                                                let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                                                st == "pending" || st == "claimable"
+                                                            })
+                                                            .collect();
+                                                        if !pending_bets.is_empty() {
+                                                            bets_msg.push_str(&format!("📋 <b>Pending/Claimable ({}):</b>\n", pending_bets.len()));
+                                                            for b in pending_bets.iter().take(40) {
+                                                                let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?");
+                                                                let status = b.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+                                                                let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("");
+                                                                let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                                let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                                let payout = b.get("payoutUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                                let emoji = if status == "claimable" { "💰" } else { "⏳" };
+                                                                if !team.is_empty() {
+                                                                    bets_msg.push_str(&format!(
+                                                                        "{} {} @ {:.2} ${:.2}{}\n",
+                                                                        emoji, team, odds, amount,
+                                                                        if payout > 0.0 { format!(" → ${:.2}", payout) } else { String::new() }
+                                                                    ));
+                                                                } else {
+                                                                    bets_msg.push_str(&format!(
+                                                                        "{} #{}{}\n",
+                                                                        emoji, &tid[..tid.len().min(8)],
+                                                                        if payout > 0.0 { format!(" → ${:.2}", payout) } else { String::new() }
+                                                                    ));
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
-                                                Err(_) => bets_msg.push_str("⚠️ Subgraph parse error\n\n"),
+                                                Err(_) => bets_msg.push_str("⚠️ Parse error\n\n"),
                                             }
                                         }
-                                        Err(_) => bets_msg.push_str("❌ Executor offline — nelze načíst subgraph bety\n\n"),
-                                    }
-
-                                    // Local tracked bets
-                                    if !active_bets.is_empty() {
-                                        bets_msg.push_str(&format!("🔍 <b>Lokálně sledované ({})</b>:\n", active_bets.len()));
-                                        for b in &active_bets {
-                                            let tid = b.token_id.as_deref().unwrap_or("?");
-                                            bets_msg.push_str(&format!(
-                                                "  \u{2022} {} @ {:.2} ${:.2} ({})\n",
-                                                b.value_team, b.odds, b.amount_usd,
-                                                &tid[..tid.len().min(10)]
-                                            ));
-                                        }
+                                        Err(_) => bets_msg.push_str("❌ Executor offline\n\n"),
                                     }
 
                                     let _ = tg_send_message(&client, &token, chat_id, &bets_msg).await;
@@ -5707,21 +5833,39 @@ async fn main() -> Result<()> {
                                         Err(_) => msg.push_str("❌ Executor offline\n"),
                                     }
 
-                                    // Subgraph summary
+                                    // On-chain summary + reconcile
                                     if let Ok(resp) = client.get(format!("{}/my-bets", executor_url)).send().await {
                                         if let Ok(mb) = resp.json::<serde_json::Value>().await {
                                             let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                                             let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
                                             let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            let redeemable = mb.get("redeemable").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let pending_count = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
                                             msg.push_str(&format!(
-                                                "\n📋 Azuro bety: {} total | ✅{} ❌{} | 💰 Claim: {}\n",
-                                                total, won, lost, redeemable
+                                                "\n📋 Azuro bety: {} total | ✅{} ❌{} | ⏳{} | 💰 Claim: {}\n",
+                                                total, won, lost, pending_count, redeemable
                                             ));
+
+                                            // Reconcile active_bets from on-chain data
+                                            if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
+                                                let onchain_pending_tids: HashSet<String> = bets_arr.iter()
+                                                    .filter(|b| {
+                                                        let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                                        st == "pending" || st == "claimable"
+                                                    })
+                                                    .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                                                    .collect();
+                                                active_bets.retain(|b| {
+                                                    match &b.token_id {
+                                                        Some(tid) => onchain_pending_tids.contains(tid),
+                                                        None => true,
+                                                    }
+                                                });
+                                            }
                                         }
                                     }
 
-                                    // Local tracked
+                                    // Pending list — reconciled
                                     if !active_bets.is_empty() {
                                         msg.push_str(&format!("\n🎰 <b>Pending sázky ({})</b>\n", active_bets.len()));
                                         let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
@@ -5730,7 +5874,25 @@ async fn main() -> Result<()> {
                                         }
                                         msg.push_str(&format!("  Ve hře: <b>${:.2}</b>\n", total_at_risk));
                                     } else {
-                                        msg.push_str("\n🎰 Žádné lokálně sledované sázky\n");
+                                        msg.push_str("\n🎰 Žádné pending sázky\n");
+                                    }
+
+                                    // WS gate diagnostics
+                                    {
+                                        let cache_r = ws_condition_cache.read().await;
+                                        let cache_size = cache_r.len();
+                                        let newest_age_ms = cache_r.values()
+                                            .map(|e| e.updated_at.elapsed().as_millis())
+                                            .min()
+                                            .unwrap_or(0);
+                                        let ws_status = if !ws_state_gate_enabled {
+                                            "OFF".to_string()
+                                        } else if cache_size == 0 {
+                                            "ON (no data)".to_string()
+                                        } else {
+                                            format!("ON ({} conds, newest {}ms)", cache_size, newest_age_ms)
+                                        };
+                                        msg.push_str(&format!("\n🔌 WS gate: {}\n", ws_status));
                                     }
 
                                     let daily_pnl = daily_returned - daily_wagered;

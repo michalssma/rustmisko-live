@@ -1286,11 +1286,31 @@ app.get('/my-bets', async (req, res) => {
       })
     ));
 
+    // Step 4: Enrich with activeBets metadata (team, odds, amount, matchKey)
+    const activeBetsArr = Array.from(activeBets.values());
+    for (const r of results) {
+      // Try matching by tokenId first, then by graphBetId pattern
+      const meta = activeBetsArr.find(ab =>
+        (ab.tokenId && ab.tokenId.toString() === r.tokenId) ||
+        (ab.graphBetId && ab.graphBetId.endsWith(`_${r.tokenId}`))
+      );
+      if (meta) {
+        r.team = meta.team || '';
+        r.matchKey = meta.matchKey || '';
+        r.odds = meta.odds || 0;
+        r.amount = meta.stake || 0;
+        r.betId = meta.betId || '';
+        r.sport = meta.sport || '';
+        r.placedAt = meta.placedAt || '';
+      }
+    }
+
     const claimable = results.filter(r => r.status === 'claimable');
     const alreadyPaid = results.filter(r => r.status === 'already_paid');
     const pending = results.filter(r => r.status === 'pending');
     const lost = results.filter(r => r.status === 'lost');
     const totalClaimableUsd = claimable.reduce((s, r) => s + r.payoutUsd, 0);
+    const totalPendingUsd = pending.reduce((s, r) => s + (r.amount || 0), 0);
 
     // Get USDT balance
     const balance = await publicClient.readContract({
@@ -1306,6 +1326,7 @@ app.get('/my-bets', async (req, res) => {
       claimableUsd: totalClaimableUsd,
       alreadyPaid: alreadyPaid.length,
       pending: pending.length,
+      pendingUsd: totalPendingUsd,
       lost: lost.length,
       balanceUsd: formatUnits(balance, contracts.betTokenDecimals),
       source: 'on-chain',
