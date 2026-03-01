@@ -45,6 +45,7 @@ $env:EXECUTOR_URL = 'http://127.0.0.1:3030'
 $env:PRIVATE_KEY = '0x34fb468df8e14a223595b824c1515f0477d2f06b3f6509f25c2f9e9e02ce3f7c'
 $env:CHAIN_ID = '137'
 $env:EXECUTOR_PORT = '3030'
+$env:WS_STATE_GATE = 'true'
 
 Write-Host '[2/4] Starting feed-hub...' -ForegroundColor Green
 $feedHubLog = Join-Path $LOG_DIR 'feed_hub.log'

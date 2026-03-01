@@ -30,6 +30,7 @@ REM Executor on-chain config (BEZ TOHO = DRY-RUN!)
 set PRIVATE_KEY=0x34fb468df8e14a223595b824c1515f0477d2f06b3f6509f25c2f9e9e02ce3f7c
 set CHAIN_ID=137
 set EXECUTOR_PORT=3030
+set WS_STATE_GATE=true
 
 REM ============================================================
 REM Kill any old processes
