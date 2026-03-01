@@ -1,8 +1,8 @@
-# Azuro WS Shadow → Primary: Acceptance Checklist
+# Azuro WS State Gate — Production Status
 
-**Shipped:** commit a1b42b3 on `main` (2026-02-28)  
-**Code:** `src/azuro_poller.rs` → `run_shadow_ws()` (line 521, +331 LOC)  
-**Status:** SHADOW MODE (runs parallel to GQL polling, no decision authority)
+**Shipped:** commits a1b42b3, 907adab, d4469f2 on `main`
+**Code:** `src/bin/alert_bot.rs` → `run_ws_gate()` + WS pre-flight check
+**Status:** ✅ PRODUCTION — WS State Gate active, pre-flight gating of all bets
 
 ---
 

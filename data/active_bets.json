@@ -1,16 +1,16 @@
 [
   {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772360646149",
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772361452358",
     "tokenId": null,
     "graphBetId": null,
-    "conditionId": "300610060000000000813923980000000000001724727379",
-    "outcomeId": "203",
-    "stake": 3,
-    "odds": 1.7072,
+    "conditionId": "300610060000000000291281190000000000001720436222",
+    "outcomeId": "7012",
+    "stake": 2,
+    "odds": 1.590799999999,
     "sport": "?",
     "matchKey": "",
-    "team": "Kitchee SC",
-    "placedAt": "2026-03-01T10:24:06.545Z",
+    "team": "HEROIC",
+    "placedAt": "2026-03-01T10:37:33.107Z",
     "status": "pending"
   }
 ]

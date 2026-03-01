@@ -145,6 +145,66 @@ Nový agent: přečti CONTEXT.md → pak tento soubor → pak kóduj.
 
 ---
 
+## 2026-03-01 — 5-Phase Matching Fix (commit f7bff50)
+
+**Rozhodnutí:** Kompletní 5-fázový matching overhaul — observabilita, NFKD unicode, country translation, token-subset matching, strategy tuning.
+**Proč:** 18% fusion miss rate (13/71 odds klíčů bez live score). Diakritika, sport labels, české překlady zemí.
+**Implementace:** `normalize_sport()`, NFKD decomposition, `translate_country_name()` (~30 CZ→EN), token-subset pair matching s guardrails.
+
+---
+
+## 2026-03-01 — Tchajwan country mapping hotfix (commit b86acf1)
+
+**Rozhodnutí:** Přidat tchajwan/tchajpej/čínská tajpej → chinesetaipei mapování.
+**Proč:** Fusion miss na taiwanese matches.
+
+---
+
+## 2026-03-01 — Strategy tuning (commit 45b1713)
+
+**Rozhodnutí:** Batch tuning: HIGH≥12%, MIN_MARKET_SOURCES=2, football+basketball anomaly ON, zombie inflight TTL fix.
+**Proč:** Zvýšit objem kvalitních betů. MIN_MARKET_SOURCES sníženo z 3 na 2 (3 bylo prakticky unreachable).
+**Důležité:** Football a basketball anomaly path nově povoleny.
+
+---
+
+## 2026-03-01 — MAX_ODDS zvýšeno na 2.50 (commit 45b1713)
+
+**Rozhodnutí:** `AUTO_BET_MAX_ODDS` zvýšeno z 2.00 na 2.50.
+**Proč:** NFT data ukazují bucket 2.0–3.0 s nejlepším ROI (+29.6%). Rozsah 2.00–2.50 je sweet spot.
+
+---
+
+## 2026-03-01 — DAILY_LOSS_LIMIT zvýšeno na $30 (commit 45b1713)
+
+**Rozhodnutí:** `DAILY_LOSS_LIMIT_USD` zvýšeno z 20 na 30.
+**Proč:** S exposure caps (30% micro tier) je hard limit $20 příliš konzervativní. $30 stále pokrývá tier-based cap.
+
+---
+
+## 2026-03-01 — Won→alreadyPaid fix (commit 62c4270)
+
+**Rozhodnutí:** Změna `mb.get("won")` → `mb.get("alreadyPaid")` na 2 místech.
+**Proč:** Executor `/my-bets` vrací `alreadyPaid` (počet vyplacených betů), NE `won`. Alert-bot četl `won` → vždy 0.
+
+---
+
+## 2026-03-01 — Created→follow-up polling (commits 62c4270 + 3aa279d)
+
+**Rozhodnutí:** Po každém betu s State: Created spawnt async 20s follow-up task.
+**Proč:** Azuro relayer `State: Created` = jen ACK. On-chain tx může revertovat 10-30s později bez notifikace.
+**Příklad:** GENG manual bet — State: Created, tx reverted, bot hlásil ✅ SUCCESS ale bet neprošel.
+**Implementace:** Unified na všech 3 bet paths (auto-edge, auto-anomaly, manual). Pokud Rejected → TG alert.
+
+---
+
+## 2026-03-01 — Tennis min edge 15→12 (commit 45b1713)
+
+**Rozhodnutí:** Tennis min_edge snížen z 15% na 12%.
+**Proč:** Při 15% + MAX_ODDS 2.00 bylo matematicky nemožné auto-bet tennis. S 12% + MAX_ODDS 2.50 je reachable.
+
+---
+
 ## Pravidla
 
 1. **Jazyk:** VŽDY česky.

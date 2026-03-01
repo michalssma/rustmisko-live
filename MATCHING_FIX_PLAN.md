@@ -1,6 +1,10 @@
 # MATCHING FIX PLAN — 2026-03-01
 
-## Problém
+## STATUS: ✅ IMPLEMENTED (commit f7bff50 + b86acf1)
+
+Všech 5 fází implementováno a nasazeno v produkci.
+
+## Problém (VYŘEŠEN)
 - 18% fusion miss rate (13/71 odds klíčů nemá live score)
 - Příčiny: sport label (`hockey` vs `ice-hockey`), diakritika (`Nový Zéland` → `novýzéland`), chybějící sufixy (`utd`), český překlad zemí
 
