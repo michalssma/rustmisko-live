@@ -1,0 +1,34 @@
+Current block: 83612476
+
+=== STEP 1: ALL BettorWin Events ===
+Found 0 BettorWin events
+TOTAL WON: $0.00
+
+=== STEP 2: TX Initiators ===
+Our wallet initiated: 0/0 TXs
+External initiated: 0/0 TXs
+
+=== STEP 3: NFT Status & Cross-Reference ===
+Total NFTs owned: 119
+Claimable: 0
+Lost (payout=0): 49
+AlreadyPaid: 70
+OtherRevert: 0
+
+AlreadyPaid WITH BettorWin event: 0/70
+AlreadyPaid WITHOUT BettorWin event: 70
+Missing proof tokenIds: 220727, 220777, 220789, 220794, 220795, 220797, 220802, 220826, 220861, 220928, 220946, 221102, 221104, 221113, 221116, 221118, 221121, 221124, 221125, 221127, 221128, 221129, 221198, 221199, 221237, 221238, 221324, 221331, 221363, 221370, 221419, 221420, 221427, 221431, 221432, 221433, 221434, 221435, 221440, 221443, 221446, 221471, 221561, 221572, 221632, 221668, 221711, 221753, 221804, 221812, 221833, 221876, 221877, 221880, 221887, 221890, 221896, 221897, 221915, 221920, 221939, 221944, 221949, 221959, 221961, 221976, 221980, 221983, 221995, 222040
+
+BettorWin for tokenIds we DON'T own: 0
+
+=== SUMMARY FOR GPT ===
+Total NFTs: 119 (range: 220727-222040)
+  Claimable: 0
+  Lost: 49
+  AlreadyPaid: 70
+  OtherRevert: 0
+BettorWin events found: 0 (total: $0.00)
+  Matched to AlreadyPaid: 0
+  Unmatched AlreadyPaid: 70
+TX initiators: 0 our wallet, 0 external
+Core used in events: 
