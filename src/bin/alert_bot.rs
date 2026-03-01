@@ -4043,6 +4043,51 @@ async fn main() -> Result<()> {
                                                                 )
                                                             };
                                                             let _ = tg_send_message(&client, &token, chat_id, &result_msg).await;
+
+                                                            // === UNIFIED FOLLOW-UP: Poll Created bets to detect async Rejected ===
+                                                            if !is_dry_run && (bet_state == "Created" || bet_state == "Pending") {
+                                                                let follow_client = client.clone();
+                                                                let follow_token = token.clone();
+                                                                let follow_executor = executor_url.clone();
+                                                                let follow_bet_id = bet_id.to_string();
+                                                                let follow_aid = aid;
+                                                                let follow_team = leading_team.to_string();
+                                                                let follow_chat = chat_id;
+                                                                tokio::spawn(async move {
+                                                                    tokio::time::sleep(Duration::from_secs(20)).await;
+                                                                    if let Ok(resp) = follow_client.get(
+                                                                        format!("{}/bet/{}", follow_executor, follow_bet_id)
+                                                                    ).send().await {
+                                                                        if let Ok(br) = resp.json::<serde_json::Value>().await {
+                                                                            let final_state = br.get("state")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                            let err_msg = br.get("errorMessage")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("");
+                                                                            if final_state == "Rejected" || final_state == "Failed" || final_state == "Cancelled" {
+                                                                                let alert = format!(
+                                                                                    "❌ <b>AUTO-BET #{} REJECTED (follow-up)</b>\n\n\
+                                                                                     {} — transakce reverted on-chain.\n\
+                                                                                     Error: {}\n\
+                                                                                     💰 Peníze nebyly strženy.",
+                                                                                    follow_aid, follow_team, err_msg);
+                                                                                let _ = tg_send_message(
+                                                                                    &follow_client, &follow_token,
+                                                                                    follow_chat, &alert).await;
+                                                                                warn!("❌ AUTO-BET #{} FOLLOW-UP REJECTED: {} err={}",
+                                                                                    follow_aid, follow_bet_id, err_msg);
+                                                                            } else if final_state == "Accepted" {
+                                                                                let token_id = br.get("tokenId")
+                                                                                    .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                info!("✅ AUTO-BET #{} FOLLOW-UP CONFIRMED: state={} tokenId={}",
+                                                                                    follow_aid, final_state, token_id);
+                                                                            } else {
+                                                                                info!("⏳ AUTO-BET #{} FOLLOW-UP: state={} (still pending)",
+                                                                                    follow_aid, final_state);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
                                                             bet_success = true;
                                                         }
                                                     }
@@ -4592,6 +4637,51 @@ async fn main() -> Result<()> {
                                                                 )
                                                             };
                                                             let _ = tg_send_message(&client, &token, chat_id, &result_msg).await;
+
+                                                            // === UNIFIED FOLLOW-UP: Poll Created bets to detect async Rejected ===
+                                                            if !is_dry_run && (bet_state == "Created" || bet_state == "Pending") {
+                                                                let follow_client = client.clone();
+                                                                let follow_token = token.clone();
+                                                                let follow_executor = executor_url.clone();
+                                                                let follow_bet_id = bet_id.to_string();
+                                                                let follow_aid = aid;
+                                                                let follow_team = value_team.clone();
+                                                                let follow_chat = chat_id;
+                                                                tokio::spawn(async move {
+                                                                    tokio::time::sleep(Duration::from_secs(20)).await;
+                                                                    if let Ok(resp) = follow_client.get(
+                                                                        format!("{}/bet/{}", follow_executor, follow_bet_id)
+                                                                    ).send().await {
+                                                                        if let Ok(br) = resp.json::<serde_json::Value>().await {
+                                                                            let final_state = br.get("state")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                            let err_msg = br.get("errorMessage")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("");
+                                                                            if final_state == "Rejected" || final_state == "Failed" || final_state == "Cancelled" {
+                                                                                let alert = format!(
+                                                                                    "❌ <b>AUTO-BET ODDS #{} REJECTED (follow-up)</b>\n\n\
+                                                                                     {} — transakce reverted on-chain.\n\
+                                                                                     Error: {}\n\
+                                                                                     💰 Peníze nebyly strženy.",
+                                                                                    follow_aid, follow_team, err_msg);
+                                                                                let _ = tg_send_message(
+                                                                                    &follow_client, &follow_token,
+                                                                                    follow_chat, &alert).await;
+                                                                                warn!("❌ AUTO-BET ODDS #{} FOLLOW-UP REJECTED: {} err={}",
+                                                                                    follow_aid, follow_bet_id, err_msg);
+                                                                            } else if final_state == "Accepted" {
+                                                                                let token_id = br.get("tokenId")
+                                                                                    .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                info!("✅ AUTO-BET ODDS #{} FOLLOW-UP CONFIRMED: state={} tokenId={}",
+                                                                                    follow_aid, final_state, token_id);
+                                                                            } else {
+                                                                                info!("⏳ AUTO-BET ODDS #{} FOLLOW-UP: state={} (still pending)",
+                                                                                    follow_aid, final_state);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
                                                             break;
                                                         }
                                                     }
