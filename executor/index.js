@@ -260,6 +260,39 @@ function saveActiveBetsToDisk() {
   }
 }
 
+// ============================================================
+// Revert Selector Classification
+// AlreadyPaid (0xd70a0e30) = payout already withdrawn → safe to prune
+// Anything else = genuinely pending or unknown → keep
+// ============================================================
+const ALREADY_PAID_SELECTOR = "d70a0e30";
+
+function classifyViewPayoutError(err) {
+  const msg = (err?.message || err?.toString() || "").toLowerCase();
+  // Viem encodes the revert data in the error message
+  if (msg.includes(ALREADY_PAID_SELECTOR) || msg.includes("alreadypaid")) {
+    return "already_paid";
+  }
+  // Log unknown selectors for future debugging
+  const selectorMatch = msg.match(/0x([0-9a-f]{8})/);
+  if (selectorMatch && selectorMatch[1] !== ALREADY_PAID_SELECTOR) {
+    console.warn(`⚠️ Unknown viewPayout revert selector: 0x${selectorMatch[1]}`);
+  }
+  return "pending";
+}
+
+// Ledger path for executor-side claim logging
+const LEDGER_PATH = path.resolve(process.cwd(), "..", "data", "ledger.jsonl");
+
+function ledgerAppend(event, data) {
+  try {
+    const entry = { ts: new Date().toISOString(), event, ...data };
+    fs.appendFileSync(LEDGER_PATH, JSON.stringify(entry) + "\n");
+  } catch (e) {
+    console.error(`⚠️ Ledger write failed: ${e.message}`);
+  }
+}
+
 // Auto-prune settled bets on startup (after toolkit becomes available)
 // SAFETY: Only removes Lost/Rejected immediately.
 // Won/Canceled are removed ONLY if on-chain viewPayout confirms already claimed.
@@ -289,8 +322,13 @@ async function autoPruneSettled() {
             });
             // viewPayout returns 0 after claim (NFT burned), safe to prune
             if (Number(payout) === 0) { activeBets.delete(key); removed++; continue; }
-          } catch {
-            // viewPayout reverted = not yet resolved on-chain, KEEP!
+          } catch (vpErr) {
+            const cls = classifyViewPayoutError(vpErr);
+            if (cls === "already_paid") {
+              // AlreadyPaid = payout was already withdrawn, safe to prune
+              activeBets.delete(key); removed++; continue;
+            }
+            // genuinely pending — keep in active_bets
           }
         }
         kept_won++;
@@ -1070,14 +1108,17 @@ app.post("/check-payout", async (req, res) => {
       claimable: payoutUsd > 0,
     });
   } catch (e) {
-    // viewPayout reverts for unresolved bets — return pending status
+    const cls = classifyViewPayoutError(e);
     res.json({
       tokenId,
       payout: "0",
       payoutUsd: 0,
       claimable: false,
-      pending: true,
-      reason: "Bet not yet resolved (viewPayout reverted)",
+      status: cls, // "already_paid" or "pending"
+      pending: cls === "pending",
+      reason: cls === "already_paid"
+        ? "Payout already withdrawn (AlreadyPaid)"
+        : "Bet not yet resolved (viewPayout reverted)",
     });
   }
 });
@@ -1239,10 +1280,14 @@ app.get('/my-bets', async (req, res) => {
       }).then(p => {
         const usd = Number(p) / (10 ** contracts.betTokenDecimals);
         return { tokenId: tid.toString(), payoutUsd: usd, status: usd > 0 ? 'claimable' : 'lost' };
-      }).catch(() => ({ tokenId: tid.toString(), payoutUsd: 0, status: 'pending' }))
+      }).catch((e) => {
+        const cls = classifyViewPayoutError(e);
+        return { tokenId: tid.toString(), payoutUsd: 0, status: cls }; // "already_paid" or "pending"
+      })
     ));
 
     const claimable = results.filter(r => r.status === 'claimable');
+    const alreadyPaid = results.filter(r => r.status === 'already_paid');
     const pending = results.filter(r => r.status === 'pending');
     const lost = results.filter(r => r.status === 'lost');
     const totalClaimableUsd = claimable.reduce((s, r) => s + r.payoutUsd, 0);
@@ -1253,12 +1298,13 @@ app.get('/my-bets', async (req, res) => {
       functionName: 'balanceOf', args: [walletAddr],
     });
 
-    console.log(`📊 My-bets on-chain: ${nftCount} NFTs, ${claimable.length} claimable ($${totalClaimableUsd.toFixed(2)}), ${pending.length} pending, ${lost.length} lost`);
+    console.log(`📊 My-bets on-chain: ${nftCount} NFTs, ${claimable.length} claimable ($${totalClaimableUsd.toFixed(2)}), ${alreadyPaid.length} already_paid, ${pending.length} pending, ${lost.length} lost`);
 
     res.json({
       total: nftCount,
       claimable: claimable.length,
       claimableUsd: totalClaimableUsd,
+      alreadyPaid: alreadyPaid.length,
       pending: pending.length,
       lost: lost.length,
       balanceUsd: formatUnits(balance, contracts.betTokenDecimals),
@@ -1353,14 +1399,22 @@ app.post("/auto-claim", async (req, res) => {
             usd: Number(p) / 10 ** contracts.betTokenDecimals,
             status: "resolved",
           }))
-          .catch(() => ({ id: tid, usd: 0, status: "pending" })),
+          .catch((e) => {
+            const cls = classifyViewPayoutError(e);
+            return { id: tid, usd: 0, status: cls }; // "already_paid" or "pending"
+          }),
       ),
     );
 
     const claimable = [];
     let totalPayout = 0;
     let pendingCount = 0;
+    let alreadyPaidCount = 0;
     for (const r of payoutResults) {
+      if (r.status === "already_paid") {
+        alreadyPaidCount++;
+        continue;
+      }
       if (r.status === "pending") {
         pendingCount++;
         continue;
@@ -1372,7 +1426,7 @@ app.post("/auto-claim", async (req, res) => {
     }
 
     console.log(
-      `🔍 Scan: ${nftCount} NFTs, ${claimable.length} claimable ($${totalPayout.toFixed(2)}), ${pendingCount} pending`,
+      `🔍 Scan: ${nftCount} NFTs, ${claimable.length} claimable ($${totalPayout.toFixed(2)}), ${alreadyPaidCount} already_paid, ${pendingCount} pending`,
     );
 
     if (claimable.length === 0) {
@@ -1411,9 +1465,21 @@ app.post("/auto-claim", async (req, res) => {
       args: [account.address],
     });
 
+    const newBalanceUsd = formatUnits(balance, contracts.betTokenDecimals);
+
     console.log(
       `✅ Auto-claim: ${claimable.length} bets claimed, $${totalPayout.toFixed(2)}, tx=${hash}`,
     );
+
+    // Ledger: persist claim event for accurate P/L tracking
+    ledgerAppend("EXECUTOR_CLAIM", {
+      txHash: hash,
+      tokenIds: claimable.map((t) => t.toString()),
+      claimed: claimable.length,
+      totalPayoutUsd: totalPayout,
+      blockNumber: receipt.blockNumber.toString(),
+      newBalanceUsd,
+    });
 
     res.json({
       status: "ok",
@@ -1421,10 +1487,11 @@ app.post("/auto-claim", async (req, res) => {
       claimed: claimable.length,
       tokenIds: claimable.map((t) => t.toString()),
       totalPayoutUsd: totalPayout,
-      newBalanceUsd: formatUnits(balance, contracts.betTokenDecimals),
+      newBalanceUsd,
       blockNumber: receipt.blockNumber.toString(),
       nftCount,
       pendingCount,
+      alreadyPaidCount,
     });
   } catch (e) {
     console.error(`❌ Auto-claim error: ${e.message}`);
