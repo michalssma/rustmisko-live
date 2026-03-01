@@ -200,6 +200,8 @@ static NORM_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 static FF_EXTENDED_SUFFIX_STRIP: AtomicBool = AtomicBool::new(true);
 /// TOKEN_SUBSET_PAIR_ALIAS: write-time fuzzy token-subset matching (default ON)
 static FF_TOKEN_SUBSET_PAIR_ALIAS: AtomicBool = AtomicBool::new(true);
+/// COUNTRY_TRANSLATE sampling counter (1 in 20 = 5%)
+static COUNTRY_TRANSLATE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Max alias cache entries (LRU eviction beyond this)
 const ALIAS_CACHE_MAX: usize = 1000;
 /// Alias cache TTL in seconds (12h)
@@ -297,11 +299,23 @@ fn translate_country_name(name: &str) -> String {
         ("australie", "australia"),
         ("indie", "india"),
         ("jihoafrickarepublika", "southafrica"),
+        // Tchaj-wan / Chinese Taipei variants
+        ("tchajwan", "chinesetaipei"),
+        ("tchajpej", "chinesetaipei"),
+        ("cinskatajpej", "chinesetaipei"),
     ];
     let mut s = name.to_string();
+    let original = s.clone();
     for (cz, en) in translations {
         if s.contains(cz) {
             s = s.replace(cz, en);
+        }
+    }
+    // Sampled debug log: 5% of calls where a translation actually fired
+    if s != original {
+        let n = COUNTRY_TRANSLATE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n % 20 == 0 {
+            tracing::debug!("COUNTRY_TRANSLATE raw={:?} -> {:?}", original, s);
         }
     }
     s
