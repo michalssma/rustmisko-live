@@ -3155,15 +3155,23 @@ async fn main() -> Result<()> {
     // Startup message
     let session_limit_str = "∞ (UNLIMITED)".to_string();
     let auto_bet_info = if AUTO_BET_ENABLED {
-        format!("🤖 <b>AUTO-BET v5: ON</b>\n   \
+        format!("🤖 <b>AUTO-BET v5: ON</b>\n\n\
+                 <b>Path A — Score Edge:</b>\n   \
                  CS2/Esports: map_winner, edge ≥12%\n   \
                  Tennis: match_winner, edge ≥12% (set_diff≥1)\n   \
                  Basketball: match_winner, edge ≥12%, stake 0.5x\n   \
-                 Football: match_winner, edge ≥18% (goal_diff≥2)\n   \
-                 Base stake: ${:.0} | Odds {:.2}-{:.2}\n   \
-                 Daily loss limit: ${:.0} | Watchdog: {}s\n\
+                 Football: match_winner, edge ≥18% (goal_diff≥2)\n\n\
+                 <b>Path B — Odds Anomaly:</b>\n   \
+                 Favorit-only, HIGH conf, sources ≥{}\n   \
+                 Tennis: set_diff≥1 | Football: ON | Basketball: ON\n   \
+                 Stake: ${:.0} | Identická odds blokována\n\n\
+                 <b>Sdílené limity:</b>\n   \
+                 Odds: {:.2}–{:.2} | Stake: ${:.0}\n   \
+                 Daily loss: ${:.0} | Watchdog: {}s\n\
                  💰 <b>AUTO-CLAIM: ON</b> (každých {}s)",
-                AUTO_BET_STAKE_USD, AUTO_BET_MIN_ODDS, AUTO_BET_MAX_ODDS,
+                AUTO_BET_MIN_MARKET_SOURCES,
+                AUTO_BET_ODDS_ANOMALY_STAKE_USD,
+                AUTO_BET_MIN_ODDS, AUTO_BET_MAX_ODDS, AUTO_BET_STAKE_USD,
                 DAILY_LOSS_LIMIT_USD, WATCHDOG_TIMEOUT_SECS,
                 CLAIM_CHECK_SECS)
     } else {
@@ -3175,8 +3183,9 @@ async fn main() -> Result<()> {
             "🟢 <b>Alert Bot v3 Online</b>\n\n\
              {}\n\n\
              {}\n\n\
-             Monitoruji Azuro vs HLTV score.\n\
-             Score Edge → AUTO-BET (HIGH ≥12%) / Alert (MEDIUM).\n\n\
+             Monitoruji Azuro vs HLTV/Fortuna score+odds.\n\
+             Path A: Score Edge → AUTO-BET / Alert\n\
+             Path B: Odds Anomaly → AUTO-BET (favorit-only)\n\n\
              /status — stav systému + executor + bety\n\
              /odds — aktuální anomálie\n\
              /bets — aktivní sázky\n\
@@ -5354,7 +5363,8 @@ async fn main() -> Result<()> {
 
                 if let Some(ref mb) = subgraph_bets {
                     let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
+                    // executor returns "alreadyPaid" not "won" — already_paid = settled+claimed wins
+                    let won = mb.get("alreadyPaid").and_then(|v| v.as_u64()).unwrap_or(0);
                     let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
                     let pending_sg = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
                     let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -5776,7 +5786,8 @@ async fn main() -> Result<()> {
                                             match resp.json::<serde_json::Value>().await {
                                                 Ok(mb) => {
                                                     let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                                                    let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    // executor returns "alreadyPaid" not "won"
+                                                    let won = mb.get("alreadyPaid").and_then(|v| v.as_u64()).unwrap_or(0);
                                                     let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
                                                     let pending_sg = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
                                                     let claimable_count = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -6350,6 +6361,55 @@ async fn main() -> Result<()> {
                                                             };
 
                                                             let _ = tg_send_message(&client, &token, chat_id, &msg).await;
+
+                                                            // === FOLLOW-UP: Poll Created bets to detect async Rejected ===
+                                                            // Azuro relayer returns State:Created immediately,
+                                                            // but on-chain tx can revert 10-30s later → Rejected.
+                                                            // Without this follow-up, user thinks bet went through.
+                                                            if !is_dry_run && (state == "Created" || state == "Pending") {
+                                                                let follow_client = client.clone();
+                                                                let follow_token = token.clone();
+                                                                let follow_executor = executor_url.clone();
+                                                                let follow_bet_id = bet_id.to_string();
+                                                                let follow_aid = aid;
+                                                                let follow_team = value_team.to_string();
+                                                                let follow_chat = chat_id;
+                                                                tokio::spawn(async move {
+                                                                    // Wait for on-chain confirmation
+                                                                    tokio::time::sleep(Duration::from_secs(20)).await;
+                                                                    if let Ok(resp) = follow_client.get(
+                                                                        format!("{}/bet/{}", follow_executor, follow_bet_id)
+                                                                    ).send().await {
+                                                                        if let Ok(br) = resp.json::<serde_json::Value>().await {
+                                                                            let final_state = br.get("state")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                            let err_msg = br.get("errorMessage")
+                                                                                .and_then(|v| v.as_str()).unwrap_or("");
+                                                                            if final_state == "Rejected" || final_state == "Failed" || final_state == "Cancelled" {
+                                                                                let alert = format!(
+                                                                                    "❌ <b>BET #{} REJECTED (follow-up)</b>\n\n\
+                                                                                     {} — transakce reverted on-chain.\n\
+                                                                                     Error: {}\n\
+                                                                                     💰 Peníze nebyly strženy.",
+                                                                                    follow_aid, follow_team, err_msg);
+                                                                                let _ = tg_send_message(
+                                                                                    &follow_client, &follow_token,
+                                                                                    follow_chat, &alert).await;
+                                                                                warn!("❌ BET #{} FOLLOW-UP REJECTED: {} err={}",
+                                                                                    follow_aid, follow_bet_id, err_msg);
+                                                                            } else if final_state == "Accepted" {
+                                                                                let token_id = br.get("tokenId")
+                                                                                    .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                info!("✅ BET #{} FOLLOW-UP CONFIRMED: state={} tokenId={}",
+                                                                                    follow_aid, final_state, token_id);
+                                                                            } else {
+                                                                                info!("⏳ BET #{} FOLLOW-UP: state={} (still pending)",
+                                                                                    follow_aid, final_state);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                });
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {

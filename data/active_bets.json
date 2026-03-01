@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772360158233",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000291382420000000000001732250925",
+    "outcomeId": "7047",
+    "stake": 2,
+    "odds": 1.649,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Ryan Nijboer",
+    "placedAt": "2026-03-01T10:15:58.547Z",
+    "status": "pending"
+  }
+]
