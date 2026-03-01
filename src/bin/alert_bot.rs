@@ -51,7 +51,7 @@ const AUTO_BET_STAKE_LOW_USD: f64 = 1.0;
 /// Minimum Azuro odds to auto-bet (skip heavy favorites)
 const AUTO_BET_MIN_ODDS: f64 = 1.15;
 /// Maximum odds for auto-bet (skip extreme underdogs)
-const AUTO_BET_MAX_ODDS: f64 = 2.00;
+const AUTO_BET_MAX_ODDS: f64 = 2.50;
 /// CS2 map_winner exception: allow higher odds (score-based edge is more reliable on maps)
 const AUTO_BET_MAX_ODDS_CS2_MAP: f64 = 3.00;
 /// Manual/Reaction default stake in USD
@@ -87,9 +87,10 @@ const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
 const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
-const AUTO_BET_MIN_MARKET_SOURCES: usize = 3;
+/// Was 3 — practically unreachable (HLTV typically has 1-2 bookmakers per match)
+const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
 /// Ignore stale odds snapshots older than this threshold
-const MAX_ODDS_AGE_SECS: i64 = 12;
+const MAX_ODDS_AGE_SECS: i64 = 20;
 /// Maximum concurrent pending bets (inflight guard)
 const MAX_CONCURRENT_PENDING: usize = 8;
 /// Loss streak cooldown: consecutive LOST count to trigger pause
@@ -405,8 +406,9 @@ fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
             => (true, 12.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
         // Safety: auto-bet only allowed when set_diff >= 1 (checked in sport guard)
+        // min_edge 15→12: at 15% + MAX_ODDS 2.00 it was mathematically impossible to auto-bet tennis
         "tennis"
-            => (true, 15.0, 1.0, "match_winner"),
+            => (true, 12.0, 1.0, "match_winner"),
         // Basketball: match_winner — point spread model
         "basketball"
             => (true, 12.0, 1.0, "match_winner"),
@@ -1889,7 +1891,7 @@ fn find_score_edges(
                         continue;
                     }
 
-                    let mw_confidence = if mw_edge >= 15.0 { "HIGH" } else { "MEDIUM" };
+                    let mw_confidence = if mw_edge >= 12.0 { "HIGH" } else { "MEDIUM" };
                     let mw_outcome_id = if azuro_side == 1 {
                         mw.outcome1_id.clone()
                     } else {
@@ -2030,8 +2032,8 @@ fn find_score_edges(
             continue;
         }
 
-        // Confidence based on edge size
-        let confidence = if edge >= 15.0 { "HIGH" } else { "MEDIUM" };
+        // Confidence based on edge size (12% = aligned with sport_min_edge)
+        let confidence = if edge >= 12.0 { "HIGH" } else { "MEDIUM" };
 
         let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
         info!("⚡ MATCH WINNER EDGE [FALLBACK]: {} leads {}-{}, Azuro implied {:.1}%, expected {:.1}%, edge {:.1}% (azuro_side={}, no map_winner odds available)",
@@ -3155,7 +3157,7 @@ async fn main() -> Result<()> {
     let auto_bet_info = if AUTO_BET_ENABLED {
         format!("🤖 <b>AUTO-BET v5: ON</b>\n   \
                  CS2/Esports: map_winner, edge ≥12%\n   \
-                 Tennis: match_winner, edge ≥15% (set_diff≥1)\n   \
+                 Tennis: match_winner, edge ≥12% (set_diff≥1)\n   \
                  Basketball: match_winner, edge ≥12%, stake 0.5x\n   \
                  Football: match_winner, edge ≥18% (goal_diff≥2)\n   \
                  Base stake: ${:.0} | Odds {:.2}-{:.2}\n   \
@@ -3174,7 +3176,7 @@ async fn main() -> Result<()> {
              {}\n\n\
              {}\n\n\
              Monitoruji Azuro vs HLTV score.\n\
-             Score Edge → AUTO-BET (HIGH) / Alert (MEDIUM).\n\n\
+             Score Edge → AUTO-BET (HIGH ≥12%) / Alert (MEDIUM).\n\n\
              /status — stav systému + executor + bety\n\
              /odds — aktuální anomálie\n\
              /bets — aktivní sázky\n\
@@ -4160,22 +4162,13 @@ async fn main() -> Result<()> {
                                     // Score-edge path has sport_auto_bet_guard + model validation;
                                     // anomaly path is purely odds-comparison → needs stricter sport rules.
                                     let anomaly_sport_allowed = match anomaly_sport {
-                                        // Football: DISABLED completely — single-source Tipsport data
-                                        // for obscure leagues is unreliable. No cross-validation.
-                                        // Score-edge also disabled. Football OFF across all paths.
-                                        "football" => {
-                                            info!("⚽ ANOMALY SPORT GUARD: {} — football DISABLED for all auto-bet paths",
-                                                anomaly.match_key);
-                                            false
-                                        }
-                                        // Basketball: DISABLED for anomaly path. NBA/basket odds on Azuro
-                                        // are too noisy/stale — nearly all "anomalies" are false signals.
-                                        // Score-edge path (with point-diff model) is the only valid path.
-                                        "basketball" => {
-                                            info!("🏀 ANOMALY SPORT GUARD: {} — basketball disabled for anomaly auto-bet (score-edge only)",
-                                                anomaly.match_key);
-                                            false
-                                        }
+                                        // Football: ENABLED with conservative guard — require ≥10% disc + 2 sources
+                                        // Risk: single-source Tipsport for obscure leagues.
+                                        // Mitigation: MIN_MARKET_SOURCES=2 + penalty system catches most noise.
+                                        "football" => true,
+                                        // Basketball: ENABLED — anomaly odds comparison is valid for mainstream leagues
+                                        // Score-edge path also lives with point-diff model.
+                                        "basketball" => true,
                                         // Tennis: only auto-bet via anomaly when there's a SET LEAD (≥1 set diff).
                                         // At match start (0-0) or equal sets (1-1), odds discrepancy is noise,
                                         // not a real signal. Prevents betting on every new tennis match.
@@ -5418,7 +5411,19 @@ async fn main() -> Result<()> {
                         let now_utc = Utc::now();
                         active_bets.retain(|b| {
                             if b.token_id.is_some() { return true; } // on-chain verified
-                            if b.placed_at == "loaded" || b.placed_at == "onchain" { return true; }
+                            // "onchain" bets are verified — keep (reconcile handles)
+                            if b.placed_at == "onchain" { return true; }
+                            // "loaded" bets from pending_claims.txt with no tokenId are zombie entries.
+                            // Expire after INFLIGHT_TTL_SECS from session start.
+                            if b.placed_at == "loaded" {
+                                let session_age = (now_utc - session_start).num_seconds();
+                                if session_age > INFLIGHT_TTL_SECS {
+                                    info!("\u{23f0} ZOMBIE_TTL: loaded bet {} ({}) expired — session age {}s > TTL {}s",
+                                        b.bet_id, b.value_team, session_age, INFLIGHT_TTL_SECS);
+                                    return false;
+                                }
+                                return true;
+                            }
                             match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
                                 Ok(placed) => {
                                     let age_secs = (now_utc - placed.with_timezone(&Utc)).num_seconds();
@@ -6018,7 +6023,11 @@ async fn main() -> Result<()> {
                                                 let now_utc = Utc::now();
                                                 active_bets.retain(|b| {
                                                     if b.token_id.is_some() { return true; }
-                                                    if b.placed_at == "loaded" || b.placed_at == "onchain" { return true; }
+                                                    if b.placed_at == "onchain" { return true; }
+                                                    if b.placed_at == "loaded" {
+                                                        let session_age = (now_utc - session_start).num_seconds();
+                                                        return session_age <= INFLIGHT_TTL_SECS;
+                                                    }
                                                     match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
                                                         Ok(placed) => (now_utc - placed.with_timezone(&Utc)).num_seconds() <= INFLIGHT_TTL_SECS,
                                                         Err(_) => true,

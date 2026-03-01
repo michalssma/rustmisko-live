@@ -1,9 +1,1 @@
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772203809262|esports::mouz_vs_parivision|PARIVISION|2|1.63
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772212814992|esports::tdk_vs_whitebird|TDK|2|1.66
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772230008522|tennis::julietapareja_vs_leama|Julieta Pareja|2|1.55
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772323632838|esports::imperial_vs_yawara|Imperial Esports|2|1.28
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772329378028|esports::9z_vs_canidsred|9z Team|2|1.76
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772334413296|esports::voca_vs_wildcard|Wildcard Gaming|2|1.81
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772334480053|esports::boss_vs_lag|LAG Gaming|2|1.6
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772337580847|tennis::bucsacristina_vs_jasminepaolini|Cristina Bucsa|2|1.57
-?|0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772344625128|tennis::desaizeel_vs_kuharenkopolina|Zeel Desai|2|1.65
+
