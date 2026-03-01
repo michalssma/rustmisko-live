@@ -16,10 +16,14 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn, error, debug};
 use tracing_subscriber::{EnvFilter, fmt};
 use std::path::Path;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 // ====================================================================
 // Config
@@ -100,6 +104,267 @@ const PORTFOLIO_REPORT_SECS: u64 = 1800;
 const WATCHDOG_TIMEOUT_SECS: u64 = 120;
 /// === CASHOUT — DISABLED (no EV/fair_value calc yet, margin leak risk) ===
 const FF_CASHOUT_ENABLED: bool = false;
+
+// ====================================================================
+// WS STATE GATE — real-time condition state from Azuro V3 streams
+// ====================================================================
+
+/// Azuro V3 WebSocket streams endpoint (production) — same as azuro_poller shadow
+const WS_GATE_URL: &str = "wss://streams.onchainfeed.org/v1/streams/feed";
+/// WS update is considered stale after this many ms — DROP if older
+const WS_STALE_MS: u64 = 1500;
+/// Reconnect backoff sequence (ms)
+const WS_GATE_BACKOFF_MS: &[u64] = &[500, 1_000, 2_000, 5_000, 15_000];
+/// Subscribe throttle: don't re-send SubscribeConditions more than once per N seconds
+const WS_SUBSCRIBE_THROTTLE_SECS: u64 = 5;
+/// Maximum conditions to track before GC of stale entries
+const WS_MAX_TRACKED_CONDITIONS: usize = 500;
+
+// ── WS types ──
+
+/// Cached condition state from Azuro WS stream
+#[derive(Debug, Clone)]
+struct WsConditionEntry {
+    /// "Active", "Paused", "Resolved", "Canceled", "Created"
+    state: String,
+    /// When this entry was last updated (monotonic)
+    updated_at: std::time::Instant,
+}
+
+/// Thread-safe shared WS condition cache (condition_id → entry)
+type WsConditionCache = Arc<RwLock<HashMap<String, WsConditionEntry>>>;
+
+/// WS subscribe message format (matches Azuro V3 protocol)
+#[derive(Serialize)]
+struct WsGateSubscribeMsg {
+    event: String,
+    conditions: Vec<String>,
+    environment: String,
+}
+
+/// WS incoming message (generic — we match on event field)
+#[derive(Deserialize, Debug)]
+struct WsGateIncoming {
+    event: Option<String>,
+    id: Option<String>,
+    data: Option<serde_json::Value>,
+}
+
+/// Result of checking WS cache for a condition before betting
+#[derive(Debug)]
+enum WsGateResult {
+    /// WS confirms condition is Active + fresh → proceed
+    Active { age_ms: u64 },
+    /// WS says condition is NOT Active → DROP immediately
+    NotActive { state: String, age_ms: u64 },
+    /// WS data is stale (older than WS_STALE_MS) → fallback to GQL
+    Stale { age_ms: u64 },
+    /// No WS data for this condition → fallback to GQL
+    NoData,
+    /// WS gate disabled (kill-switch off) → fallback to GQL
+    Disabled,
+}
+
+/// Check WS condition cache for pre-flight gate decision
+fn ws_gate_check(cache: &HashMap<String, WsConditionEntry>, condition_id: &str, gate_enabled: bool) -> WsGateResult {
+    if !gate_enabled {
+        return WsGateResult::Disabled;
+    }
+    match cache.get(condition_id) {
+        Some(entry) => {
+            let age_ms = entry.updated_at.elapsed().as_millis() as u64;
+            if age_ms > WS_STALE_MS {
+                WsGateResult::Stale { age_ms }
+            } else if entry.state == "Active" {
+                WsGateResult::Active { age_ms }
+            } else {
+                WsGateResult::NotActive { state: entry.state.clone(), age_ms }
+            }
+        }
+        None => WsGateResult::NoData,
+    }
+}
+
+/// Async WS condition gate daemon.
+/// Maintains live connection to Azuro WS stream, receives condition state updates,
+/// populates shared cache that the main loop reads for pre-flight gating.
+///
+/// Subscribes to condition IDs received via `sub_rx` channel.
+async fn run_ws_gate(
+    cache: WsConditionCache,
+    mut sub_rx: mpsc::Receiver<Vec<String>>,
+) {
+    let mut backoff_idx: usize = 0;
+    // Accumulate all condition IDs we should be subscribed to
+    let mut all_subscribed: HashSet<String> = HashSet::new();
+    // Pending IDs that arrived while disconnected
+    let mut pending_subscribe: Vec<String> = Vec::new();
+
+    loop {
+        info!("[WS-GATE] Connecting to {}", WS_GATE_URL);
+
+        let ws_stream = match tokio_tungstenite::connect_async(WS_GATE_URL).await {
+            Ok((stream, resp)) => {
+                info!("[WS-GATE] Connected! HTTP {} (subscribed: {})", resp.status(), all_subscribed.len());
+                backoff_idx = 0;
+                stream
+            }
+            Err(e) => {
+                let delay = WS_GATE_BACKOFF_MS.get(backoff_idx).copied().unwrap_or(15_000);
+                warn!("[WS-GATE] Connect failed: {} — retry in {}ms", e, delay);
+                backoff_idx = (backoff_idx + 1).min(WS_GATE_BACKOFF_MS.len() - 1);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                continue;
+            }
+        };
+
+        let (mut ws_sink, mut ws_read) = ws_stream.split();
+
+        // On reconnect: clear old subscribed set, re-subscribe to everything
+        let mut needs_resub = !all_subscribed.is_empty();
+        let mut resub_ids: Vec<String> = all_subscribed.iter().cloned().collect();
+        // Also add any pending from while disconnected
+        for id in pending_subscribe.drain(..) {
+            if all_subscribed.insert(id.clone()) {
+                resub_ids.push(id);
+            }
+        }
+        let mut last_subscribe_ts = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(WS_SUBSCRIBE_THROTTLE_SECS + 1))
+            .unwrap_or_else(std::time::Instant::now);
+
+        let disconnect_reason: String;
+        loop {
+            // ── Handle new subscribe requests from main loop ──
+            // Drain channel (non-blocking)
+            loop {
+                match sub_rx.try_recv() {
+                    Ok(new_ids) => {
+                        let mut fresh: Vec<String> = Vec::new();
+                        for id in new_ids {
+                            if all_subscribed.insert(id.clone()) {
+                                fresh.push(id);
+                            }
+                        }
+                        if !fresh.is_empty() {
+                            resub_ids.extend(fresh);
+                            needs_resub = true;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            // ── Send SubscribeConditions if we have new IDs and throttle allows ──
+            if needs_resub && !resub_ids.is_empty()
+                && last_subscribe_ts.elapsed() >= Duration::from_secs(WS_SUBSCRIBE_THROTTLE_SECS)
+            {
+                let msg = serde_json::to_string(&WsGateSubscribeMsg {
+                    event: "SubscribeConditions".to_string(),
+                    conditions: resub_ids.clone(),
+                    environment: "polygon".to_string(),
+                }).unwrap();
+                if let Err(e) = ws_sink.send(WsMessage::Text(msg.into())).await {
+                    disconnect_reason = format!("subscribe send error: {}", e);
+                    break;
+                }
+                info!("[WS-GATE] Subscribed {} conditions (total tracked: {})",
+                    resub_ids.len(), all_subscribed.len());
+                resub_ids.clear();
+                needs_resub = false;
+                last_subscribe_ts = std::time::Instant::now();
+            }
+
+            // ── Read next WS message (with 3s timeout for responsiveness) ──
+            let msg = tokio::time::timeout(Duration::from_secs(3), ws_read.next()).await;
+
+            match msg {
+                Ok(Some(Ok(WsMessage::Text(txt)))) => {
+                    match serde_json::from_str::<WsGateIncoming>(&txt) {
+                        Ok(incoming) => {
+                            let event = incoming.event.as_deref().unwrap_or("?");
+                            match event {
+                                "ConditionUpdated" => {
+                                    let cid = incoming.id.as_deref().unwrap_or("?").to_string();
+                                    let state_str = incoming.data.as_ref()
+                                        .and_then(|d| d.get("state"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?")
+                                        .to_string();
+
+                                    // Update cache
+                                    let mut cache_w = cache.write().await;
+                                    cache_w.insert(cid.clone(), WsConditionEntry {
+                                        state: state_str.clone(),
+                                        updated_at: std::time::Instant::now(),
+                                    });
+
+                                    // GC: if cache too large, remove oldest entries
+                                    if cache_w.len() > WS_MAX_TRACKED_CONDITIONS {
+                                        let mut entries: Vec<(String, std::time::Instant)> =
+                                            cache_w.iter().map(|(k, v)| (k.clone(), v.updated_at)).collect();
+                                        entries.sort_by_key(|e| e.1);
+                                        let to_remove = cache_w.len() - WS_MAX_TRACKED_CONDITIONS / 2;
+                                        for (k, _) in entries.into_iter().take(to_remove) {
+                                            cache_w.remove(&k);
+                                        }
+                                        debug!("[WS-GATE] GC: removed {} stale entries", to_remove);
+                                    }
+                                    drop(cache_w);
+
+                                    debug!("[WS-GATE] ConditionUpdated cid={} state={}", &cid[..cid.len().min(16)], state_str);
+                                }
+                                "SubscribedToConditions" => {
+                                    let count = incoming.data.as_ref()
+                                        .and_then(|d| d.as_array())
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    info!("[WS-GATE] Server confirmed subscription: {} condition IDs", count);
+                                }
+                                _ => {
+                                    debug!("[WS-GATE] event={}", event);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!("[WS-GATE] JSON parse error: {} raw={}", e, &txt[..txt.len().min(200)]);
+                        }
+                    }
+                }
+                Ok(Some(Ok(WsMessage::Ping(payload)))) => {
+                    let _ = ws_sink.send(WsMessage::Pong(payload)).await;
+                }
+                Ok(Some(Ok(WsMessage::Close(frame)))) => {
+                    disconnect_reason = format!("server close: {:?}",
+                        frame.map(|f| format!("{} {}", f.code, f.reason)));
+                    break;
+                }
+                Ok(Some(Err(e))) => {
+                    disconnect_reason = format!("read error: {}", e);
+                    break;
+                }
+                Ok(None) => {
+                    disconnect_reason = "stream ended (None)".to_string();
+                    break;
+                }
+                Err(_) => {
+                    // Timeout — normal, loop back to check subscribe + read
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Disconnected — reconnect with backoff
+        let delay = WS_GATE_BACKOFF_MS.get(backoff_idx).copied().unwrap_or(15_000);
+        warn!("[WS-GATE] Disconnected: {} — reconnecting in {}ms (cache: {} entries)",
+            disconnect_reason, delay, all_subscribed.len());
+        backoff_idx = (backoff_idx + 1).min(WS_GATE_BACKOFF_MS.len() - 1);
+        // On reconnect, we need to re-subscribe to all tracked conditions
+        resub_ids = all_subscribed.iter().cloned().collect();
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
+}
 
 // ====================================================================
 // FEATURE FLAGS — enable upgrades incrementally (Gemini recommendation)
@@ -2906,6 +3171,24 @@ async fn main() -> Result<()> {
         )
     ).await?;
 
+    // ====================================================================
+    // WS STATE GATE — real-time condition state daemon
+    // ====================================================================
+    let ws_state_gate_enabled = std::env::var("WS_STATE_GATE")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true); // DEFAULT ON — kill-switch: set WS_STATE_GATE=false to disable
+    let ws_condition_cache: WsConditionCache = Arc::new(RwLock::new(HashMap::new()));
+    let (ws_sub_tx, ws_sub_rx) = mpsc::channel::<Vec<String>>(64);
+    if ws_state_gate_enabled {
+        let cache_clone = ws_condition_cache.clone();
+        tokio::spawn(async move {
+            run_ws_gate(cache_clone, ws_sub_rx).await;
+        });
+        info!("🔌 [WS-GATE] WebSocket condition state gate ENABLED (kill-switch: WS_STATE_GATE=false)");
+    } else {
+        info!("⚠️ [WS-GATE] WebSocket condition state gate DISABLED (WS_STATE_GATE=false)");
+    }
+
     let mut poll_ticker = tokio::time::interval(Duration::from_secs(POLL_INTERVAL_SECS));
     let mut cashout_ticker = tokio::time::interval(Duration::from_secs(CASHOUT_CHECK_SECS));
     let mut claim_ticker = tokio::time::interval(Duration::from_secs(CLAIM_CHECK_SECS));
@@ -3039,6 +3322,18 @@ async fn main() -> Result<()> {
                                 }
                                 // GC: remove conditions not seen in 10 minutes
                                 condition_last_seen.retain(|_, ts| poll_instant.duration_since(*ts).as_secs() < 600);
+
+                                // === WS GATE: subscribe new condition IDs to WS stream ===
+                                if ws_state_gate_enabled {
+                                    let new_cids: Vec<String> = state.odds.iter()
+                                        .filter_map(|item| item.payload.condition_id.as_ref())
+                                        .filter(|cid| !cid.is_empty())
+                                        .cloned()
+                                        .collect();
+                                    if !new_cids.is_empty() {
+                                        let _ = ws_sub_tx.try_send(new_cids);
+                                    }
+                                }
 
                                 // === 1. SCORE EDGE detection (primary strategy!) ===
                                 let score_edges = find_score_edges(&state, &mut score_tracker, &mut resync_freeze);
@@ -3287,32 +3582,76 @@ async fn main() -> Result<()> {
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
-                                        // Condition freshness: how stale is our last sighting?
+                                        // Condition freshness: how stale is our last sighting? (GQL baseline)
                                         let condition_age_ms = condition_last_seen.get(&condition_id)
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
 
-                                        // === PRE-FLIGHT GATE: condition freshness check ===
-                                        // If condition was not seen Active recently → DROP immediately
-                                        // Saves executor round-trip + gas on doomed attempts
-                                        if condition_age_ms > CONDITION_MAX_AGE_MS {
-                                            warn!("🚫 PRE-FLIGHT GATE #{}: condition {} stale (age={}ms > {}ms) — dropping",
-                                                aid, &condition_id, condition_age_ms, CONDITION_MAX_AGE_MS);
-                                            ledger_write("BET_FAILED", &serde_json::json!({
-                                                "alert_id": aid, "match_key": match_key_for_bet,
-                                                "condition_id": condition_id, "outcome_id": outcome_id,
-                                                "error": "pre-flight gate: condition stale",
-                                                "reason_code": "PreFlightStale",
-                                                "is_condition_state_reject": true,
-                                                "condition_age_ms": condition_age_ms,
-                                                "requested_odds": azuro_odds,
-                                                "stake": stake, "path": "edge",
-                                                "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
-                                            }));
-                                            log_event("PREFLIGHT_GATE", &serde_json::json!({
-                                                "alert_id": aid, "condition_id": condition_id,
-                                                "condition_age_ms": condition_age_ms, "reason": "stale",
-                                            }));
+                                        // === PRE-FLIGHT GATE: WS-first with GQL fallback ===
+                                        // Priority: WS real-time state > GQL poll staleness
+                                        let ws_result = {
+                                            let cache_r = ws_condition_cache.read().await;
+                                            ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                        };
+                                        let gate_blocked = match &ws_result {
+                                            WsGateResult::NotActive { state, age_ms } => {
+                                                warn!("🚫 WS-GATE #{}: condition {} state={} (ws_age={}ms) — DROP",
+                                                    aid, &condition_id, state, age_ms);
+                                                ledger_write("BET_FAILED", &serde_json::json!({
+                                                    "alert_id": aid, "match_key": match_key_for_bet,
+                                                    "condition_id": condition_id, "outcome_id": outcome_id,
+                                                    "error": format!("WS gate: condition state={}", state),
+                                                    "reason_code": "WsStateNotActive",
+                                                    "is_condition_state_reject": true,
+                                                    "ws_state": state, "ws_age_ms": age_ms,
+                                                    "condition_age_ms": condition_age_ms,
+                                                    "requested_odds": azuro_odds,
+                                                    "stake": stake, "path": "edge",
+                                                    "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                }));
+                                                log_event("WS_GATE_DROP", &serde_json::json!({
+                                                    "alert_id": aid, "condition_id": condition_id,
+                                                    "ws_state": state, "ws_age_ms": age_ms,
+                                                    "gql_age_ms": condition_age_ms, "reason": "WsStateNotActive",
+                                                }));
+                                                true
+                                            }
+                                            WsGateResult::Active { age_ms } => {
+                                                debug!("✅ WS-GATE #{}: condition {} Active (ws_age={}ms)", aid, &condition_id, age_ms);
+                                                false // proceed!
+                                            }
+                                            WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
+                                                // Fallback to GQL gate
+                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                    let fb_reason = match &ws_result {
+                                                        WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
+                                                        WsGateResult::NoData => "WsNoData->GqlStale".to_string(),
+                                                        _ => "WsDisabled->GqlStale".to_string(),
+                                                    };
+                                                    warn!("🚫 PRE-FLIGHT GATE #{}: condition {} [{}] gql_age={}ms > {}ms — dropping",
+                                                        aid, &condition_id, fb_reason, condition_age_ms, CONDITION_MAX_AGE_MS);
+                                                    ledger_write("BET_FAILED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": match_key_for_bet,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": format!("pre-flight gate: {}", fb_reason),
+                                                        "reason_code": "PreFlightStale",
+                                                        "is_condition_state_reject": true,
+                                                        "condition_age_ms": condition_age_ms,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "edge",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    log_event("PREFLIGHT_GATE", &serde_json::json!({
+                                                        "alert_id": aid, "condition_id": condition_id,
+                                                        "condition_age_ms": condition_age_ms, "reason": fb_reason,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    false // GQL says fresh enough → proceed
+                                                }
+                                            }
+                                        };
+                                        if gate_blocked {
                                             // Don't mark inflight — we never sent it
                                             // Continue to normal alert flow (no auto-bet)
                                         } else {
@@ -3851,30 +4190,75 @@ async fn main() -> Result<()> {
                                         let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
                                         let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
-                                        // Condition freshness: how stale is our last sighting?
+                                        // Condition freshness: how stale is our last sighting? (GQL)
                                         let condition_age_ms_b = condition_last_seen.get(&condition_id)
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
 
-                                        // === PRE-FLIGHT GATE: condition freshness check (Path B) ===
-                                        if condition_age_ms_b > CONDITION_MAX_AGE_MS {
-                                            warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} stale (age={}ms > {}ms) — dropping",
-                                                aid, &condition_id, condition_age_ms_b, CONDITION_MAX_AGE_MS);
-                                            ledger_write("BET_FAILED", &serde_json::json!({
-                                                "alert_id": aid, "match_key": anomaly.match_key,
-                                                "condition_id": condition_id, "outcome_id": outcome_id,
-                                                "error": "pre-flight gate: condition stale",
-                                                "reason_code": "PreFlightStale",
-                                                "is_condition_state_reject": true,
-                                                "condition_age_ms": condition_age_ms_b,
-                                                "requested_odds": azuro_odds,
-                                                "stake": stake, "path": "anomaly_odds",
-                                                "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
-                                            }));
-                                            log_event("PREFLIGHT_GATE", &serde_json::json!({
-                                                "alert_id": aid, "condition_id": condition_id,
-                                                "condition_age_ms": condition_age_ms_b, "reason": "stale",
-                                            }));
+                                        // === PRE-FLIGHT GATE (Path B): WS-first with GQL fallback ===
+                                        let ws_result_b = {
+                                            let cache_r = ws_condition_cache.read().await;
+                                            ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                        };
+                                        let gate_blocked_b = match &ws_result_b {
+                                            WsGateResult::NotActive { state, age_ms } => {
+                                                warn!("🚫 WS-GATE ODDS #{}: condition {} state={} (ws_age={}ms) — DROP",
+                                                    aid, &condition_id, state, age_ms);
+                                                ledger_write("BET_FAILED", &serde_json::json!({
+                                                    "alert_id": aid, "match_key": anomaly.match_key,
+                                                    "condition_id": condition_id, "outcome_id": outcome_id,
+                                                    "error": format!("WS gate: condition state={}", state),
+                                                    "reason_code": "WsStateNotActive",
+                                                    "is_condition_state_reject": true,
+                                                    "ws_state": state, "ws_age_ms": age_ms,
+                                                    "condition_age_ms": condition_age_ms_b,
+                                                    "requested_odds": azuro_odds,
+                                                    "stake": stake, "path": "anomaly_odds",
+                                                    "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                }));
+                                                log_event("WS_GATE_DROP", &serde_json::json!({
+                                                    "alert_id": aid, "condition_id": condition_id,
+                                                    "ws_state": state, "ws_age_ms": age_ms,
+                                                    "gql_age_ms": condition_age_ms_b, "reason": "WsStateNotActive",
+                                                }));
+                                                true
+                                            }
+                                            WsGateResult::Active { age_ms } => {
+                                                debug!("✅ WS-GATE ODDS #{}: condition {} Active (ws_age={}ms)", aid, &condition_id, age_ms);
+                                                false
+                                            }
+                                            WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
+                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                    let fb_reason_b = match &ws_result_b {
+                                                        WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
+                                                        WsGateResult::NoData => "WsNoData->GqlStale".to_string(),
+                                                        _ => "WsDisabled->GqlStale".to_string(),
+                                                    };
+                                                    warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} [{}] gql_age={}ms > {}ms — dropping",
+                                                        aid, &condition_id, fb_reason_b, condition_age_ms_b, CONDITION_MAX_AGE_MS);
+                                                    ledger_write("BET_FAILED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": anomaly.match_key,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": format!("pre-flight gate: {}", fb_reason_b),
+                                                        "reason_code": "PreFlightStale",
+                                                        "is_condition_state_reject": true,
+                                                        "condition_age_ms": condition_age_ms_b,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "anomaly_odds",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    log_event("PREFLIGHT_GATE", &serde_json::json!({
+                                                        "alert_id": aid, "condition_id": condition_id,
+                                                        "condition_age_ms": condition_age_ms_b, "reason": &fb_reason_b,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    false // GQL says fresh enough → proceed
+                                                }
+                                            }
+                                        };
+                                        if gate_blocked_b {
+                                            // Don't mark inflight — we never sent it
                                         } else {
 
                                         let conf_emoji = if anomaly.confidence == "HIGH" { "🟢" } else { "🟡" };
