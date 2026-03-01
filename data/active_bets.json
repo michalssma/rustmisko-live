@@ -27,7 +27,7 @@
     "team": "Xtreme Gaming",
     "placedAt": "2026-02-27T15:01:04.810Z",
     "status": "pending",
-    "state": "Sent"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772209105894",
@@ -42,7 +42,7 @@
     "team": "Bad Luck",
     "placedAt": "2026-02-27T16:18:26.043Z",
     "status": "pending",
-    "state": "Created"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772216954407",
@@ -87,7 +87,7 @@
     "team": "Galorys",
     "placedAt": "2026-02-27T21:09:28.978Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772232645839",
@@ -117,7 +117,7 @@
     "team": "Detroit Pistons",
     "placedAt": "2026-02-28T00:13:39.581Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772237636587",
@@ -132,7 +132,7 @@
     "team": "CA Union de Mar del Plata",
     "placedAt": "2026-02-28T00:13:56.680Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772238518676",
@@ -147,7 +147,7 @@
     "team": "Uruguay",
     "placedAt": "2026-02-28T00:28:38.878Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772240750653",
@@ -162,7 +162,7 @@
     "team": "Comunicaciones",
     "placedAt": "2026-02-28T01:05:51.019Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772241386677",
@@ -177,7 +177,7 @@
     "team": "Boston Celtics",
     "placedAt": "2026-02-28T01:16:26.924Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772242824688",
@@ -207,7 +207,7 @@
     "team": "Dallas Mavericks",
     "placedAt": "2026-02-28T01:42:01.971Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772249687723",
@@ -222,7 +222,7 @@
     "team": "Voca Pgl Bucharest 2026 North America",
     "placedAt": "2026-02-28T03:34:47.997Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772251685067",
@@ -237,7 +237,7 @@
     "team": "Team Voca",
     "placedAt": "2026-02-28T04:08:05.278Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772258891015",
@@ -252,7 +252,7 @@
     "team": "Deep Cross Gaming",
     "placedAt": "2026-02-28T06:08:11.421Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772260735870",
@@ -267,7 +267,7 @@
     "team": "Lambton Jaffas",
     "placedAt": "2026-02-28T06:38:56.111Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772261723790",
@@ -281,7 +281,8 @@
     "matchKey": "",
     "team": "Tokushima Vortis",
     "placedAt": "2026-02-28T06:55:23.883Z",
-    "status": "pending"
+    "status": "pending",
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772264498072",
@@ -296,7 +297,7 @@
     "team": "Altona Magic SC",
     "placedAt": "2026-02-28T07:41:38.270Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772264954922",
@@ -311,7 +312,7 @@
     "team": "Southern District",
     "placedAt": "2026-02-28T07:49:15.107Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772268554313",
@@ -326,7 +327,7 @@
     "team": "West Torrens Birkalla",
     "placedAt": "2026-02-28T08:49:14.708Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772268695208",
@@ -341,7 +342,7 @@
     "team": "Max Alcala Gurri",
     "placedAt": "2026-02-28T08:51:35.343Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772269545914",
@@ -356,7 +357,7 @@
     "team": "Top Esports",
     "placedAt": "2026-02-28T09:05:46.043Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772270618930",
@@ -371,7 +372,7 @@
     "team": "Qwentry",
     "placedAt": "2026-02-28T09:23:39.081Z",
     "status": "pending",
-    "state": "Accepted"
+    "state": "Settled"
   },
   {
     "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772281064457",
@@ -385,6 +386,21 @@
     "matchKey": "",
     "team": "WhiteBird",
     "placedAt": "2026-02-28T12:17:44.589Z",
+    "status": "pending",
+    "state": "Settled"
+  },
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772337580847",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000291349990000000000001725596862",
+    "outcomeId": "7048",
+    "stake": 2,
+    "odds": 1.5229,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Cristina Bucsa",
+    "placedAt": "2026-03-01T03:59:41.056Z",
     "status": "pending"
   }
 ]
