@@ -5,6 +5,12 @@
 logs/
 data/*.db
 data/*.db*
+data/pending_claims.txt
+data/active_bets.json
+data/bet_count_daily.txt
+data/bet_history.txt
+data/daily_pnl.json
+data/nft_model.json
 temp/
 nul
 .claude/

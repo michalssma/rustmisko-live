@@ -31,9 +31,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const POLL_INTERVAL_SECS: u64 = 2;  // 2s — near-instant detection of Tipsport score changes!
 /// Minimum edge % to trigger alert (all tiers)
-const MIN_EDGE_PCT: f64 = 5.0;
+const MIN_EDGE_PCT: f64 = 8.0;
 /// Don't re-alert same match+score+side within this window
-const ALERT_COOLDOWN_SECS: i64 = 45; // faster re-fire for live execution windows
+const ALERT_COOLDOWN_SECS: i64 = 90; // reduced spam — 90s between re-alerts on same match
 /// Auto-cashout check interval
 const CASHOUT_CHECK_SECS: u64 = 30;
 /// Minimum profit % to auto-cashout
@@ -41,7 +41,7 @@ const CASHOUT_MIN_PROFIT_PCT: f64 = 3.0;
 /// Minimum score-edge % to trigger alert
 const MIN_SCORE_EDGE_PCT: f64 = 8.0;
 /// Score edge cooldown per match (seconds)
-const SCORE_EDGE_COOLDOWN_SECS: i64 = 30; // 30s — react fast to new score changes!
+const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches score changes
 /// === AUTO-BET CONFIG ===
 const AUTO_BET_ENABLED: bool = true;
 /// Base stake per auto-bet in USD
@@ -87,9 +87,17 @@ const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
 const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
-const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
+const AUTO_BET_MIN_MARKET_SOURCES: usize = 3;
 /// Ignore stale odds snapshots older than this threshold
-const MAX_ODDS_AGE_SECS: i64 = 20;
+const MAX_ODDS_AGE_SECS: i64 = 12;
+/// Maximum concurrent pending bets (inflight guard)
+const MAX_CONCURRENT_PENDING: usize = 8;
+/// Loss streak cooldown: consecutive LOST count to trigger pause
+const LOSS_STREAK_PAUSE_THRESHOLD: usize = 3;
+/// Loss streak pause duration (seconds)
+const LOSS_STREAK_PAUSE_SECS: u64 = 300;
+/// Minimum bankroll to allow auto-bet (skip if below)
+const MIN_BANKROLL_USD: f64 = 20.0;
 /// === RISK MANAGEMENT ===
 /// Daily settled-loss limit HARD ceiling — min(this, tier_daily_cap) is effective limit
 const DAILY_LOSS_LIMIT_USD: f64 = 30.0;
@@ -1092,7 +1100,7 @@ fn strip_map_winner_suffix(key: &str) -> String {
 fn normalize_team_name(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(|c| c.is_alphanumeric())
         .collect::<String>()
 }
 
@@ -2917,6 +2925,9 @@ async fn main() -> Result<()> {
     let mut daily_date = Utc::now().format("%Y-%m-%d").to_string();
     let mut daily_loss_alert_sent = false;
     let mut daily_loss_last_reminder: Option<DateTime<Utc>> = None;
+    // === LOSS STREAK TRACKING ===
+    let mut consecutive_losses: usize = 0;
+    let mut loss_streak_pause_until: Option<std::time::Instant> = None;
     // Load from daily_pnl.json if exists (includes SOD bankroll persistence)
     {
         let pnl_path = "data/daily_pnl.json";
@@ -3203,6 +3214,13 @@ async fn main() -> Result<()> {
     let mut claim_safety_counter: u32 = 0;
     // Session start time for portfolio reporting
     let session_start = Utc::now();
+    // WS gate rolling counters (session-level, shown in portfolio)
+    let mut ws_gate_active_count: u32 = 0;       // passed WS gate (Active)
+    let mut ws_gate_not_active_count: u32 = 0;    // dropped by WS (NotActive)
+    let mut ws_gate_stale_fallback_count: u32 = 0; // WS stale → GQL fallback
+    let mut ws_gate_nodata_fallback_count: u32 = 0; // WS no data → GQL fallback
+    // In-flight TTL: bets with token_id=None older than this are considered stale
+    const INFLIGHT_TTL_SECS: i64 = 600; // 10 minutes
 
     loop {
         tokio::select! {
@@ -3531,6 +3549,12 @@ async fn main() -> Result<()> {
                                             edge.match_key, edge.azuro_w1, edge.azuro_w2);
                                     }
 
+                                    // New guards: bankroll floor, pending cap, loss streak
+                                    let bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
+                                    let pending_count = active_bets.len();
+                                    let pending_ok = pending_count < MAX_CONCURRENT_PENDING;
+                                    let streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
+
                                     let should_auto_bet = AUTO_BET_ENABLED
                                         && sport_auto_allowed
                                         && is_preferred_market
@@ -3546,8 +3570,20 @@ async fn main() -> Result<()> {
                                         && anomaly.outcome_id.is_some()
                                         && !generic_esports_blocked
                                         && (!already_bet_this || rebet_ok) // RE-BET: allow if re-bet conditions met
-                                        && stake >= 0.50; // EXPOSURE CAP: stake trimmer didn't zero it out
+                                        && stake >= 0.50 // EXPOSURE CAP: stake trimmer didn't zero it out
+                                        && bankroll_ok   // MIN_BANKROLL guard
+                                        && pending_ok    // MAX_CONCURRENT_PENDING guard
+                                        && streak_ok;    // LOSS_STREAK pause guard
 
+                                    if !bankroll_ok && edge.confidence == "HIGH" {
+                                        info!("🛑 MIN BANKROLL: ${:.2} < ${:.2} — skipping auto-bet", current_bankroll, MIN_BANKROLL_USD);
+                                    }
+                                    if !pending_ok && edge.confidence == "HIGH" {
+                                        info!("🛑 PENDING CAP: {} >= {} — skipping auto-bet", pending_count, MAX_CONCURRENT_PENDING);
+                                    }
+                                    if !streak_ok && edge.confidence == "HIGH" {
+                                        info!("🛑 LOSS STREAK PAUSE: {} consecutive losses — cooling down", consecutive_losses);
+                                    }
                                     if !sport_auto_allowed && edge.confidence == "HIGH" {
                                         info!("📢 {} ALERT ONLY (auto-bet disabled for {})", edge.match_key, sport);
                                     }
@@ -3614,14 +3650,21 @@ async fn main() -> Result<()> {
                                                     "ws_state": state, "ws_age_ms": age_ms,
                                                     "gql_age_ms": condition_age_ms, "reason": "WsStateNotActive",
                                                 }));
+                                                ws_gate_not_active_count += 1;
                                                 true
                                             }
                                             WsGateResult::Active { age_ms } => {
                                                 debug!("✅ WS-GATE #{}: condition {} Active (ws_age={}ms)", aid, &condition_id, age_ms);
+                                                ws_gate_active_count += 1;
                                                 false // proceed!
                                             }
                                             WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
                                                 // Fallback to GQL gate
+                                                match &ws_result {
+                                                    WsGateResult::Stale { .. } => ws_gate_stale_fallback_count += 1,
+                                                    WsGateResult::NoData => ws_gate_nodata_fallback_count += 1,
+                                                    _ => {}
+                                                }
                                                 if condition_age_ms > CONDITION_MAX_AGE_MS {
                                                     let fb_reason = match &ws_result {
                                                         WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
@@ -4163,6 +4206,11 @@ async fn main() -> Result<()> {
                                         net < DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac)
                                     };
 
+                                    // New guards for anomaly path too
+                                    let anomaly_bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
+                                    let anomaly_pending_ok = active_bets.len() < MAX_CONCURRENT_PENDING;
+                                    let anomaly_streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
+
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
@@ -4176,7 +4224,10 @@ async fn main() -> Result<()> {
                                         && !already_bet_this
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
-                                        && anomaly_stake >= 0.50; // EXPOSURE CAP
+                                        && anomaly_stake >= 0.50 // EXPOSURE CAP
+                                        && anomaly_bankroll_ok   // MIN_BANKROLL guard
+                                        && anomaly_pending_ok    // MAX_CONCURRENT_PENDING guard
+                                        && anomaly_streak_ok;    // LOSS_STREAK pause guard
 
                                     if anomaly.is_live && market_source_count < AUTO_BET_MIN_MARKET_SOURCES {
                                         info!("⏭️ ODDS ANOMALY {} skipped for auto-bet: only {} market source(s)",
@@ -4221,13 +4272,20 @@ async fn main() -> Result<()> {
                                                     "ws_state": state, "ws_age_ms": age_ms,
                                                     "gql_age_ms": condition_age_ms_b, "reason": "WsStateNotActive",
                                                 }));
+                                                ws_gate_not_active_count += 1;
                                                 true
                                             }
                                             WsGateResult::Active { age_ms } => {
                                                 debug!("✅ WS-GATE ODDS #{}: condition {} Active (ws_age={}ms)", aid, &condition_id, age_ms);
+                                                ws_gate_active_count += 1;
                                                 false
                                             }
                                             WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
+                                                match &ws_result_b {
+                                                    WsGateResult::Stale { .. } => ws_gate_stale_fallback_count += 1,
+                                                    WsGateResult::NoData => ws_gate_nodata_fallback_count += 1,
+                                                    _ => {}
+                                                }
                                                 if condition_age_ms_b > CONDITION_MAX_AGE_MS {
                                                     let fb_reason_b = match &ws_result_b {
                                                         WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
@@ -4820,6 +4878,11 @@ async fn main() -> Result<()> {
                             if claimable && payout_usd > 0.0 {
                                 // WON or CANCELED — claim it!
                                 let result = if payout_usd > bet.amount_usd * 1.1 { "Won" } else { "Canceled" };
+                                // Reset loss streak on win
+                                if result == "Won" {
+                                    consecutive_losses = 0;
+                                    loss_streak_pause_until = None;
+                                }
                                 // === LEDGER: WON/CANCELED detected (PATH A) ===
                                 ledger_write(if result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
                                     "alert_id": bet.alert_id, "bet_id": bet.bet_id,
@@ -4874,6 +4937,12 @@ async fn main() -> Result<()> {
                                 if result == "Lost" {
                                     total_wagered += bet.amount_usd;
                                     daily_wagered += bet.amount_usd;
+                                    // Loss streak tracking
+                                    consecutive_losses += 1;
+                                    if consecutive_losses >= LOSS_STREAK_PAUSE_THRESHOLD {
+                                        loss_streak_pause_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOSS_STREAK_PAUSE_SECS));
+                                        info!("🛑 LOSS STREAK: {} consecutive losses — pausing auto-bet for {}s", consecutive_losses, LOSS_STREAK_PAUSE_SECS);
+                                    }
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write(
@@ -5318,8 +5387,8 @@ async fn main() -> Result<()> {
                             .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
                             .collect();
 
-                        // Build enriched info from on-chain bets (team, odds, amount from executor metadata)
-                        let onchain_enriched: Vec<(String, String, f64, f64, String)> = bets_arr.iter()
+                        // Build enriched info from on-chain bets
+                        let onchain_enriched: Vec<(String, String, f64, f64, String, String)> = bets_arr.iter()
                             .filter(|b| {
                                 let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
                                 st == "pending" || st == "claimable"
@@ -5330,31 +5399,50 @@ async fn main() -> Result<()> {
                                 let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                (tid, team, odds, amount, match_key)
+                                let bet_id = b.get("betId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                (tid, team, odds, amount, match_key, bet_id)
                             })
                             .collect();
 
                         let pre_count = active_bets.len();
 
                         // 1) Remove local bets whose tokenId is NOT in on-chain pending/claimable
-                        //    (they settled on-chain — lost, already_paid, or claimed)
                         active_bets.retain(|b| {
                             match &b.token_id {
                                 Some(tid) => onchain_pending_tids.contains(tid),
-                                None => true, // keep bets with no tokenId yet (recently placed)
+                                None => true, // keep in-flight bets (tokenId unknown)
                             }
                         });
 
-                        // 2) For on-chain pending bets not in local list, add them
-                        //    (covers bets that were tracked only by executor, not alert-bot)
+                        // 2) TTL: expire in-flight bets (token_id=None) older than INFLIGHT_TTL_SECS
+                        let now_utc = Utc::now();
+                        active_bets.retain(|b| {
+                            if b.token_id.is_some() { return true; } // on-chain verified
+                            if b.placed_at == "loaded" || b.placed_at == "onchain" { return true; }
+                            match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+                                Ok(placed) => {
+                                    let age_secs = (now_utc - placed.with_timezone(&Utc)).num_seconds();
+                                    if age_secs > INFLIGHT_TTL_SECS {
+                                        info!("⏰ INFLIGHT_TTL: bet {} ({}) expired after {}s — removing",
+                                            b.bet_id, b.value_team, age_secs);
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }
+                                Err(_) => true, // can't parse — keep it
+                            }
+                        });
+
+                        // 3) For on-chain pending bets not in local list, add them
                         let local_tids: HashSet<String> = active_bets.iter()
                             .filter_map(|b| b.token_id.clone())
                             .collect();
-                        for (tid, team, odds, amount, match_key) in &onchain_enriched {
+                        for (tid, team, odds, amount, match_key, bet_id) in &onchain_enriched {
                             if !local_tids.contains(tid) && !team.is_empty() {
                                 active_bets.push(ActiveBet {
                                     alert_id: 0,
-                                    bet_id: format!("onchain_{}", tid),
+                                    bet_id: if !bet_id.is_empty() { bet_id.clone() } else { format!("onchain_{}", tid) },
                                     match_key: match_key.clone(),
                                     team1: team.clone(),
                                     team2: "?".to_string(),
@@ -5370,17 +5458,26 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // 3) Update tokenIds for local bets missing them (match by team/odds)
+                        // 4) Harden tokenId discovery: match by betId first, then team+odds+conditionId
                         for b in active_bets.iter_mut() {
                             if b.token_id.is_none() {
-                                // Try to find matching on-chain bet by team name
-                                if let Some((tid, _, _, _, _)) = onchain_enriched.iter()
-                                    .find(|(_, t, o, _, _)| {
-                                        !t.is_empty() && t == &b.value_team && (*o - b.odds).abs() < 0.05
+                                // Primary: match by betId (most reliable)
+                                if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
+                                    .find(|(_, _, _, _, _, bid)| !bid.is_empty() && bid == &b.bet_id)
+                                {
+                                    b.token_id = Some(tid.clone());
+                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} via betId match", tid, b.bet_id);
+                                }
+                                // Secondary: match by team+odds (with tighter tolerance)
+                                else if let Some((tid, _, _, _, mk, _)) = onchain_enriched.iter()
+                                    .find(|(_, t, o, _, mk, _)| {
+                                        !t.is_empty() && t == &b.value_team
+                                        && (*o - b.odds).abs() < 0.03
+                                        && (mk.is_empty() || b.match_key.is_empty() || mk == &b.match_key)
                                     })
                                 {
                                     b.token_id = Some(tid.clone());
-                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} ({})",
+                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} ({}) via team+odds+matchKey",
                                         tid, b.bet_id, b.value_team);
                                 }
                             }
@@ -5392,7 +5489,7 @@ async fn main() -> Result<()> {
                                 pre_count, post_count, onchain_pending_tids.len());
                         }
 
-                        // 4) Atomic rewrite of pending_claims.txt from reconciled list
+                        // 5) Atomic rewrite of pending_claims.txt
                         if pre_count != post_count || active_bets.iter().any(|b| b.placed_at == "onchain") {
                             if let Ok(mut f) = std::fs::OpenOptions::new()
                                 .create(true).write(true).truncate(true)
@@ -5407,17 +5504,51 @@ async fn main() -> Result<()> {
                                 info!("💾 RECONCILE: pending_claims.txt rewritten ({} entries)", active_bets.len());
                             }
                         }
+
+                        // 6) INVARIANT CHECK: on-chain pending vs local on-chain-verified count
+                        let local_onchain_count = active_bets.iter().filter(|b| b.token_id.is_some()).count();
+                        let onchain_count = onchain_pending_tids.len();
+                        if local_onchain_count != onchain_count {
+                            warn!("⚠️ INVARIANT MISMATCH: local on-chain verified={} vs on-chain pending+claimable={} — investigate!",
+                                local_onchain_count, onchain_count);
+                        }
                     }
                 }
 
-                // Pending bet list — now sourced from reconciled active_bets (on-chain truth)
-                if active_bets.is_empty() {
+                // === SPLIT DISPLAY: On-chain (truth) vs In-flight (unconfirmed) ===
+                let onchain_bets: Vec<&ActiveBet> = active_bets.iter()
+                    .filter(|b| b.token_id.is_some())
+                    .collect();
+                let inflight_bets: Vec<&ActiveBet> = active_bets.iter()
+                    .filter(|b| b.token_id.is_none())
+                    .collect();
+
+                if onchain_bets.is_empty() && inflight_bets.is_empty() {
                     msg.push_str("🎰 Pending sázek: 0\n");
                 } else {
-                    let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
-                    msg.push_str(&format!("🎰 Pending sázek: <b>{}</b> (ve hře: ${:.2})\n", active_bets.len(), total_at_risk));
-                    for b in &active_bets {
-                        msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                    // On-chain verified pending (truth)
+                    if !onchain_bets.is_empty() {
+                        let total_onchain: f64 = onchain_bets.iter().map(|b| b.amount_usd).sum();
+                        msg.push_str(&format!("🎰 Pending sázek: <b>{}</b> (ve hře: ${:.2})\n",
+                            onchain_bets.len(), total_onchain));
+                        for b in &onchain_bets {
+                            msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                        }
+                    }
+                    // In-flight unconfirmed (not yet on-chain, NOT counted in exposure)
+                    if !inflight_bets.is_empty() {
+                        msg.push_str(&format!("✈️ In-flight (neověřeno): <b>{}</b>\n", inflight_bets.len()));
+                        for b in &inflight_bets {
+                            let age_str = match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+                                Ok(placed) => {
+                                    let secs = (Utc::now() - placed.with_timezone(&Utc)).num_seconds();
+                                    format!("{}s ago", secs)
+                                }
+                                Err(_) => b.placed_at.clone(),
+                            };
+                            msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2} ({})\n",
+                                b.value_team, b.odds, b.amount_usd, age_str));
+                        }
                     }
                 }
 
@@ -5446,6 +5577,9 @@ async fn main() -> Result<()> {
                         format!("ON ({} conds, newest {}ms)", cache_size, newest_age_ms)
                     };
                     msg.push_str(&format!("\n🔌 WS gate: {}\n", ws_status));
+                    msg.push_str(&format!("  ✅ active={} | 🚫 not_active={} | ⏳ stale={} | ❓ nodata={}\n",
+                        ws_gate_active_count, ws_gate_not_active_count,
+                        ws_gate_stale_fallback_count, ws_gate_nodata_fallback_count));
                 }
 
                 // Feed-hub live info
@@ -5846,7 +5980,7 @@ async fn main() -> Result<()> {
                                                 total, won, lost, pending_count, redeemable
                                             ));
 
-                                            // Reconcile active_bets from on-chain data
+                                            // Reconcile active_bets from on-chain data (same as ticker)
                                             if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
                                                 let onchain_pending_tids: HashSet<String> = bets_arr.iter()
                                                     .filter(|b| {
@@ -5855,26 +5989,106 @@ async fn main() -> Result<()> {
                                                     })
                                                     .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
                                                     .collect();
+
+                                                let onchain_enriched: Vec<(String, String, f64, f64, String, String)> = bets_arr.iter()
+                                                    .filter(|b| {
+                                                        let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                                        st == "pending" || st == "claimable"
+                                                    })
+                                                    .map(|b| {
+                                                        let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                                                        let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                        let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                        let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                                        let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                        let bet_id = b.get("betId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                                        (tid, team, odds, amount, match_key, bet_id)
+                                                    })
+                                                    .collect();
+
+                                                // Remove settled on-chain bets
                                                 active_bets.retain(|b| {
                                                     match &b.token_id {
                                                         Some(tid) => onchain_pending_tids.contains(tid),
                                                         None => true,
                                                     }
                                                 });
+
+                                                // TTL: expire stale in-flight bets
+                                                let now_utc = Utc::now();
+                                                active_bets.retain(|b| {
+                                                    if b.token_id.is_some() { return true; }
+                                                    if b.placed_at == "loaded" || b.placed_at == "onchain" { return true; }
+                                                    match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+                                                        Ok(placed) => (now_utc - placed.with_timezone(&Utc)).num_seconds() <= INFLIGHT_TTL_SECS,
+                                                        Err(_) => true,
+                                                    }
+                                                });
+
+                                                // Harden tokenId discovery: betId first, then team+odds+matchKey
+                                                for b in active_bets.iter_mut() {
+                                                    if b.token_id.is_none() {
+                                                        if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
+                                                            .find(|(_, _, _, _, _, bid)| !bid.is_empty() && bid == &b.bet_id)
+                                                        {
+                                                            b.token_id = Some(tid.clone());
+                                                        } else if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
+                                                            .find(|(_, t, o, _, mk, _)| {
+                                                                !t.is_empty() && t == &b.value_team
+                                                                && (*o - b.odds).abs() < 0.03
+                                                                && (mk.is_empty() || b.match_key.is_empty() || mk == &b.match_key)
+                                                            })
+                                                        {
+                                                            b.token_id = Some(tid.clone());
+                                                        }
+                                                    }
+                                                }
+
+                                                // Invariant check
+                                                let local_onchain_count = active_bets.iter().filter(|b| b.token_id.is_some()).count();
+                                                let onchain_count = onchain_pending_tids.len();
+                                                if local_onchain_count != onchain_count {
+                                                    msg.push_str(&format!("⚠️ <b>INVARIANT:</b> local verified={} vs on-chain={}\n",
+                                                        local_onchain_count, onchain_count));
+                                                }
                                             }
                                         }
                                     }
 
-                                    // Pending list — reconciled
-                                    if !active_bets.is_empty() {
-                                        msg.push_str(&format!("\n🎰 <b>Pending sázky ({})</b>\n", active_bets.len()));
-                                        let total_at_risk: f64 = active_bets.iter().map(|b| b.amount_usd).sum();
-                                        for b in &active_bets {
-                                            msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
-                                        }
-                                        msg.push_str(&format!("  Ve hře: <b>${:.2}</b>\n", total_at_risk));
-                                    } else {
+                                    // Split display: on-chain vs in-flight
+                                    let onchain_bets: Vec<&ActiveBet> = active_bets.iter()
+                                        .filter(|b| b.token_id.is_some())
+                                        .collect();
+                                    let inflight_bets_view: Vec<&ActiveBet> = active_bets.iter()
+                                        .filter(|b| b.token_id.is_none())
+                                        .collect();
+
+                                    if onchain_bets.is_empty() && inflight_bets_view.is_empty() {
                                         msg.push_str("\n🎰 Žádné pending sázky\n");
+                                    } else {
+                                        if !onchain_bets.is_empty() {
+                                            let total_onchain: f64 = onchain_bets.iter().map(|b| b.amount_usd).sum();
+                                            msg.push_str(&format!("\n🎰 <b>On-chain pending ({})</b> — ve hře: ${:.2}\n",
+                                                onchain_bets.len(), total_onchain));
+                                            for b in &onchain_bets {
+                                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                                            }
+                                        }
+                                        if !inflight_bets_view.is_empty() {
+                                            msg.push_str(&format!("\n✈️ <b>In-flight ({})</b> — neověřeno on-chain\n",
+                                                inflight_bets_view.len()));
+                                            for b in &inflight_bets_view {
+                                                let age_str = match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+                                                    Ok(placed) => {
+                                                        let secs = (Utc::now() - placed.with_timezone(&Utc)).num_seconds();
+                                                        format!("{}s ago", secs)
+                                                    }
+                                                    Err(_) => b.placed_at.clone(),
+                                                };
+                                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2} ({})\n",
+                                                    b.value_team, b.odds, b.amount_usd, age_str));
+                                            }
+                                        }
                                     }
 
                                     // WS gate diagnostics
@@ -5893,6 +6107,9 @@ async fn main() -> Result<()> {
                                             format!("ON ({} conds, newest {}ms)", cache_size, newest_age_ms)
                                         };
                                         msg.push_str(&format!("\n🔌 WS gate: {}\n", ws_status));
+                                        msg.push_str(&format!("  ✅ active={} | 🚫 not_active={} | ⏳ stale={} | ❓ nodata={}\n",
+                                            ws_gate_active_count, ws_gate_not_active_count,
+                                            ws_gate_stale_fallback_count, ws_gate_nodata_fallback_count));
                                     }
 
                                     let daily_pnl = daily_returned - daily_wagered;

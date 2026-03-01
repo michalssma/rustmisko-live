@@ -66,3 +66,4 @@ serde_json         = { workspace = true }
 chrono             = { workspace = true }
 rusqlite           = { version = "0.32", features = ["bundled"] }
 reqwest            = { workspace = true }
+unicode-normalization = "0.1"

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,6 +28,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
+use unicode_normalization::UnicodeNormalization;
 
 mod feed_db;
 mod azuro_poller;
@@ -167,6 +169,7 @@ struct FeedHubState {
     live: Arc<RwLock<HashMap<String, LiveMatchState>>>,
     odds: Arc<RwLock<HashMap<OddsKey, OddsState>>>,
     connections: Arc<RwLock<usize>>,
+    alias_cache: AliasCache,
 }
 
 impl FeedHubState {
@@ -175,6 +178,7 @@ impl FeedHubState {
             live: Arc::new(RwLock::new(HashMap::new())),
             odds: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(0)),
+            alias_cache: new_alias_cache(),
         }
     }
 }
@@ -183,6 +187,276 @@ impl FeedHubState {
 /// FlashScore format: "Blanchet U." → "blanchet"
 /// Azuro format: "Ugo Blanchet" → "blanchet"
 /// Handles particles: "De Stefano S." → "destefano", "Samira De Stefano" → "destefano"
+
+// ====================================================================
+// Feature flags (env kill-switches) + global counters
+// ====================================================================
+/// NORM_TRACE: detailed raw→normalized logging (default OFF, I/O heavy)
+static FF_NORM_TRACE: AtomicBool = AtomicBool::new(false);
+/// Sampling counter for NORM_TRACE: log every Nth ingest (default 20 = 5%)
+const NORM_TRACE_SAMPLE_EVERY: u64 = 20;
+static NORM_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// EXTENDED_SUFFIX_STRIP: extra suffix list (default ON)
+static FF_EXTENDED_SUFFIX_STRIP: AtomicBool = AtomicBool::new(true);
+/// TOKEN_SUBSET_PAIR_ALIAS: write-time fuzzy token-subset matching (default ON)
+static FF_TOKEN_SUBSET_PAIR_ALIAS: AtomicBool = AtomicBool::new(true);
+/// Max alias cache entries (LRU eviction beyond this)
+const ALIAS_CACHE_MAX: usize = 1000;
+/// Alias cache TTL in seconds (12h)
+const ALIAS_CACHE_TTL_SECS: i64 = 43200;
+
+/// Load feature flags from environment variables (call once at startup)
+fn load_feature_flags() {
+    if let Ok(v) = std::env::var("FF_NORM_TRACE") {
+        FF_NORM_TRACE.store(v == "true" || v == "1", Ordering::Relaxed);
+    }
+    if let Ok(v) = std::env::var("FF_EXTENDED_SUFFIX_STRIP") {
+        if v == "false" || v == "0" {
+            FF_EXTENDED_SUFFIX_STRIP.store(false, Ordering::Relaxed);
+        }
+    }
+    if let Ok(v) = std::env::var("FF_TOKEN_SUBSET_PAIR_ALIAS") {
+        if v == "false" || v == "0" {
+            FF_TOKEN_SUBSET_PAIR_ALIAS.store(false, Ordering::Relaxed);
+        }
+    }
+    info!(
+        "Feature flags: NORM_TRACE={}, EXTENDED_SUFFIX_STRIP={}, TOKEN_SUBSET_PAIR_ALIAS={}",
+        FF_NORM_TRACE.load(Ordering::Relaxed),
+        FF_EXTENDED_SUFFIX_STRIP.load(Ordering::Relaxed),
+        FF_TOKEN_SUBSET_PAIR_ALIAS.load(Ordering::Relaxed),
+    );
+}
+
+/// Normalize sport label: unify variant names to canonical form
+/// hockey → ice-hockey (FlashScore, Tipsport, Chance send "hockey"; Azuro sends "ice-hockey")
+/// lol → league-of-legends, csgo → cs2, esport → esports
+fn normalize_sport(sport: &str) -> String {
+    let s = sport.to_lowercase();
+    match s.as_str() {
+        "hockey" | "hokej" | "ledni-hokej" | "lední hokej" => "ice-hockey".to_string(),
+        "lol" => "league-of-legends".to_string(),
+        "csgo" | "cs:go" | "counter-strike" => "cs2".to_string(),
+        "esport" | "e-sporty" | "e-sport" => "esports".to_string(),
+        "fotbal" | "soccer" => "football".to_string(),
+        "basketbal" => "basketball".to_string(),
+        "volejbal" => "volleyball".to_string(),
+        "házenou" | "handbal" => "handball".to_string(),
+        _ => s,
+    }
+}
+
+/// Translate Czech country/team names to English equivalents.
+/// Called BEFORE normalize_name, operates on the NFKD-stripped lowercase string.
+/// Only maps well-known country names that actually appear in Czech scrapers.
+fn translate_country_name(name: &str) -> String {
+    // All inputs should already be lowercase + diacritics stripped
+    let translations: &[(&str, &str)] = &[
+        ("novyzeland", "newzealand"),
+        ("novykorejsko", "southkorea"),
+        ("jiznikorejsko", "southkorea"),
+        ("korejskarepublika", "southkorea"),
+        ("severnikorejsko", "northkorea"),
+        ("cina", "china"),
+        ("japonsko", "japan"),
+        ("nemecko", "germany"),
+        ("rakousko", "austria"),
+        ("svycarsko", "switzerland"),
+        ("francouz", "france"),    // francouzsko = France (adj)
+        ("francie", "france"),
+        ("spanelsko", "spain"),
+        ("italie", "italy"),
+        ("portugalsko", "portugal"),
+        ("recko", "greece"),
+        ("turecko", "turkey"),
+        ("polsko", "poland"),
+        ("madarsko", "hungary"),
+        ("rumunsko", "romania"),
+        ("bulharsko", "bulgaria"),
+        ("chorvatsko", "croatia"),
+        ("srbsko", "serbia"),
+        ("slovinsko", "slovenia"),
+        ("slovensko", "slovakia"),
+        ("cesko", "czechia"),
+        ("ceskarepublika", "czechia"),
+        ("rusko", "russia"),
+        ("ukrajina", "ukraine"),
+        ("belgie", "belgium"),
+        ("nizozemsko", "netherlands"),
+        ("holandsko", "netherlands"),
+        ("dansko", "denmark"),
+        ("norsko", "norway"),
+        ("svedsko", "sweden"),
+        ("finsko", "finland"),
+        ("irsko", "ireland"),
+        ("skotsko", "scotland"),
+        ("brazilie", "brazil"),
+        ("argentina", "argentina"),
+        ("mexiko", "mexico"),
+        ("kanada", "canada"),
+        ("australie", "australia"),
+        ("indie", "india"),
+        ("jihoafrickarepublika", "southafrica"),
+    ];
+    let mut s = name.to_string();
+    for (cz, en) in translations {
+        if s.contains(cz) {
+            s = s.replace(cz, en);
+        }
+    }
+    s
+}
+
+/// Strip Unicode diacritics via NFKD decomposition + filtering combining marks.
+/// "Nový Zéland" → "Novy Zeland", "München" → "Munchen"
+fn strip_diacritics(s: &str) -> String {
+    s.nfkd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect()
+}
+
+/// Check if NORM_TRACE should fire (sampling: every NORM_TRACE_SAMPLE_EVERY calls)
+fn should_norm_trace() -> bool {
+    if !FF_NORM_TRACE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let n = NORM_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    n % NORM_TRACE_SAMPLE_EVERY == 0
+}
+
+// ====================================================================
+// Alias cache for token-subset matching (Phase 3.2)
+// ====================================================================
+#[derive(Clone, Debug)]
+struct AliasCacheEntry {
+    target_key: String,
+    created_at: DateTime<Utc>,
+}
+
+type AliasCache = Arc<RwLock<HashMap<String, AliasCacheEntry>>>;
+
+fn new_alias_cache() -> AliasCache {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+/// Ultra-common tokens that alone are NOT sufficient for a match
+const ULTRA_COMMON_TOKENS: &[&str] = &[
+    "fc", "sc", "afc", "bfc", "rc", "ac", "cf", "cd", "sd", "ud",
+    "club", "united", "city", "town", "real", "sporting",
+    "dynamo", "spartak", "lokomotiv", "olympic", "national",
+];
+
+/// Token-subset pair matching: match if BOTH teams have ≥2 meaningful tokens
+/// and both team pairs overlap (subset). Returns the matched live_key.
+fn token_subset_pair_match<'a>(
+    odds_key: &str,
+    live_keys: &'a [&str],
+) -> Option<&'a str> {
+    if !FF_TOKEN_SUBSET_PAIR_ALIAS.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let parts: Vec<&str> = odds_key.splitn(2, "::").collect();
+    if parts.len() != 2 { return None; }
+    let sport = parts[0];
+    let teams = parts[1];
+    let vs_parts: Vec<&str> = teams.splitn(2, "_vs_").collect();
+    if vs_parts.len() != 2 { return None; }
+    let (ot_a, ot_b) = (vs_parts[0], vs_parts[1]);
+
+    // Each team needs ≥2 meaningful tokens (chars ≥3, not ultra-common)
+    let ot_a_tokens: Vec<&str> = split_to_tokens(ot_a);
+    let ot_b_tokens: Vec<&str> = split_to_tokens(ot_b);
+
+    let ot_a_meaningful: Vec<&str> = ot_a_tokens.iter()
+        .filter(|t| t.len() >= 3 && !ULTRA_COMMON_TOKENS.contains(t))
+        .copied().collect();
+    let ot_b_meaningful: Vec<&str> = ot_b_tokens.iter()
+        .filter(|t| t.len() >= 3 && !ULTRA_COMMON_TOKENS.contains(t))
+        .copied().collect();
+
+    // Guardrail: both teams need ≥2 meaningful tokens
+    if ot_a_meaningful.len() < 2 || ot_b_meaningful.len() < 2 {
+        return None;
+    }
+
+    for &cand in live_keys {
+        let cparts: Vec<&str> = cand.splitn(2, "::").collect();
+        if cparts.len() != 2 { continue; }
+        if cparts[0] != sport { continue; }
+        let cteams: Vec<&str> = cparts[1].splitn(2, "_vs_").collect();
+        if cteams.len() != 2 { continue; }
+        let (ct_a, ct_b) = (cteams[0], cteams[1]);
+
+        let ct_a_tokens: Vec<&str> = split_to_tokens(ct_a);
+        let ct_b_tokens: Vec<&str> = split_to_tokens(ct_b);
+
+        // Try both orderings (keys are alphabetically sorted, but check both)
+        let fwd = token_pair_overlaps(&ot_a_meaningful, &ot_b_meaningful, &ct_a_tokens, &ct_b_tokens);
+        let rev = token_pair_overlaps(&ot_a_meaningful, &ot_b_meaningful, &ct_b_tokens, &ct_a_tokens);
+
+        if fwd || rev {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// Split a normalized team name into tokens (split on non-alphanumeric boundaries)
+fn split_to_tokens(name: &str) -> Vec<&str> {
+    // Names are already alphanumeric-only, so we can't split on delimiters.
+    // Instead, return the name as a single token since it's concatenated.
+    // For token-subset, we need at least partial substring matching.
+    if name.is_empty() { return vec![]; }
+    vec![name]
+}
+
+/// Check if odds team tokens overlap with candidate team tokens (both teams simultaneously)
+/// Uses substring containment since names are concatenated alphanumeric strings.
+fn token_pair_overlaps(
+    ot_a: &[&str], ot_b: &[&str],
+    ct_a_tokens: &[&str], ct_b_tokens: &[&str],
+) -> bool {
+    // For concatenated names, check if one contains the other (or significant overlap)
+    let ot_a_str: String = ot_a.join("");
+    let ot_b_str: String = ot_b.join("");
+    let ct_a_str: String = ct_a_tokens.join("");
+    let ct_b_str: String = ct_b_tokens.join("");
+
+    if ot_a_str.is_empty() || ot_b_str.is_empty() || ct_a_str.is_empty() || ct_b_str.is_empty() {
+        return false;
+    }
+
+    // Both teams must match: A↔A' and B↔B' (or A↔B' and B↔A')
+    let a_match = substring_overlap(&ot_a_str, &ct_a_str);
+    let b_match = substring_overlap(&ot_b_str, &ct_b_str);
+
+    a_match && b_match
+}
+
+/// Check if two concatenated team names have significant substring overlap.
+/// At least 60% of the shorter name must be contained in the longer name.
+fn substring_overlap(a: &str, b: &str) -> bool {
+    if a == b { return true; }
+    // One contains the other
+    if a.contains(b) || b.contains(a) { return true; }
+
+    // Check longest common substring (simplified: prefix/suffix overlap)
+    let (shorter, longer) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let min_overlap = (shorter.len() * 60 / 100).max(3);
+
+    // Check if any substring of `shorter` with length >= min_overlap exists in `longer`
+    for start in 0..shorter.len() {
+        let remaining = shorter.len() - start;
+        if remaining < min_overlap { break; }
+        let chunk = &shorter[start..start + min_overlap];
+        if longer.contains(chunk) {
+            return true;
+        }
+    }
+    false
+}
+
 fn normalize_tennis_name(name: &str) -> String {
     let name = name.trim();
     let parts: Vec<&str> = name.split_whitespace().collect();
@@ -227,11 +501,18 @@ fn normalize_tennis_name(name: &str) -> String {
 }
 
 fn normalize_name(name: &str) -> String {
+    // Step 0: Strip diacritics via NFKD decomposition
+    //  "Nový Zéland" → "Novy Zeland", "München" → "Munchen"
+    let stripped = strip_diacritics(name);
+
     // Strip ALL non-alphanumeric chars so "Thunder Downunder" == "THUNDERdOWNUNDER"
-    let mut s: String = name.to_lowercase()
+    let mut s: String = stripped.to_lowercase()
         .chars()
         .filter(|c| c.is_alphanumeric())
         .collect();
+
+    // Step 1: Translate Czech country names to English
+    s = translate_country_name(&s);
 
     // Strip common prefixes that differ between sources
     // HLTV: "Nemesis", Azuro: "Team Nemesis" → both → "nemesis"
@@ -280,6 +561,21 @@ fn normalize_name(name: &str) -> String {
         if s.len() > suffix.len() + 3 && s.ends_with(suffix) {
             s.truncate(s.len() - suffix.len());
             break;
+        }
+    }
+
+    // Extended suffixes (behind kill-switch FF_EXTENDED_SUFFIX_STRIP)
+    if FF_EXTENDED_SUFFIX_STRIP.load(Ordering::Relaxed) {
+        let ext_suffixes = [
+            "utd", "town", "youth", "npl", "reserves", "junior",
+            "afc", "bfc", "rovers", "athletic",
+            "hotspurs", "albion", "argyle", "county",
+        ];
+        for suffix in &ext_suffixes {
+            if s.len() > suffix.len() + 3 && s.ends_with(suffix) {
+                s.truncate(s.len() - suffix.len());
+                break;
+            }
         }
     }
 
@@ -441,7 +737,7 @@ fn normalize_esports_name(name: &str) -> String {
 }
 
 fn match_key(sport: &str, team1: &str, team2: &str) -> String {
-    let sport_lower = sport.to_lowercase();
+    let sport_lower = normalize_sport(sport);
     // All esports game labels (cs2, dota-2, valorant, lol, starcraft, esports)
     // are normalized to a SINGLE "esports" prefix.  This eliminates the need
     // for write-time alias explosion.  The actual game title is still preserved
@@ -1231,6 +1527,14 @@ async fn handle_fortuna_post(state: &FeedHubState, body_str: &str) -> (bool, Str
         let sport = &m.sport;
         let key = match_key(sport, &m.team1, &m.team2);
 
+        // NORM_TRACE (sampled)
+        if should_norm_trace() {
+            debug!(
+                "NORM_TRACE src=fortuna sport={} raw={}|{} key={}",
+                sport, m.team1, m.team2, key
+            );
+        }
+
         let mut score1 = m.score1;
         let mut score2 = m.score2;
 
@@ -1527,6 +1831,14 @@ async fn handle_socket(
                                     let key = match_key(&payload.sport, &payload.team1, &payload.team2);
                                     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
+                                    // NORM_TRACE (sampled)
+                                    if should_norm_trace() {
+                                        debug!(
+                                            "NORM_TRACE src={} sport={} raw={}|{} key={}",
+                                            env_source, payload.sport, payload.team1, payload.team2, key
+                                        );
+                                    }
+
                                     state.live.write().await.insert(
                                         key.clone(),
                                         LiveMatchState {
@@ -1554,6 +1866,15 @@ async fn handle_socket(
                                     let seen_at = parse_ts(&env.ts);
                                     let key = match_key(&payload.sport, &payload.team1, &payload.team2);
                                     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+
+                                    // NORM_TRACE (sampled)
+                                    if should_norm_trace() {
+                                        debug!(
+                                            "NORM_TRACE src={} sport={} bk={} raw={}|{} key={}",
+                                            env_source, payload.sport, payload.bookmaker,
+                                            payload.team1, payload.team2, key
+                                        );
+                                    }
 
                                     let odds_key = OddsKey {
                                         match_key: key.clone(),
@@ -1674,6 +1995,8 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    load_feature_flags();
+
     let bind = std::env::var("FEED_HUB_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     let addr: SocketAddr = bind.parse().context("Invalid FEED_HUB_BIND")?;
 
@@ -1742,15 +2065,71 @@ async fn main() -> Result<()> {
                 let odds_items = state.odds.read().await.len();
 
                 // “fused_ready” = kolik odds klíčů má zároveň live
-                let fused_ready = {
+                let (fused_ready, fusion_misses) = {
                     let live = state.live.read().await;
                     let odds = state.odds.read().await;
                     let mut match_keys = std::collections::HashSet::new();
                     for ok in odds.keys() {
                         match_keys.insert(ok.match_key.clone());
                     }
-                    match_keys.iter().filter(|k| live.contains_key(k.as_str())).count()
+                    let live_keys_vec: Vec<&str> = live.keys().map(|s| s.as_str()).collect();
+                    let ea: &[&str] = &[
+                        "cs2", "dota-2", "league-of-legends", "valorant",
+                        "basketball", "football", "mma", "starcraft",
+                    ];
+                    let mut fused = 0usize;
+                    let mut misses: Vec<String> = Vec::new();
+                    for k in &match_keys {
+                        let direct = live.contains_key(k.as_str());
+                        let alt = !direct && {
+                            let p: Vec<&str> = k.splitn(2, "::").collect();
+                            if p.len() == 2 {
+                                let tail = p[1];
+                                ea.iter().any(|a2| {
+                                    if *a2 == p[0] {
+                                        live.contains_key(&format!("esports::{}", tail))
+                                    } else { false }
+                                })
+                            } else { false }
+                        };
+                        let fz = !direct && !alt && fuzzy_find_key(k.as_str(), &live_keys_vec).is_some();
+                        let tk = !direct && !alt && !fz && token_subset_pair_match(k.as_str(), &live_keys_vec).is_some();
+                        if direct || alt || fz || tk {
+                            fused += 1;
+                        } else {
+                            let sp = k.split("::").next().unwrap_or("?");
+                            let mut rt1 = String::new();
+                            let mut rt2 = String::new();
+                            let mut sr = String::new();
+                            let mut ot = String::new();
+                            for (ok2, ov) in odds.iter() {
+                                if ok2.match_key == *k {
+                                    rt1 = ov.payload.team1.clone();
+                                    rt2 = ov.payload.team2.clone();
+                                    sr = format!("{}:{}", ov.source, ov.payload.bookmaker);
+                                    ot = ov.seen_at.format("%H:%M:%S").to_string();
+                                    break;
+                                }
+                            }
+                            let t3: Vec<&str> = live_keys_vec.iter()
+                                .filter(|lk| lk.starts_with(&format!("{}::", sp)))
+                                .take(3).copied().collect();
+                            misses.push(format!(
+                                "key={} sport={} src={} ots={} raw={}|{} top3=[{}]",
+                                k, sp, sr, ot, rt1, rt2, t3.join(", ")
+                            ));
+                        }
+                    }
+                    (fused, misses)
                 };
+                let miss_n = fusion_misses.len();
+                for (i, line) in fusion_misses.iter().enumerate() {
+                    if i >= 10 { break; }
+                    warn!("FUSION_MISS {}", line);
+                }
+                if miss_n > 10 {
+                    warn!("FUSION_MISS ...and {} more", miss_n - 10);
+                }
 
                 let hb = FeedHeartbeatEvent {
                     ts: Utc::now().to_rfc3339(),
@@ -1760,7 +2139,6 @@ async fn main() -> Result<()> {
                     odds_items,
                     fused_ready,
                 };
-
                 let _ = logger.log(&hb);
                 let _ = db_tx.try_send(DbMsg::Heartbeat(DbHeartbeatRow {
                     ts: Utc::now(),
@@ -1770,8 +2148,8 @@ async fn main() -> Result<()> {
                     fused_ready: fused_ready as i64,
                 }));
                 info!(
-                    "HB: conns={}, live={}, odds={}, fused_ready={} (see logs/*.jsonl)",
-                    connections, live_items, odds_items, fused_ready
+                    "HB: conns={} live={} odds={} fused={} miss={}",
+                    connections, live_items, odds_items, fused_ready, miss_n
                 );
             }
         });

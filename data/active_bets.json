@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772352777731",
+    "tokenId": null,
+    "graphBetId": null,
+    "conditionId": "300610060000000000291366150000000000001732396153",
+    "outcomeId": "10231",
+    "stake": 2,
+    "odds": 1.5035,
+    "sport": "?",
+    "matchKey": "",
+    "team": "Alexandra Shubladze",
+    "placedAt": "2026-03-01T08:12:57.879Z",
+    "status": "pending"
+  }
+]
