@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use logger::EventLogger;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
@@ -155,6 +155,33 @@ struct FeedHeartbeatEvent {
     live_items: usize,
     odds_items: usize,
     fused_ready: usize,
+    freshness_by_bookmaker: Vec<BookmakerFreshnessMetric>,
+    source_count_per_market: Vec<MarketSourceCountMetric>,
+    fused_ready_per_market: Vec<FusedReadyPerMarketMetric>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BookmakerFreshnessMetric {
+    bookmaker: String,
+    samples: usize,
+    p50_age_secs: i64,
+    p95_age_secs: i64,
+    max_age_secs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MarketSourceCountMetric {
+    match_key: String,
+    market: String,
+    source_count: usize,
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct FusedReadyPerMarketMetric {
+    market: String,
+    fused_ready: usize,
+    total_pairs: usize,
 }
 
 /// Key for multi-bookmaker odds: match_key + bookmaker
@@ -845,8 +872,191 @@ struct HttpStateResponse {
     odds_items: usize,
     fused_ready: usize,
     fused_keys: Vec<String>,
+    freshness_by_bookmaker: Vec<BookmakerFreshnessMetric>,
+    source_count_per_market: Vec<MarketSourceCountMetric>,
+    fused_ready_per_market: Vec<FusedReadyPerMarketMetric>,
     live: Vec<HttpLiveItem>,
     odds: Vec<HttpOddsItem>,
+}
+
+fn normalized_market_label(market: &str) -> String {
+    let m = market.trim().to_lowercase();
+    if m.is_empty() {
+        "match_winner".to_string()
+    } else {
+        m
+    }
+}
+
+fn is_match_fused(match_key: &str, live: &HashMap<String, LiveMatchState>, live_keys_vec: &[&str]) -> bool {
+    let direct = live.contains_key(match_key);
+    let alt = !direct && {
+        let p: Vec<&str> = match_key.splitn(2, "::").collect();
+        if p.len() == 2 {
+            let tail = p[1];
+            let ea: &[&str] = &[
+                "cs2", "dota-2", "league-of-legends", "valorant",
+                "basketball", "football", "mma", "starcraft",
+            ];
+            ea.iter().any(|a2| {
+                if *a2 == p[0] {
+                    live.contains_key(&format!("esports::{}", tail))
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    };
+    let fz = !direct && !alt && fuzzy_find_key(match_key, live_keys_vec).is_some();
+    let tk = !direct && !alt && !fz && token_subset_pair_match(match_key, live_keys_vec).is_some();
+    direct || alt || fz || tk
+}
+
+fn collect_fusion_status(
+    live: &HashMap<String, LiveMatchState>,
+    odds: &HashMap<OddsKey, OddsState>,
+) -> (Vec<String>, Vec<String>) {
+    let mut match_keys = HashSet::new();
+    for ok in odds.keys() {
+        match_keys.insert(ok.match_key.clone());
+    }
+    let live_keys_vec: Vec<&str> = live.keys().map(|s| s.as_str()).collect();
+
+    let mut fused_keys: Vec<String> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
+
+    for k in &match_keys {
+        if is_match_fused(k.as_str(), live, &live_keys_vec) {
+            fused_keys.push(k.clone());
+        } else {
+            let sp = k.split("::").next().unwrap_or("?");
+            let mut rt1 = String::new();
+            let mut rt2 = String::new();
+            let mut sr = String::new();
+            let mut ot = String::new();
+            for (ok2, ov) in odds.iter() {
+                if ok2.match_key == *k {
+                    rt1 = ov.payload.team1.clone();
+                    rt2 = ov.payload.team2.clone();
+                    sr = format!("{}:{}", ov.source, ov.payload.bookmaker);
+                    ot = ov.seen_at.format("%H:%M:%S").to_string();
+                    break;
+                }
+            }
+            let t3: Vec<&str> = live_keys_vec.iter()
+                .filter(|lk| lk.starts_with(&format!("{}::", sp)))
+                .take(3)
+                .copied()
+                .collect();
+            misses.push(format!(
+                "key={} sport={} src={} ots={} raw={}|{} top3=[{}]",
+                k, sp, sr, ot, rt1, rt2, t3.join(", ")
+            ));
+        }
+    }
+
+    fused_keys.sort();
+    misses.sort();
+    (fused_keys, misses)
+}
+
+fn percentile_from_sorted(values: &[i64], numer: usize, denom: usize) -> i64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let idx = ((values.len() - 1) * numer + (denom / 2)) / denom;
+    values[idx]
+}
+
+fn build_observability_metrics(
+    odds: &HashMap<OddsKey, OddsState>,
+    fused_keys: &[String],
+) -> (
+    Vec<BookmakerFreshnessMetric>,
+    Vec<MarketSourceCountMetric>,
+    Vec<FusedReadyPerMarketMetric>,
+) {
+    let now = Utc::now();
+
+    let mut ages_by_bookmaker: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut sources_by_market: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    let mut seen_market_pairs: HashSet<(String, String)> = HashSet::new();
+    let fused_key_set: HashSet<&str> = fused_keys.iter().map(|k| k.as_str()).collect();
+    let mut fused_by_market: HashMap<String, (usize, usize)> = HashMap::new();
+
+    for (ok, ov) in odds.iter() {
+        let age_secs = now.signed_duration_since(ov.seen_at).num_seconds().max(0);
+        ages_by_bookmaker
+            .entry(ov.payload.bookmaker.clone())
+            .or_default()
+            .push(age_secs);
+
+        let market = normalized_market_label(&ov.payload.market);
+        sources_by_market
+            .entry((ok.match_key.clone(), market.clone()))
+            .or_default()
+            .insert(ov.payload.bookmaker.clone());
+
+        if seen_market_pairs.insert((ok.match_key.clone(), market.clone())) {
+            let entry = fused_by_market.entry(market).or_insert((0, 0));
+            entry.1 += 1;
+            if fused_key_set.contains(ok.match_key.as_str()) {
+                entry.0 += 1;
+            }
+        }
+    }
+
+    let mut freshness_by_bookmaker = Vec::new();
+    for (bookmaker, mut ages) in ages_by_bookmaker {
+        ages.sort();
+        let samples = ages.len();
+        let p50 = percentile_from_sorted(&ages, 50, 100);
+        let p95 = percentile_from_sorted(&ages, 95, 100);
+        let max_age_secs = *ages.last().unwrap_or(&0);
+        freshness_by_bookmaker.push(BookmakerFreshnessMetric {
+            bookmaker,
+            samples,
+            p50_age_secs: p50,
+            p95_age_secs: p95,
+            max_age_secs,
+        });
+    }
+    freshness_by_bookmaker.sort_by(|a, b| a.bookmaker.cmp(&b.bookmaker));
+
+    let mut source_count_per_market = Vec::new();
+    for ((match_key, market), sources_set) in sources_by_market {
+        let mut sources: Vec<String> = sources_set.into_iter().collect();
+        sources.sort();
+        source_count_per_market.push(MarketSourceCountMetric {
+            match_key,
+            market,
+            source_count: sources.len(),
+            sources,
+        });
+    }
+    source_count_per_market.sort_by(|a, b| {
+        a.match_key
+            .cmp(&b.match_key)
+            .then_with(|| a.market.cmp(&b.market))
+    });
+
+    let mut fused_ready_per_market = Vec::new();
+    for (market, (fused_ready, total_pairs)) in fused_by_market {
+        fused_ready_per_market.push(FusedReadyPerMarketMetric {
+            market,
+            fused_ready,
+            total_pairs,
+        });
+    }
+    fused_ready_per_market.sort_by(|a, b| a.market.cmp(&b.market));
+
+    (
+        freshness_by_bookmaker,
+        source_count_per_market,
+        fused_ready_per_market,
+    )
 }
 
 // ====================================================================
@@ -1125,17 +1335,105 @@ fn fuzzy_find_key<'a>(needle: &str, candidates: &'a [&str]) -> Option<&'a str> {
         if cteams.len() != 2 { continue; }
         let (c_a, c_b) = (cteams[0], cteams[1]);
 
-        // Check: needle teams are substrings (suffix) of candidate teams
-        // or vice versa. Match both orderings (sorted, but just in case).
-        let match_fwd = (c_a.ends_with(n_a) || n_a.ends_with(c_a))
-                     && (c_b.ends_with(n_b) || n_b.ends_with(c_b));
-        let match_rev = (c_a.ends_with(n_b) || n_b.ends_with(c_a))
-                     && (c_b.ends_with(n_a) || n_a.ends_with(c_b));
+        // Check strong team equivalence in both orderings.
+        // This handles truncated forms like "virginiacavalie" vs "virginiacavaliers"
+        // and minor source-specific naming differences.
+        let match_fwd = team_name_equivalent(c_a, n_a)
+            && team_name_equivalent(c_b, n_b);
+        let match_rev = team_name_equivalent(c_a, n_b)
+            && team_name_equivalent(c_b, n_a);
         if match_fwd || match_rev {
             return Some(cand);
         }
     }
     None
+}
+
+fn team_name_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+
+    // Fast-path: substring/suffix equivalence (existing behavior, expanded)
+    if a.contains(b) || b.contains(a) || a.ends_with(b) || b.ends_with(a) {
+        return true;
+    }
+
+    let sim = bigram_jaccard_similarity(a, b);
+    let common_prefix = common_prefix_len(a, b);
+
+    // Strict threshold, with fallback when strong common prefix exists.
+    sim >= 0.70 || (sim >= 0.55 && common_prefix >= 4)
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars()
+        .zip(b.chars())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+fn bigram_jaccard_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+
+    if ab.len() < 2 || bb.len() < 2 {
+        return 0.0;
+    }
+
+    let mut a_set: HashSet<Vec<u8>> = HashSet::new();
+    let mut b_set: HashSet<Vec<u8>> = HashSet::new();
+
+    for w in ab.windows(2) {
+        a_set.insert(w.to_vec());
+    }
+    for w in bb.windows(2) {
+        b_set.insert(w.to_vec());
+    }
+
+    if a_set.is_empty() || b_set.is_empty() {
+        return 0.0;
+    }
+
+    let intersection = a_set.intersection(&b_set).count() as f64;
+    let union = a_set.union(&b_set).count() as f64;
+    if union == 0.0 { 0.0 } else { intersection / union }
+}
+
+async fn canonicalize_match_key_ingest(state: &FeedHubState, candidate_key: &str) -> String {
+    let live_r = state.live.read().await;
+    let odds_r = state.odds.read().await;
+
+    let mut key_set: HashSet<String> = HashSet::new();
+    for k in live_r.keys() {
+        key_set.insert(k.clone());
+    }
+    for ok in odds_r.keys() {
+        key_set.insert(ok.match_key.clone());
+    }
+
+    if key_set.is_empty() {
+        return candidate_key.to_string();
+    }
+
+    let keys_vec: Vec<String> = key_set.into_iter().collect();
+    let key_refs: Vec<&str> = keys_vec.iter().map(|s| s.as_str()).collect();
+
+    if let Some(found) = fuzzy_find_key(candidate_key, &key_refs) {
+        return found.to_string();
+    }
+    if let Some(found) = token_subset_pair_match(candidate_key, &key_refs) {
+        return found.to_string();
+    }
+
+    candidate_key.to_string()
 }
 
 async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
@@ -1422,48 +1720,12 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
     let live_items = live_map.len();
     let odds_items = odds_map.len();
 
-    // Collect unique match keys from odds
-    let mut odds_match_keys = std::collections::HashSet::new();
-    for ok in odds_map.keys() {
-        odds_match_keys.insert(ok.match_key.clone());
-    }
-
-    // Esports fallback alts — same as in build_opportunities
-    let esports_alts_snap: &[&str] = &[
-        "cs2", "dota-2", "league-of-legends", "valorant",
-        "basketball", "football", "mma", "starcraft",
-    ];
-    // Collect live keys for fuzzy matching
-    let live_keys_vec: Vec<&str> = live_map.keys().map(|s| s.as_str()).collect();
-
-    let mut fused_keys = Vec::new();
-    for k in &odds_match_keys {
-        let is_fused = if live_map.contains_key(k) {
-            true
-        } else {
-            // Check if any live key with esports:: prefix matches via alt
-            let parts: Vec<&str> = k.splitn(2, "::").collect();
-            if parts.len() == 2 {
-                let tail = parts[1];
-                esports_alts_snap.iter().any(|alt| {
-                    if *alt == parts[0] {
-                        // live key would be esports::tail
-                        live_map.contains_key(&format!("esports::{}", tail))
-                    } else {
-                        false
-                    }
-                })
-            } else { false }
-        };
-        // Fuzzy suffix matching: Fortuna short names vs Tipsport/Azuro full names
-        let is_fused = is_fused || fuzzy_find_key(k.as_str(), &live_keys_vec).is_some();
-        if is_fused {
-            fused_keys.push(k.clone());
-        }
-        // No limit on fused_keys — alert-bot needs full picture
-    }
+    let (fused_keys, _fusion_misses) = collect_fusion_status(&live_map, &odds_map);
 
     let fused_ready = fused_keys.len();
+
+    let (freshness_by_bookmaker, source_count_per_market, fused_ready_per_market) =
+        build_observability_metrics(&odds_map, &fused_keys);
 
     let mut live = Vec::new();
     for (k, v) in live_map.iter() {
@@ -1492,6 +1754,9 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
         odds_items,
         fused_ready,
         fused_keys,
+        freshness_by_bookmaker,
+        source_count_per_market,
+        fused_ready_per_market,
         live,
         odds,
     }
@@ -1539,7 +1804,8 @@ async fn handle_fortuna_post(state: &FeedHubState, body_str: &str) -> (bool, Str
 
     for m in &inbound.matches {
         let sport = &m.sport;
-        let key = match_key(sport, &m.team1, &m.team2);
+        let raw_key = match_key(sport, &m.team1, &m.team2);
+        let key = canonicalize_match_key_ingest(state, &raw_key).await;
 
         // NORM_TRACE (sampled)
         if should_norm_trace() {
@@ -1842,7 +2108,8 @@ async fn handle_socket(
                                     let payload: LiveMatchPayload = serde_json::from_value(env.payload)
                                         .context("invalid live_match payload")?;
                                     let seen_at = parse_ts(&env.ts);
-                                    let key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let raw_key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let key = canonicalize_match_key_ingest(&state, &raw_key).await;
                                     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
                                     // NORM_TRACE (sampled)
@@ -1878,7 +2145,8 @@ async fn handle_socket(
                                     let payload: OddsPayload = serde_json::from_value(env.payload)
                                         .context("invalid odds payload")?;
                                     let seen_at = parse_ts(&env.ts);
-                                    let key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let raw_key = match_key(&payload.sport, &payload.team1, &payload.team2);
+                                    let key = canonicalize_match_key_ingest(&state, &raw_key).await;
                                     let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
 
                                     // NORM_TRACE (sampled)
@@ -2075,67 +2343,16 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(10)).await;
 
                 let connections = *state.connections.read().await;
-                let live_items = state.live.read().await.len();
-                let odds_items = state.odds.read().await.len();
+                let live = state.live.read().await;
+                let odds = state.odds.read().await;
+                let live_items = live.len();
+                let odds_items = odds.len();
 
-                // “fused_ready” = kolik odds klíčů má zároveň live
-                let (fused_ready, fusion_misses) = {
-                    let live = state.live.read().await;
-                    let odds = state.odds.read().await;
-                    let mut match_keys = std::collections::HashSet::new();
-                    for ok in odds.keys() {
-                        match_keys.insert(ok.match_key.clone());
-                    }
-                    let live_keys_vec: Vec<&str> = live.keys().map(|s| s.as_str()).collect();
-                    let ea: &[&str] = &[
-                        "cs2", "dota-2", "league-of-legends", "valorant",
-                        "basketball", "football", "mma", "starcraft",
-                    ];
-                    let mut fused = 0usize;
-                    let mut misses: Vec<String> = Vec::new();
-                    for k in &match_keys {
-                        let direct = live.contains_key(k.as_str());
-                        let alt = !direct && {
-                            let p: Vec<&str> = k.splitn(2, "::").collect();
-                            if p.len() == 2 {
-                                let tail = p[1];
-                                ea.iter().any(|a2| {
-                                    if *a2 == p[0] {
-                                        live.contains_key(&format!("esports::{}", tail))
-                                    } else { false }
-                                })
-                            } else { false }
-                        };
-                        let fz = !direct && !alt && fuzzy_find_key(k.as_str(), &live_keys_vec).is_some();
-                        let tk = !direct && !alt && !fz && token_subset_pair_match(k.as_str(), &live_keys_vec).is_some();
-                        if direct || alt || fz || tk {
-                            fused += 1;
-                        } else {
-                            let sp = k.split("::").next().unwrap_or("?");
-                            let mut rt1 = String::new();
-                            let mut rt2 = String::new();
-                            let mut sr = String::new();
-                            let mut ot = String::new();
-                            for (ok2, ov) in odds.iter() {
-                                if ok2.match_key == *k {
-                                    rt1 = ov.payload.team1.clone();
-                                    rt2 = ov.payload.team2.clone();
-                                    sr = format!("{}:{}", ov.source, ov.payload.bookmaker);
-                                    ot = ov.seen_at.format("%H:%M:%S").to_string();
-                                    break;
-                                }
-                            }
-                            let t3: Vec<&str> = live_keys_vec.iter()
-                                .filter(|lk| lk.starts_with(&format!("{}::", sp)))
-                                .take(3).copied().collect();
-                            misses.push(format!(
-                                "key={} sport={} src={} ots={} raw={}|{} top3=[{}]",
-                                k, sp, sr, ot, rt1, rt2, t3.join(", ")
-                            ));
-                        }
-                    }
-                    (fused, misses)
-                };
+                let (fused_keys, fusion_misses) = collect_fusion_status(&live, &odds);
+                let fused_ready = fused_keys.len();
+                let (freshness_by_bookmaker, source_count_per_market, fused_ready_per_market) =
+                    build_observability_metrics(&odds, &fused_keys);
+
                 let miss_n = fusion_misses.len();
                 for (i, line) in fusion_misses.iter().enumerate() {
                     if i >= 10 { break; }
@@ -2152,6 +2369,9 @@ async fn main() -> Result<()> {
                     live_items,
                     odds_items,
                     fused_ready,
+                    freshness_by_bookmaker,
+                    source_count_per_market,
+                    fused_ready_per_market,
                 };
                 let _ = logger.log(&hb);
                 let _ = db_tx.try_send(DbMsg::Heartbeat(DbHeartbeatRow {
@@ -2162,8 +2382,8 @@ async fn main() -> Result<()> {
                     fused_ready: fused_ready as i64,
                 }));
                 info!(
-                    "HB: conns={} live={} odds={} fused={} miss={}",
-                    connections, live_items, odds_items, fused_ready, miss_n
+                    "HB: conns={} live={} odds={} fused={} miss={} markets={}",
+                    connections, live_items, odds_items, fused_ready, miss_n, hb.source_count_per_market.len()
                 );
             }
         });

@@ -588,6 +588,35 @@
   /**
    * Extract scores from a match container.
    */
+  function normalizePotentialGluedScoreText(text) {
+    if (!text) return "";
+    let t = String(text).replace(/\s+/g, " ").trim();
+
+    // Fix common DOM concat glitch (same class of bug as Chance/Tipsport):
+    //   "7:71.čt."  -> "7:7 1.čt."
+    //   "0-51.set"  -> "0-5 1.set"
+    t = t.replace(
+      /(\d{1,3})\s*([-:–])\s*(\d{1,3})([1-5])\.\s*(set|pol|čt|čtvrt|čtvrtina|třetina|perioda|period|quarter|half|mapa|map)(\b)/gi,
+      (_, a, sep, b, period, label, boundary) => `${a}${sep}${b} ${period}.${label}${boundary}`
+    );
+
+    return t;
+  }
+
+  function findScoreFromLeafElements(root) {
+    const candidates = root.querySelectorAll('span, div, b, strong, em, i, small');
+    for (const el of candidates) {
+      if (el.children.length > 0) continue;
+      const text = (el.textContent || "").trim();
+      if (!text) continue;
+      const m = text.match(/^(\d{1,3})\s*[-:–]\s*(\d{1,3})$/);
+      if (m) {
+        return { s1: parseInt(m[1]) || 0, s2: parseInt(m[2]) || 0 };
+      }
+    }
+    return null;
+  }
+
   function extractScores(el) {
     let score1 = 0, score2 = 0;
     let status = "Live";
@@ -610,10 +639,23 @@
 
     // Priority 2: Regex fallback
     if (score1 === 0 && score2 === 0) {
-      const scoreMatch = el.textContent.match(/(\d{1,3})\s*[-:–]\s*(\d{1,3})/);
-      if (scoreMatch) {
-        score1 = parseInt(scoreMatch[1]) || 0;
-        score2 = parseInt(scoreMatch[2]) || 0;
+      // Prefer leaf elements with EXACT score text; avoids concat bugs like "0:1" + "2.třetina" => "0:12"
+      const leaf = findScoreFromLeafElements(el);
+      if (leaf) {
+        score1 = leaf.s1;
+        score2 = leaf.s2;
+      } else {
+        // Last resort: regex on normalized text, with boundary to avoid matching "7:71.čt."
+        const txt = normalizePotentialGluedScoreText(el.textContent);
+        const scoreMatch = txt.match(/(\d{1,3})\s*[-:–]\s*(\d{1,3})(?=\s|$|\(|\)|,)/);
+        if (scoreMatch) {
+          const a = parseInt(scoreMatch[1]) || 0;
+          const b = parseInt(scoreMatch[2]) || 0;
+          if (a >= 0 && a < 999 && b >= 0 && b < 999) {
+            score1 = a;
+            score2 = b;
+          }
+        }
       }
     }
 
@@ -728,7 +770,7 @@
 
   function init() {
     const pageSport = detectSportFromURL();
-    log(`🏆 FlashScore Multi-Sport Scraper v3.0 (Generic DOM)`);
+    log(`🏆 FlashScore Multi-Sport Scraper v3.1 (Generic DOM)`);
     log(`Page: ${window.location.href}`);
     log(`Detected sport: ${pageSport || "all/mixed"}`);
     log(`Strategy: g_1_ IDs → BEM classes → participant elements → link scan`);

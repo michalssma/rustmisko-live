@@ -32,17 +32,64 @@ Mít konzervativní, auditovatelný a stabilní live-betting pipeline s jasným 
 
 ## Co je NEXT 🔲
 
-1. **Rozšiřování scraper coverage**
-   - 1xbit scraper (všechny sporty)
-   - Další booky pro lepší cross-validation
+1. **Runbook hardening (fix → test → gate)**
+   - Každý fix má povinné pořadí: **implementace → replay test → KPI kontrola → teprve potom rollout**.
+   - Bez splněných gate metrik se nepokračuje do další fáze.
 
-2. **Per-sport exposure tuning**
-   - Config file pro feature flags (teď hardcoded)
-   - Bankroll growth: $46→$150 (small tier)
+2. **Fix #1 — Market alignment v odds anomaly**
+   - Upravit anomaly detekci tak, aby porovnání probíhalo jen mezi stejnými markety (`Azuro market == market_key/payload.market`).
+   - Zabránit mixu `map*_winner` vs `match_winner` (hard skip při nekompatibilním marketu).
+   - Cíl: odstranit phantom anomálie a snížit falešné alerty.
 
-3. **Reporting**
-   - Automatický ranní report s P/L breakdown
-   - Reason tagging (score_edge vs odds_anomaly) → 100% audit trail
+3. **Povinný replay test po Fix #1**
+   - Spustit deterministický replay na 5 historických JSONL souborech.
+   - Příkaz: `cargo test -- --test-threads=1`
+   - Test musí běžet s clock injection (fixovaný čas/replay timeline), aby výsledky byly reprodukovatelné.
+   - Ověřit shodu: počty alertů, A/B/C klasifikace, reject důvody.
+
+4. **KPI Gate #1 (po alignmentu)**
+   - `anomaly_precision > 90%` (true positives / total alerts), měřit před/po z JSONL grepem.
+   - `only-1-source SKIP < 25%`
+   - `placed_rate >= 35%` z validních HIGH signálů
+   - Pokud gate neprojde: rollback změny a iterace pouze na matching/market mapování.
+
+5. **Fix #2 — Observability metriky ve feed-hub**
+   - Rozšířit `/state` o:
+     - `freshness_by_bookmaker` (p50/p95/max age)
+     - `source_count_per_market` (`match_key + market`)
+     - `fused_ready_per_market`
+   - Přidat periodický JSONL heartbeat event se stejnými metrikami pro audit.
+
+6. **Povinný replay test po Fix #2**
+   - Opět `cargo test -- --test-threads=1` na stejných 5 JSONL.
+   - Ověřit determinismus + konzistenci metrik (žádné časové drift artefakty).
+
+7. **KPI Gate #2 (po observability)**
+   - Každý reject typu `only source`/`stale` musí mít jednoznačné metrické vysvětlení.
+   - `ConditionNotRunning < 10%` z attemptů
+   - `FOLLOW-UP REJECTED (execution reverted) < 5%` z `PLACED`
+
+8. **Scraper-by-scraper validační průchod**
+   - Pořadí: `Fortuna → Tipsport → Chance` (izolovaně).
+   - Pro každý scraper: ingest, freshness, market alignment, fusion, anomaly kvalita.
+   - Minimum: 20 validních live vzorků na scraper bez systematického mismatch.
+
+9. **Staged rollout autobetu**
+   - Fáze A: dry-run (signal-only).
+   - Fáze B: micro-stake ($1, denní cap).
+   - Fáze C: standard stake ($3) jen pro whitelist markety/sporty.
+   - Přechod mezi fázemi jen při 24h stabilitě KPI.
+
+10. **Hard-stop + rollback pravidla**
+    - Okamžitý stop při KPI breach (`reverted`, `ConditionNotRunning`, denní loss limit).
+    - Rollback musí být konfigurační (bez dlouhého redeploy).
+
+11. **Až potom rozšiřování coverage**
+    - 1xbit scraper a další booky až po splnění všech gate metrik výše.
+
+12. **Reporting (finální vrstva)**
+    - Automatický ranní report s P/L breakdown.
+    - Dotažení reason taggingu (`score_edge` vs `odds_anomaly`) na 100% audit trail.
 
 ## Poznámka
 

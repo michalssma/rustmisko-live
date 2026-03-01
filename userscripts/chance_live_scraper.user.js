@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chance.cz → Feed Hub Live Scraper
 // @namespace    rustmisko
-// @version      1.1
+// @version      1.2
 // @description  Scrapes live odds/scores from Chance.cz and sends to Feed Hub — Azuro edge source #3
 // @author       RustMisko
 // @match        https://www.chance.cz/*
@@ -116,7 +116,7 @@
     `;
     panel.innerHTML = `
       <div style="font-weight:bold; margin-bottom: 4px; color: #e63946; font-size: 13px;">
-        🎰 Chance.cz → Feed Hub v1.1
+        🎰 Chance.cz → Feed Hub v1.2
       </div>
       <div id="ch-status" style="color: #fa0;">⏳ Connecting...</div>
       <div id="ch-sport" style="margin-top: 2px; color: #aaa;">Sport: detecting...</div>
@@ -431,6 +431,34 @@
   // SCORE EXTRACTION
   // ====================================================================
 
+  function normalizeDetailedScore(text) {
+    if (!text) return '';
+
+    let t = String(text).replace(/\s+/g, ' ').trim();
+
+    // If we accidentally grabbed a wrapper that still contains team names,
+    // cut from first visible score onward.
+    if (
+      t.includes(' - ') &&
+      /\d{1,3}:\d{1,3}/.test(t) &&
+      /\d\.[\s]*(mapa|set|pol|čt|perioda|třetina)/i.test(t)
+    ) {
+      const m = t.match(/(\d{1,3}:\d{1,3}.*)$/);
+      if (m) t = m[1].trim();
+    }
+
+    // Fix common Chance.cz DOM concat glitch:
+    //   "7:71.čt."  (score 7:7 + "1.čt.")
+    //   "0:51.čt."  (score 0:5 + "1.čt.")
+    //   "7:123.čt." (score 7:12 + "3.čt.")
+    t = t.replace(
+      /(\d{1,3}):(\d{1,3})([1-5])\.\s*(mapa|set|pol|čt|perioda|třetina)(\.)?/gi,
+      (_, s1, s2Prefix, period, label, dot) => `${s1}:${s2Prefix} ${period}.${label}${dot || ''}`
+    );
+
+    return t;
+  }
+
   /**
    * Find score element inside match container.
    * Chance.cz uses a dedicated div (class sc-837f7f43-0) with "X:Y"
@@ -468,14 +496,21 @@
   function extractDetailedScore(container) {
     const allEls = container.querySelectorAll('span, div');
     for (const el of allEls) {
+      if (el.children.length > 0) continue;
       const text = el.textContent.trim();
+      if (!text) continue;
+      // Avoid wrapper texts that contain team names and other row content.
+      if (text.includes(' - ')) continue;
+      // Avoid odds/price text accidentally captured as detail.
+      if (/\d{1,3}[,.]\d{2}/.test(text)) continue;
+
       // Match "Lepší ze/z N | ..." pattern (Czech "Best of N")
-      if (/Lepší\s+z/i.test(text) && text.length < 120) {
-        return text;
+      if (/Lepší\s+z/i.test(text) && text.length < 160) {
+        return normalizeDetailedScore(text);
       }
       // Match period/set/map info
-      if (/\d\.\s*(mapa|set|pol|čt|perioda|třetina)/i.test(text) && text.length < 80) {
-        return text;
+      if (/\d\.\s*(mapa|set|pol|čt|perioda|třetina)/i.test(text) && text.length < 120) {
+        return normalizeDetailedScore(text);
       }
     }
     return '';
@@ -587,7 +622,7 @@
       const scoreResult = extractScore(link);
       const score1 = scoreResult ? scoreResult.s1 : 0;
       const score2 = scoreResult ? scoreResult.s2 : 0;
-      const detailedScore = extractDetailedScore(link);
+      const detailedScore = normalizeDetailedScore(extractDetailedScore(link));
 
       // Detect sport
       const sport = detectMatchSport(link, t1, t2);

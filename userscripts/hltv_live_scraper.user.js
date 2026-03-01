@@ -155,6 +155,59 @@
   }
 
   // ====================================================================
+  // SCORE EXTRACTION (SAFE)
+  // ====================================================================
+  function extractLinkScores(link) {
+    const selectors = 'span, div, b, strong, em, i, small';
+
+    function findNumericLeafIn(root) {
+      if (!root) return null;
+      // Prefer leaf elements with exact numeric text
+      const candidates = root.querySelectorAll(selectors);
+      for (const el of candidates) {
+        if (el.children.length > 0) continue;
+        const t = (el.textContent || '').trim();
+        if (!/^\d{1,2}$/.test(t)) continue;
+        const n = parseInt(t, 10);
+        if (!Number.isFinite(n) || n < 0 || n > 99) continue;
+        return n;
+      }
+      // Also allow the root itself if it's a simple numeric leaf
+      if (root.children && root.children.length === 0) {
+        const t = (root.textContent || '').trim();
+        if (/^\d{1,2}$/.test(t)) {
+          const n = parseInt(t, 10);
+          if (Number.isFinite(n) && n >= 0 && n <= 99) return n;
+        }
+      }
+      return null;
+    }
+
+    // Strategy 1 (best): find two team containers and extract one score per team.
+    // This avoids picking e.g. map-count numbers (1-0) that can appear elsewhere.
+    const teamContainers = link.querySelectorAll("[class*='matchTeam'], .matchTeam");
+    if (teamContainers.length >= 2) {
+      const s1 = findNumericLeafIn(teamContainers[0].querySelector(".matchTeamScore, [class*='matchTeamScore'], .currentMapScore, [class*='currentMapScore'], .score, [class*='Score'], [class*='score']") || teamContainers[0]);
+      const s2 = findNumericLeafIn(teamContainers[1].querySelector(".matchTeamScore, [class*='matchTeamScore'], .currentMapScore, [class*='currentMapScore'], .score, [class*='Score'], [class*='score']") || teamContainers[1]);
+      if (s1 !== null && s2 !== null) return { score1: s1, score2: s2 };
+    }
+
+    // Strategy 2: explicit score elements within the link.
+    const directScoreEls = link.querySelectorAll(
+      ".matchTeamScore, [class*='matchTeamScore'], .currentMapScore, [class*='currentMapScore'], .score, [class*='Score'], [class*='score']"
+    );
+    const nums = [];
+    for (const el of directScoreEls) {
+      const n = findNumericLeafIn(el);
+      if (n !== null) nums.push(n);
+      if (nums.length >= 2) break;
+    }
+    if (nums.length >= 2) return { score1: nums[0], score2: nums[1] };
+
+    return { score1: 0, score2: 0 };
+  }
+
+  // ====================================================================
   // MATCH SCRAPING v2 — URL-based team extraction
   // ====================================================================
   function scrapeMatches() {
@@ -220,21 +273,7 @@
       if (!team2) team2 = capitalize(team2FromUrl);
 
       // Extract map scores
-      let score1 = 0, score2 = 0;
-      // Look for score-like numbers near the link
-      const scoreEls = link.querySelectorAll("[class*='Score'], [class*='score']");
-      const scoreNums = [];
-      for (const se of scoreEls) {
-        const txt = se.textContent.trim();
-        const n = parseInt(txt, 10);
-        if (!isNaN(n) && n >= 0 && n <= 99 && txt.length <= 3) {
-          scoreNums.push(n);
-        }
-      }
-      if (scoreNums.length >= 2) {
-        score1 = scoreNums[0];
-        score2 = scoreNums[1];
-      }
+      const { score1, score2 } = extractLinkScores(link);
 
       // Extract HLTV featured odds — SAFE version
       // Only look within the match link itself or 1 parent level up.

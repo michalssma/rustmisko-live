@@ -1,16 +1,16 @@
 [
   {
-    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772361452358",
+    "betId": "0x8226d38e5c69c2f0a77fba80e466082b410a8f00_1772404868028",
     "tokenId": null,
     "graphBetId": null,
-    "conditionId": "300610060000000000291281190000000000001720436222",
-    "outcomeId": "7012",
+    "conditionId": "300610060000000000291354950000000000001731179244",
+    "outcomeId": "6983",
     "stake": 2,
-    "odds": 1.590799999999,
+    "odds": 1.1868,
     "sport": "?",
     "matchKey": "",
-    "team": "HEROIC",
-    "placedAt": "2026-03-01T10:37:33.107Z",
+    "team": "Cleveland Cavaliers",
+    "placedAt": "2026-03-01T22:41:08.120Z",
     "status": "pending"
   }
 ]

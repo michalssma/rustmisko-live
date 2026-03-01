@@ -34,6 +34,8 @@ const POLL_INTERVAL_SECS: u64 = 2;  // 2s — near-instant detection of Tipsport
 const MIN_EDGE_PCT: f64 = 8.0;
 /// Don't re-alert same match+score+side within this window
 const ALERT_COOLDOWN_SECS: i64 = 90; // reduced spam — 90s between re-alerts on same match
+/// Manual offers: max 1 nabídka na stejný match_key za tento interval
+const MANUAL_MATCH_COOLDOWN_SECS: i64 = 180;
 /// Auto-cashout check interval
 const CASHOUT_CHECK_SECS: u64 = 30;
 /// Minimum profit % to auto-cashout
@@ -69,8 +71,17 @@ const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
 const AUTO_BET_RETRY_MAX: usize = 2;
 /// Jitter base delays per retry attempt — actual = base + rand(0..base/2)
 const AUTO_BET_RETRY_DELAYS_MS: [u64; 2] = [200, 500];
+/// Min-odds fallback step for one rescue retry (e.g. 0.92 -> 0.86)
+const MIN_ODDS_FALLBACK_STEP: f64 = 0.06;
+/// Retry condition-paused only for reasonably fresh conditions
+const RETRY_CONDITION_MAX_AGE_MS: u64 = 1200;
+/// Small pause before retrying after execution ID remap
+const REMAP_RETRY_DELAY_MS: u64 = 120;
 /// Signal TTL — reject bet if decision is older than this (seconds)
 const SIGNAL_TTL_SECS: u64 = 3;
+/// Persistent dedup history lookback (hours) — older entries are ignored on startup.
+/// Prevents "blocked forever" behavior on recurring match keys.
+const DEDUP_HISTORY_LOOKBACK_HOURS: i64 = 8;
 /// === PRE-FLIGHT GATING (condition-state pivot, 2026-02-28) ===
 /// Max age since last GQL sighting of this condition as Active
 /// If condition_age_ms > this, DROP before sending to executor
@@ -78,14 +89,16 @@ const SIGNAL_TTL_SECS: u64 = 3;
 const CONDITION_MAX_AGE_MS: u64 = 2000;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
 /// ROLLBACK: set to 999_999 to effectively disable pipeline budget
-const PIPELINE_BUDGET_MS: u64 = 1500;
+const PIPELINE_BUDGET_MS: u64 = 1200;
 /// Suspended market odds thresholds — market odds outside this range → skip
 /// ROLLBACK: set MIN to 0.0 and MAX to 999_999.0 to disable
 const SUSPENDED_MARKET_MIN_ODDS: f64 = 1.05;
 const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
-const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.97;
-const MIN_ODDS_FACTOR_TENNIS: f64 = 0.97;
+/// Relaxed from 0.97 → 0.92: reduce MinOddsReject due to on-chain/oracle slippage
+const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.92;
+/// Tennis tends to move faster around points; use looser minOdds to avoid constant rejects
+const MIN_ODDS_FACTOR_TENNIS: f64 = 0.90;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
 /// Was 3 — practically unreachable (HLTV typically has 1-2 bookmakers per match)
 const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
@@ -120,8 +133,9 @@ const FF_CASHOUT_ENABLED: bool = false;
 
 /// Azuro V3 WebSocket streams endpoint (production) — same as azuro_poller shadow
 const WS_GATE_URL: &str = "wss://streams.onchainfeed.org/v1/streams/feed";
-/// WS update is considered stale after this many ms — DROP if older
-const WS_STALE_MS: u64 = 1500;
+/// WS update is considered stale after this many ms
+/// Keep this strict: stale WS effectively behaves like no WS (and we prefer skipping over executor rejects)
+const WS_STALE_MS: u64 = 500;
 /// Reconnect backoff sequence (ms)
 const WS_GATE_BACKOFF_MS: &[u64] = &[500, 1_000, 2_000, 5_000, 15_000];
 /// Subscribe throttle: don't re-send SubscribeConditions more than once per N seconds
@@ -432,6 +446,15 @@ fn min_odds_factor_for_match(match_key: &str) -> f64 {
         MIN_ODDS_FACTOR_TENNIS
     } else {
         MIN_ODDS_FACTOR_DEFAULT
+    }
+}
+
+fn min_odds_factor_with_fallback(match_key: &str, fallback_applied: bool) -> f64 {
+    let base = min_odds_factor_for_match(match_key);
+    if fallback_applied {
+        (base - MIN_ODDS_FALLBACK_STEP).max(0.80)
+    } else {
+        base
     }
 }
 
@@ -1529,9 +1552,9 @@ fn find_score_edges(
         tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
 
         let is_first_sight = prev.is_none();
-        let (prev_s1, prev_s2) = match prev {
-            Some((ps1, ps2, _)) => (ps1, ps2),
-            None => (s1, s2), // First time: use current score as "previous" for edge calc
+        let (prev_s1, prev_s2, prev_seen_at) = match prev {
+            Some((ps1, ps2, pts)) => (ps1, ps2, pts),
+            None => (s1, s2, now), // First time: use current score as "previous" for edge calc
         };
 
         let score_changed = s1 != prev_s1 || s2 != prev_s2;
@@ -1545,6 +1568,39 @@ fn find_score_edges(
             info!(
                 "  ⏭️ {} score jump backward {}-{} -> {}-{} (source/reset), skipping edge eval",
                 match_key, prev_s1, prev_s2, s1, s2
+            );
+            tracker.edge_cooldown.insert(match_key.to_string(), now);
+            continue;
+        }
+
+        // Guard against impossible forward spikes in basketball feed.
+        // Example parser/source glitch: 7-7 -> 77-7 in one poll window.
+        let elapsed_secs = (now - prev_seen_at).num_seconds().max(1);
+        let delta1 = s1 - prev_s1;
+        let delta2 = s2 - prev_s2;
+        let is_basketball_match = match_key.starts_with("basketball::");
+        let forward_basket_spike = score_changed
+            && is_basketball_match
+            && !is_first_sight
+            && delta1 >= 0
+            && delta2 >= 0
+            && elapsed_secs <= 120
+            && (
+                delta1.max(delta2) >= 20
+                    || (delta1 + delta2) >= 26
+                    || ((s1.max(s2) - s1.min(s2)) >= 60 && delta1.max(delta2) >= 15)
+            );
+        if forward_basket_spike {
+            info!(
+                "  ⏭️ {} basketball forward spike {}-{} -> {}-{} (Δ={} / {}, {}s), skipping edge eval",
+                match_key,
+                prev_s1,
+                prev_s2,
+                s1,
+                s2,
+                delta1,
+                delta2,
+                elapsed_secs
             );
             tracker.edge_cooldown.insert(match_key.to_string(), now);
             continue;
@@ -2109,37 +2165,40 @@ fn format_score_edge_alert(e: &ScoreEdge, alert_id: u32) -> String {
     let sport = e.match_key.split("::").next().unwrap_or("?").to_uppercase();
 
     format!(
-        "⚡ <b>#{}</b> {} <b>SCORE EDGE</b> [{}]\n\
-         🏷️ <b>{}</b>\n\
-         \n\
-         <b>{}</b> vs <b>{}</b>\n\
-         🔴 LIVE: <b>{}-{}</b> (bylo {}-{})\n\
-         \n\
-         📊 <b>{}</b> VEDE!\n\
-         \n\
-         🎯 Azuro kurz ({}):\n\
-         {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
-         Azuro implied: <b>{:.1}%</b>\n\
-         \n\
-         📈 Score-implied: <b>{:.1}%</b>\n\
-         ⚡ EDGE: <b>{:.1}%</b> — kurzy JEŠTĚ nereagovaly!\n\
-         \n\
-         🏦 {}\n\
-         💡 BET <b>{}</b> @ <b>{:.2}</b>{}\n\
-         \n\
+        "⚡ <b>#{}</b> {} <b>SCORE EDGE</b>\n\
+         🏷️ <b>{}</b> | path: <b>score_edge</b> | conf: <b>{}</b>\n\
+         🧩 <b>{}</b> vs <b>{}</b>\n\
+         🔴 LIVE: <b>{}-{}</b> (předtím {}-{})\n\
+         💡 Pick: <b>{}</b> @ <b>{:.2}</b>\n\
+         📊 Azuro: {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
+         🧠 Why: edge <b>{:.1}%</b> | score-implied <b>{:.1}%</b> vs azuro <b>{:.1}%</b>\n\
+         🛰 Sources (2): azuro + live_score\n\
+         🏦 {}{}\n\
          Reply: <code>{} YES $3</code> / <code>{} OPP $3</code> / <code>{} NO</code>",
-        alert_id, conf_emoji, e.confidence, sport,
-        e.team1, e.team2,
-        e.score1, e.score2, e.prev_score1, e.prev_score2,
+        alert_id,
+        conf_emoji,
+        sport,
+        e.confidence,
+        e.team1,
+        e.team2,
+        e.score1,
+        e.score2,
+        e.prev_score1,
+        e.prev_score2,
         leading_team,
-        e.azuro_bookmaker,
-        e.team1, e.azuro_w1, e.team2, e.azuro_w2,
-        e.azuro_implied_pct,
-        e.score_implied_pct,
+        azuro_odds,
+        e.team1,
+        e.azuro_w1,
+        e.team2,
+        e.azuro_w2,
         e.edge_pct,
+        e.score_implied_pct,
+        e.azuro_implied_pct,
         exec_ready,
-        leading_team, azuro_odds, url_line,
-        alert_id, alert_id, alert_id,
+        url_line,
+        alert_id,
+        alert_id,
+        alert_id,
     )
 }
 
@@ -2356,6 +2415,78 @@ fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool, bo
     }
 }
 
+fn normalized_market_key(market: Option<&str>) -> String {
+    market
+        .map(|m| m.trim().to_lowercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "match_winner".to_string())
+}
+
+fn market_from_match_key(match_key: &str) -> String {
+    if let Some((_, suffix)) = match_key.rsplit_once("::") {
+        if suffix.ends_with("_winner") {
+            return suffix.to_lowercase();
+        }
+    }
+    "match_winner".to_string()
+}
+
+fn remap_execution_ids_from_state(
+    state: &StateResponse,
+    match_key: &str,
+    team1: &str,
+    team2: &str,
+    value_side: u8,
+) -> Option<(String, String)> {
+    let desired_market = market_from_match_key(match_key);
+
+    for item in &state.odds {
+        if item.match_key != match_key {
+            continue;
+        }
+        if !item.payload.bookmaker.starts_with("azuro_") {
+            continue;
+        }
+        let item_market = normalized_market_key(item.payload.market.as_deref());
+        if item_market != desired_market {
+            continue;
+        }
+
+        let cond = match item.payload.condition_id.as_ref() {
+            Some(c) if !c.is_empty() => c,
+            _ => continue,
+        };
+        let out1 = match item.payload.outcome1_id.as_ref() {
+            Some(o) if !o.is_empty() => o,
+            _ => continue,
+        };
+        let out2 = match item.payload.outcome2_id.as_ref() {
+            Some(o) if !o.is_empty() => o,
+            _ => continue,
+        };
+
+        let direct = teams_match(team1, &item.payload.team1) && teams_match(team2, &item.payload.team2);
+        let swapped = teams_match(team1, &item.payload.team2) && teams_match(team2, &item.payload.team1);
+
+        if !direct && !swapped {
+            continue;
+        }
+
+        let mapped_side = if direct {
+            value_side
+        } else if value_side == 1 {
+            2
+        } else {
+            1
+        };
+
+        let out = if mapped_side == 1 { out1 } else { out2 };
+        return Some((cond.clone(), out.clone()));
+    }
+
+    None
+}
+
 fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
     let now = Utc::now();
     // Build set of currently live match_keys
@@ -2376,15 +2507,13 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
             .filter(|i| i.payload.bookmaker.starts_with("azuro_") && is_recent_seen_at(&i.seen_at, now))
             .collect();
         // Include hltv-featured (20bet, ggbet, etc.) as market reference!
-        let market_items: Vec<&&StateOddsItem> = items.iter()
+        let market_items_all: Vec<&&StateOddsItem> = items.iter()
             .filter(|i| !i.payload.bookmaker.starts_with("azuro_") && is_recent_seen_at(&i.seen_at, now))
             .collect();
 
-        if azuro_items.is_empty() || market_items.is_empty() {
+        if azuro_items.is_empty() || market_items_all.is_empty() {
             continue;
         }
-
-        let azuro = &azuro_items[0].payload;
         let is_live = live_keys.contains_key(match_key.as_str());
         let live_score = live_keys.get(match_key.as_str()).map(|l| {
             format!("{}-{}", l.payload.score1, l.payload.score2)
@@ -2395,136 +2524,164 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
             continue;
         }
 
-        // For each market source, align teams and compute discrepancy
-        let mut total_m_w1 = 0.0_f64;
-        let mut total_m_w2 = 0.0_f64;
-        let mut any_swapped = false;
-        let mut any_ambiguous = false;
-        let mut market_count = 0;
+        let mut processed_markets: HashSet<String> = HashSet::new();
 
-        for mi in &market_items {
-            let (mw1, mw2, swapped, ambiguous) = align_teams(azuro, &mi.payload);
-            total_m_w1 += mw1;
-            total_m_w2 += mw2;
-            if swapped { any_swapped = true; }
-            if ambiguous { any_ambiguous = true; }
-            market_count += 1;
-        }
+        for azuro_item in &azuro_items {
+            let azuro = &azuro_item.payload;
+            let azuro_market = normalized_market_key(azuro.market.as_deref());
+            if !processed_markets.insert(azuro_market.clone()) {
+                continue;
+            }
 
-        // HARD BLOCK: if team identity is ambiguous, skip entirely (same safety as score edge path)
-        if any_ambiguous {
-            info!("🚫 ODDS ANOMALY TEAM AMBIGUOUS: {} — azuro({} vs {}) cannot reliably match market teams, skipping",
-                match_key, azuro.team1, azuro.team2);
-            continue;
-        }
+            let market_items: Vec<&&StateOddsItem> = market_items_all
+                .iter()
+                .copied()
+                .filter(|mi| {
+                    let market_key = normalized_market_key(mi.payload.market.as_deref());
+                    market_key == azuro_market
+                })
+                .collect();
 
-        let avg_w1 = total_m_w1 / market_count as f64;
-        let avg_w2 = total_m_w2 / market_count as f64;
+            if market_items.is_empty() {
+                debug!(
+                    "ODDS_ANOMALY market alignment miss: match_key={} azuro_market={} azuro_bookmaker={}",
+                    match_key,
+                    azuro_market,
+                    azuro.bookmaker
+                );
+                continue;
+            }
 
-        let market_bookie = market_items.iter().map(|i| i.payload.bookmaker.as_str()).collect::<Vec<_>>().join("+");
+            // For each market source, align teams and compute discrepancy
+            let mut total_m_w1 = 0.0_f64;
+            let mut total_m_w2 = 0.0_f64;
+            let mut any_swapped = false;
+            let mut any_ambiguous = false;
+            let mut market_count = 0;
 
-        let disc_w1 = (azuro.odds_team1 / avg_w1 - 1.0) * 100.0;
-        let disc_w2 = (azuro.odds_team2 / avg_w2 - 1.0) * 100.0;
+            for mi in &market_items {
+                let (mw1, mw2, swapped, ambiguous) = align_teams(azuro, &mi.payload);
+                total_m_w1 += mw1;
+                total_m_w2 += mw2;
+                if swapped { any_swapped = true; }
+                if ambiguous { any_ambiguous = true; }
+                market_count += 1;
+            }
+
+            // HARD BLOCK: if team identity is ambiguous, skip entirely (same safety as score edge path)
+            if any_ambiguous {
+                info!("🚫 ODDS ANOMALY TEAM AMBIGUOUS: {} — azuro({} vs {}) cannot reliably match market teams, skipping",
+                    match_key, azuro.team1, azuro.team2);
+                continue;
+            }
+
+            let avg_w1 = total_m_w1 / market_count as f64;
+            let avg_w2 = total_m_w2 / market_count as f64;
+
+            let market_bookie = market_items.iter().map(|i| i.payload.bookmaker.as_str()).collect::<Vec<_>>().join("+");
+
+            let disc_w1 = (azuro.odds_team1 / avg_w1 - 1.0) * 100.0;
+            let disc_w2 = (azuro.odds_team2 / avg_w2 - 1.0) * 100.0;
 
         // === Confidence scoring ===
-        let mut reasons: Vec<String> = Vec::new();
-        let mut penalty = 0;
+            let mut reasons: Vec<String> = Vec::new();
+            let mut penalty = 0;
 
         // PENALTY: teams were swapped
-        if any_swapped {
-            reasons.push(format!("Týmy v jiném pořadí ✅ zarovnáno (azuro: {} vs {}, trh: {} vs {})",
-                azuro.team1, azuro.team2,
-                market_items[0].payload.team1, market_items[0].payload.team2));
-            penalty += 1;
-        }
+            if any_swapped {
+                reasons.push(format!("Týmy v jiném pořadí ✅ zarovnáno (azuro: {} vs {}, trh: {} vs {})",
+                    azuro.team1, azuro.team2,
+                    market_items[0].payload.team1, market_items[0].payload.team2));
+                penalty += 1;
+            }
 
         // PENALTY: extreme odds (likely near-resolved match)
-        let max_odds = azuro.odds_team1.max(azuro.odds_team2);
-        if max_odds > 8.0 {
-            reasons.push(format!("Extrémní odds ({:.2}) — pravděpodobně rozhodnutý zápas", max_odds));
-            penalty += 2;
-        }
+            let max_odds = azuro.odds_team1.max(azuro.odds_team2);
+            if max_odds > 8.0 {
+                reasons.push(format!("Extrémní odds ({:.2}) — pravděpodobně rozhodnutý zápas", max_odds));
+                penalty += 2;
+            }
 
         // CRITICAL: Suspended/placeholder MARKET odds detection
         // When a bookmaker suspends a market (goal, VAR, red card), they show
         // placeholder odds like 1.01-1.05 / 50-120+. These are NOT real prices.
-        let min_market = avg_w1.min(avg_w2);
-        let max_market = avg_w1.max(avg_w2);
-        if min_market <= SUSPENDED_MARKET_MIN_ODDS || max_market >= SUSPENDED_MARKET_MAX_ODDS {
-            reasons.push(format!("⚠️ SUSPENDED MARKET: trh odds {:.2}/{:.2} — placeholder/suspended!", avg_w1, avg_w2));
-            penalty += 6; // Guarantees LOW → skip entirely
-        }
+            let min_market = avg_w1.min(avg_w2);
+            let max_market = avg_w1.max(avg_w2);
+            if min_market <= SUSPENDED_MARKET_MIN_ODDS || max_market >= SUSPENDED_MARKET_MAX_ODDS {
+                reasons.push(format!("⚠️ SUSPENDED MARKET: trh odds {:.2}/{:.2} — placeholder/suspended!", avg_w1, avg_w2));
+                penalty += 6; // Guarantees LOW → skip entirely
+            }
 
         // PENALTY: very high discrepancy is suspicious
-        let max_disc = disc_w1.max(disc_w2);
-        if max_disc > 40.0 {
-            reasons.push(format!("{:.0}% discrepancy je podezřele vysoká — stale data?", max_disc));
-            penalty += 2;
-        }
+            let max_disc = disc_w1.max(disc_w2);
+            if max_disc > 40.0 {
+                reasons.push(format!("{:.0}% discrepancy je podezřele vysoká — stale data?", max_disc));
+                penalty += 2;
+            }
 
         // CRITICAL: Favorite/underdog FLIP detection
         // If Azuro says team1 is favorite (w1 < w2) but market says team1 is underdog (w1 > w2)
         // → odds_team1/odds_team2 are probably SWAPPED in one source → FALSE signal!
-        let azuro_fav1 = azuro.odds_team1 < azuro.odds_team2; // Azuro thinks team1 is favorite
-        let market_fav1 = avg_w1 < avg_w2; // Market thinks team1 is favorite
-        if azuro_fav1 != market_fav1 {
-            reasons.push("⚠️ FAVORIT PROHOZENÝ: Azuro a trh se neshodují kdo je favorit!".into());
-            penalty += 4; // Very strong signal this is data error
-        }
+            let azuro_fav1 = azuro.odds_team1 < azuro.odds_team2; // Azuro thinks team1 is favorite
+            let market_fav1 = avg_w1 < avg_w2; // Market thinks team1 is favorite
+            if azuro_fav1 != market_fav1 {
+                reasons.push("⚠️ FAVORIT PROHOZENÝ: Azuro a trh se neshodují kdo je favorit!".into());
+                penalty += 4; // Very strong signal this is data error
+            }
 
         // BONUS: multiple market sources agree
-        if market_count >= 2 {
-            reasons.push(format!("{} market zdrojů se shoduje", market_count));
-            penalty -= 1;
-        }
+            if market_count >= 2 {
+                reasons.push(format!("{} market zdrojů se shoduje", market_count));
+                penalty -= 1;
+            }
 
         // CRITICAL: Identical Azuro odds guard (e.g. 1.84/1.84 = oracle didn't set real prices)
         // When both sides have same odds, any "edge" is phantom — pure data artifact
-        let azuro_odds_diff = (azuro.odds_team1 - azuro.odds_team2).abs();
-        if azuro_odds_diff < 0.02 {
-            reasons.push(format!("⚠️ IDENTICKÉ AZURO ODDS: {:.2}/{:.2} — oracle bug, phantom edge!",
-                azuro.odds_team1, azuro.odds_team2));
-            penalty += 6; // Guarantees LOW confidence → skip entirely
-        }
+            let azuro_odds_diff = (azuro.odds_team1 - azuro.odds_team2).abs();
+            if azuro_odds_diff < 0.02 {
+                reasons.push(format!("⚠️ IDENTICKÉ AZURO ODDS: {:.2}/{:.2} — oracle bug, phantom edge!",
+                    azuro.odds_team1, azuro.odds_team2));
+                penalty += 6; // Guarantees LOW confidence → skip entirely
+            }
 
         // BONUS: Azuro odds are reasonable (1.2 - 5.0 range)
-        if azuro.odds_team1 > 1.15 && azuro.odds_team1 < 5.0 && azuro.odds_team2 > 1.15 && azuro.odds_team2 < 5.0 {
-            reasons.push("Azuro odds v normálním rozsahu".into());
-        } else {
-            penalty += 1;
-        }
+            if azuro.odds_team1 > 1.15 && azuro.odds_team1 < 5.0 && azuro.odds_team2 > 1.15 && azuro.odds_team2 < 5.0 {
+                reasons.push("Azuro odds v normálním rozsahu".into());
+            } else {
+                penalty += 1;
+            }
 
-        let confidence = if penalty <= 0 {
-            "HIGH"
-        } else if penalty <= 2 {
-            "MEDIUM"
-        } else {
-            "LOW"
-        };
+            let confidence = if penalty <= 0 {
+                "HIGH"
+            } else if penalty <= 2 {
+                "MEDIUM"
+            } else {
+                "LOW"
+            };
 
         // === Only alert HIGH and MEDIUM confidence ===
         // LOW = skip entirely (stale data, live mismatch, etc.)
-        if confidence == "LOW" {
-            continue;
-        }
+            if confidence == "LOW" {
+                continue;
+            }
 
-        let side1_ok = disc_w1 > MIN_EDGE_PCT;
-        let side2_ok = disc_w2 > MIN_EDGE_PCT;
+            let side1_ok = disc_w1 > MIN_EDGE_PCT;
+            let side2_ok = disc_w2 > MIN_EDGE_PCT;
 
         // === FAVORITE-ONLY LOGIC ===
         // Strategie: sázíme POUZE na FAVORITA když Azuro nabízí lepší odds než trh.
         // Underdog anomálie BEZ score-edge je noise — favorit s lepším kurzem = reálná value.
         // Favorit = strana s NIŽŠÍMI Azuro odds (vyšší implied probability).
-        let fav_side = if azuro.odds_team1 < azuro.odds_team2 {
-            1 // team1 je favorit (nižší odds)
-        } else if azuro.odds_team2 < azuro.odds_team1 {
-            2 // team2 je favorit
-        } else {
-            // Odds jsou rovné — povolíme obě strany
-            0
-        };
+            let fav_side = if azuro.odds_team1 < azuro.odds_team2 {
+                1 // team1 je favorit (nižší odds)
+            } else if azuro.odds_team2 < azuro.odds_team1 {
+                2 // team2 je favorit
+            } else {
+                // Odds jsou rovné — povolíme obě strany
+                0
+            };
 
-        let selected_side = if fav_side == 0 {
+            let selected_side = if fav_side == 0 {
             // Equal odds — pick stronger discrepancy
             match (side1_ok, side2_ok) {
                 (true, true) => { if disc_w1 >= disc_w2 { 1 } else { 2 } }
@@ -2565,67 +2722,68 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
             }
         };
 
-        if any_swapped {
-            info!("🔀 ODDS ANOMALY {}: team order different (azuro: {} vs {} | market: {} vs {}) — odds aligned correctly, value_side={}",
-                match_key, azuro.team1, azuro.team2,
-                market_items[0].payload.team1, market_items[0].payload.team2,
-                selected_side);
-        }
+            if any_swapped {
+                info!("🔀 ODDS ANOMALY {}: team order different (azuro: {} vs {} | market: {} vs {}) — odds aligned correctly, value_side={}",
+                    match_key, azuro.team1, azuro.team2,
+                    market_items[0].payload.team1, market_items[0].payload.team2,
+                    selected_side);
+            }
 
-        if selected_side == 1 {
-            anomalies.push(OddsAnomaly {
-                detected_at: now,
-                match_key: match_key.clone(),
-                team1: azuro.team1.clone(),
-                team2: azuro.team2.clone(),
-                azuro_w1: azuro.odds_team1,
-                azuro_w2: azuro.odds_team2,
-                azuro_bookmaker: azuro.bookmaker.clone(),
-                azuro_url: azuro.url.clone(),
-                market_w1: avg_w1,
-                market_w2: avg_w2,
-                market_bookmaker: market_bookie,
-                value_side: 1,
-                discrepancy_pct: disc_w1,
-                confidence,
-                confidence_reasons: reasons,
-                teams_swapped: any_swapped,
-                is_live,
-                live_score,
-                game_id: azuro.game_id.clone(),
-                condition_id: azuro.condition_id.clone(),
-                outcome1_id: azuro.outcome1_id.clone(),
-                outcome2_id: azuro.outcome2_id.clone(),
-                outcome_id: azuro.outcome1_id.clone(),
-                chain: azuro.chain.clone(),
-            });
-        } else if selected_side == 2 {
-            anomalies.push(OddsAnomaly {
-                detected_at: now,
-                match_key: match_key.clone(),
-                team1: azuro.team1.clone(),
-                team2: azuro.team2.clone(),
-                azuro_w1: azuro.odds_team1,
-                azuro_w2: azuro.odds_team2,
-                azuro_bookmaker: azuro.bookmaker.clone(),
-                azuro_url: azuro.url.clone(),
-                market_w1: avg_w1,
-                market_w2: avg_w2,
-                market_bookmaker: market_bookie,
-                value_side: 2,
-                discrepancy_pct: disc_w2,
-                confidence,
-                confidence_reasons: reasons,
-                teams_swapped: any_swapped,
-                is_live,
-                live_score,
-                game_id: azuro.game_id.clone(),
-                condition_id: azuro.condition_id.clone(),
-                outcome1_id: azuro.outcome1_id.clone(),
-                outcome2_id: azuro.outcome2_id.clone(),
-                outcome_id: azuro.outcome2_id.clone(),
-                chain: azuro.chain.clone(),
-            });
+            if selected_side == 1 {
+                anomalies.push(OddsAnomaly {
+                    detected_at: now,
+                    match_key: match_key.clone(),
+                    team1: azuro.team1.clone(),
+                    team2: azuro.team2.clone(),
+                    azuro_w1: azuro.odds_team1,
+                    azuro_w2: azuro.odds_team2,
+                    azuro_bookmaker: azuro.bookmaker.clone(),
+                    azuro_url: azuro.url.clone(),
+                    market_w1: avg_w1,
+                    market_w2: avg_w2,
+                    market_bookmaker: market_bookie,
+                    value_side: 1,
+                    discrepancy_pct: disc_w1,
+                    confidence,
+                    confidence_reasons: reasons,
+                    teams_swapped: any_swapped,
+                    is_live,
+                    live_score: live_score.clone(),
+                    game_id: azuro.game_id.clone(),
+                    condition_id: azuro.condition_id.clone(),
+                    outcome1_id: azuro.outcome1_id.clone(),
+                    outcome2_id: azuro.outcome2_id.clone(),
+                    outcome_id: azuro.outcome1_id.clone(),
+                    chain: azuro.chain.clone(),
+                });
+            } else if selected_side == 2 {
+                anomalies.push(OddsAnomaly {
+                    detected_at: now,
+                    match_key: match_key.clone(),
+                    team1: azuro.team1.clone(),
+                    team2: azuro.team2.clone(),
+                    azuro_w1: azuro.odds_team1,
+                    azuro_w2: azuro.odds_team2,
+                    azuro_bookmaker: azuro.bookmaker.clone(),
+                    azuro_url: azuro.url.clone(),
+                    market_w1: avg_w1,
+                    market_w2: avg_w2,
+                    market_bookmaker: market_bookie,
+                    value_side: 2,
+                    discrepancy_pct: disc_w2,
+                    confidence,
+                    confidence_reasons: reasons,
+                    teams_swapped: any_swapped,
+                    is_live,
+                    live_score: live_score.clone(),
+                    game_id: azuro.game_id.clone(),
+                    condition_id: azuro.condition_id.clone(),
+                    outcome1_id: azuro.outcome1_id.clone(),
+                    outcome2_id: azuro.outcome2_id.clone(),
+                    outcome_id: azuro.outcome2_id.clone(),
+                    chain: azuro.chain.clone(),
+                });
+            }
         }
     }
 
@@ -2682,36 +2840,37 @@ fn format_anomaly_alert(a: &OddsAnomaly, alert_id: u32) -> String {
     };
 
     let sport = a.match_key.split("::").next().unwrap_or("?").to_uppercase();
+    let market_sources: Vec<&str> = a.market_bookmaker
+        .split('+')
+        .filter(|s| !s.trim().is_empty())
+        .collect();
+    let source_count = market_sources.len() + 1;
+    let source_list = if market_sources.is_empty() {
+        a.azuro_bookmaker.clone()
+    } else {
+        format!("{} + {}", a.azuro_bookmaker, market_sources.join(" + "))
+    };
 
     format!(
-        "🎯 <b>#{}</b> {} <b>ODDS ANOMALY</b> [{}]\n\
-         🏷️ <b>{}</b>\n\
-         \n\
-         <b>{}</b> vs <b>{}</b>{}{}\n\
-         \n\
-         📊 Azuro ({}):\n\
-         {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
-         \n\
-         📊 Trh ({}):\n\
-         {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
-         \n\
-         ⚡ <b>{}</b> na Azuru o <b>{:.1}%</b> VYŠŠÍ než trh\n\
-         Azuro: {:.2} vs Trh: {:.2}{}{}\n\
-         \n\
+        "🎯 <b>#{}</b> {} <b>ODDS ANOMALY</b>\n\
+         🏷️ <b>{}</b> | path: <b>anomaly_odds</b> | conf: <b>{}</b>\n\
+         🧩 <b>{}</b> vs <b>{}</b>{}{}\n\
+         💡 Pick: <b>{}</b> @ <b>{:.2}</b>\n\
+         📊 Azuro: {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
+         📊 Trh: {} <b>{:.2}</b> | {} <b>{:.2}</b>\n\
+         🧠 Why: <b>{:.1}%</b> value (azuro {:.2} vs trh {:.2}){}\n\
+         🛰 Sources ({}): {}{}\n\
          🏦 {}\n\
-         💡 BET <b>{}</b> @ <b>{:.2}</b>\n\
-         \n\
          Reply: <code>{} YES $3</code> / <code>{} OPP $3</code> / <code>{} NO</code>",
         alert_id, conf_emoji, a.confidence, sport,
         a.team1, a.team2, live_line, swap_warn,
-        a.azuro_bookmaker,
-        a.team1, a.azuro_w1, a.team2, a.azuro_w2,
-        a.market_bookmaker,
-        a.team1, a.market_w1, a.team2, a.market_w2,
-        value_team, a.discrepancy_pct,
-        azuro_odds, market_odds, reasons_text, url_line,
-        exec_ready,
         value_team, azuro_odds,
+        a.team1, a.azuro_w1, a.team2, a.azuro_w2,
+        a.team1, a.market_w1, a.team2, a.market_w2,
+        a.discrepancy_pct,
+        azuro_odds, market_odds, reasons_text,
+        source_count, source_list, url_line,
+        exec_ready,
         alert_id, alert_id, alert_id
     )
 }
@@ -2749,6 +2908,94 @@ fn format_opportunity_alert(opp: &Opportunity) -> String {
         opp.edge_pct, opp.odds,
         opp.bookmaker,
         opp.confidence * 100.0
+    )
+}
+
+fn format_auto_bet_result_message(
+    aid: u32,
+    path: &str,
+    match_key: &str,
+    team: &str,
+    odds: f64,
+    stake: f64,
+    bet_id: &str,
+    bet_state: &str,
+    auto_bet_count: u32,
+    is_dry_run: bool,
+) -> String {
+    let sport = match_key.split("::").next().unwrap_or("?").to_uppercase();
+    if is_dry_run {
+        format!(
+            "🧪 <b>AUTO-BET #{} DRY-RUN</b>\n\
+             🏷️ <b>{}</b> | path: <b>{}</b>\n\
+             💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>",
+            aid, sport, path, team, odds, stake
+        )
+    } else {
+        format!(
+            "✅ <b>AUTO-BET #{} PLACED</b>\n\
+             🏷️ <b>{}</b> | path: <b>{}</b>\n\
+             💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>\n\
+             🧾 Bet ID: <code>{}</code> | state: <b>{}</b>\n\
+             📈 Auto-bets dnes: <b>{}</b>",
+            aid, sport, path, team, odds, stake, bet_id, bet_state, auto_bet_count
+        )
+    }
+}
+
+fn format_auto_bet_failed_message(
+    aid: u32,
+    path: &str,
+    match_key: &str,
+    condition_id: &str,
+    reason_code: &str,
+    err: &str,
+    retries: usize,
+    rtt_ms: u128,
+    pipeline_ms: u128,
+    requested_odds: f64,
+    min_odds: f64,
+) -> String {
+    let sport = match_key.split("::").next().unwrap_or("?").to_uppercase();
+    format!(
+        "❌ <b>AUTO-BET #{} FAILED</b>\n\
+         🏷️ <b>{}</b> | path: <b>{}</b>\n\
+         🧩 match: <b>{}</b>\n\
+         🧠 reason: <b>{}</b>\n\
+         🔧 condition: <code>{}</code>\n\
+         📊 odds: {:.4} → min {:.4} | retry {}\n\
+         ⏱ rtt {}ms | pipeline {}ms\n\
+         📝 {}",
+        aid,
+        sport,
+        path,
+        match_key,
+        reason_code,
+        condition_id,
+        requested_odds,
+        min_odds,
+        retries,
+        rtt_ms,
+        pipeline_ms,
+        err,
+    )
+}
+
+fn format_auto_bet_rejected_message(
+    aid: u32,
+    path: &str,
+    match_key: &str,
+    condition_id: &str,
+    state: &str,
+) -> String {
+    let sport = match_key.split("::").next().unwrap_or("?").to_uppercase();
+    format!(
+        "❌ <b>AUTO-BET #{} REJECTED</b>\n\
+         🏷️ <b>{}</b> | path: <b>{}</b>\n\
+         🧩 match: <b>{}</b>\n\
+         🔧 condition: <code>{}</code>\n\
+         🧠 state: <b>{}</b>",
+        aid, sport, path, match_key, condition_id, state
     )
 }
 
@@ -2870,6 +3117,8 @@ async fn main() -> Result<()> {
     let mut alert_counter: u32 = 0;
     let mut alert_map: HashMap<u32, OddsAnomaly> = HashMap::new();
     let mut msg_id_to_alert_id: HashMap<i64, u32> = HashMap::new();
+    // Manual alert throttle per match_key (anti-spam)
+    let mut manual_offer_last_sent: HashMap<String, DateTime<Utc>> = HashMap::new();
     let mut active_bets: Vec<ActiveBet> = Vec::new();
     let mut score_tracker = ScoreTracker::new();
     // In-flight dedup: condition IDs currently being sent to executor (prevents race condition
@@ -3001,6 +3250,18 @@ async fn main() -> Result<()> {
         }
     };
 
+    // === CONDITION BLACKLIST: track conditions that got "not active" / "paused" errors ===
+    // After a condition fails with these errors, it rarely recovers → skip all future bets on it
+    // Eliminates ~88 repeated BET_FAILED on dead conditions per historical data
+    let mut blacklisted_conditions: HashMap<String, std::time::Instant> = HashMap::new();
+    const CONDITION_BLACKLIST_TTL_SECS: u64 = 600; // 10 min — allow retry after cooldown
+
+    // === MATCH-LEVEL BLACKLIST: block entire match when conditions keep dying ===
+    // After ConditionNotRunning or on-chain Rejected, the match's conditions are usually all dead.
+    // New condition_ids get generated per score update → condition-level blacklist alone is insufficient.
+    let mut blacklisted_matches: HashMap<String, std::time::Instant> = HashMap::new();
+    const MATCH_BLACKLIST_TTL_SECS: u64 = 300; // 5 min — match-level cooldown
+
     // === DEDUP: track already-bet match keys + condition IDs (persisted across restarts) ===
     let bet_history_path = "data/bet_history.txt";
     let mut already_bet_matches: HashSet<String> = HashSet::new();
@@ -3011,18 +3272,33 @@ async fn main() -> Result<()> {
     // Load from file on startup
     if Path::new(bet_history_path).exists() {
         if let Ok(contents) = std::fs::read_to_string(bet_history_path) {
+            let now_utc = Utc::now();
+            let mut loaded_total: usize = 0;
+            let mut loaded_fresh: usize = 0;
             for line in contents.lines() {
                 let parts: Vec<&str> = line.split('|').collect();
                 if parts.len() >= 2 {
+                    loaded_total += 1;
+                    let is_fresh = if parts.len() >= 5 {
+                        chrono::DateTime::parse_from_rfc3339(parts[4])
+                            .map(|ts| (now_utc - ts.with_timezone(&Utc)).num_hours() <= DEDUP_HISTORY_LOOKBACK_HOURS)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    if !is_fresh {
+                        continue;
+                    }
                     already_bet_matches.insert(parts[0].to_string());
                     already_bet_conditions.insert(parts[1].to_string());
                     // Extract base match key (strip ::mapN_winner suffix)
                     let base_key = strip_map_winner_suffix(parts[0]);
                     already_bet_base_matches.insert(base_key);
+                    loaded_fresh += 1;
                 }
             }
-            info!("📋 Loaded {} previous bets from history (dedup protection, {} base matches)",
-                already_bet_matches.len(), already_bet_base_matches.len());
+            info!("📋 Loaded {} fresh dedup entries from history ({} total scanned, lookback={}h, {} base matches)",
+                loaded_fresh, loaded_total, DEDUP_HISTORY_LOOKBACK_HOURS, already_bet_base_matches.len());
         }
     }
 
@@ -3408,7 +3684,7 @@ async fn main() -> Result<()> {
                                     let leading_team = if edge.leading_side == 1 { &edge.team1 } else { &edge.team2 };
 
                                     // === AUTO-BET: place bet automatically on high-confidence edges ===
-                                    let cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
+                                    let mut cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
                                     let match_key_for_bet = edge.match_key.clone();
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
 
@@ -3566,6 +3842,40 @@ async fn main() -> Result<()> {
                                     let pending_ok = pending_count < MAX_CONCURRENT_PENDING;
                                     let streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
+                                    // CONDITION BLACKLIST: skip conditions that previously failed
+                                    let condition_blacklisted = edge.condition_id.as_ref()
+                                        .map(|cid| {
+                                            if let Some(bl_time) = blacklisted_conditions.get(cid) {
+                                                if bl_time.elapsed() < std::time::Duration::from_secs(CONDITION_BLACKLIST_TTL_SECS) {
+                                                    info!("🚫 CONDITION BLACKLISTED (edge): {} — failed {}s ago, skipping",
+                                                        cid, bl_time.elapsed().as_secs());
+                                                    true
+                                                } else {
+                                                    blacklisted_conditions.remove(cid);
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .unwrap_or(false);
+
+                                    // MATCH-LEVEL BLACKLIST: skip entire match when conditions keep dying
+                                    let match_blacklisted = {
+                                        if let Some(bl_time) = blacklisted_matches.get(&edge.match_key) {
+                                            if bl_time.elapsed() < std::time::Duration::from_secs(MATCH_BLACKLIST_TTL_SECS) {
+                                                info!("🚫 MATCH BLACKLISTED (edge): {} — failed {}s ago, skipping",
+                                                    &edge.match_key, bl_time.elapsed().as_secs());
+                                                true
+                                            } else {
+                                                blacklisted_matches.remove(&edge.match_key);
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    };
+
                                     let should_auto_bet = AUTO_BET_ENABLED
                                         && sport_auto_allowed
                                         && is_preferred_market
@@ -3580,6 +3890,8 @@ async fn main() -> Result<()> {
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
                                         && !generic_esports_blocked
+                                        && !condition_blacklisted  // CONDITION BLACKLIST: skip dead conditions
+                                        && !match_blacklisted      // MATCH BLACKLIST: skip dead matches
                                         && (!already_bet_this || rebet_ok) // RE-BET: allow if re-bet conditions met
                                         && stake >= 0.50 // EXPOSURE CAP: stake trimmer didn't zero it out
                                         && bankroll_ok   // MIN_BANKROLL guard
@@ -3626,8 +3938,8 @@ async fn main() -> Result<()> {
 
                                     if should_auto_bet {
                                         // AUTO-BET with sport-specific stake (set above)
-                                        let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
-                                        let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
+                                        let mut condition_id = anomaly.condition_id.as_ref().unwrap().clone();
+                                        let mut outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
                                         // Condition freshness: how stale is our last sighting? (GQL baseline)
                                         let condition_age_ms = condition_last_seen.get(&condition_id)
@@ -3636,15 +3948,32 @@ async fn main() -> Result<()> {
 
                                         // === PRE-FLIGHT GATE: WS-first with GQL fallback ===
                                         // Priority: WS real-time state > GQL poll staleness
-                                        let ws_result = {
+                                        let mut ws_result = {
                                             let cache_r = ws_condition_cache.read().await;
                                             ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
                                         };
+
+                                        // WS subscription race: when a condition appears for the first time,
+                                        // the cache can be empty for a short window. Probe once to avoid
+                                        // falling back to GQL (which correlates poorly with fast state flips).
+                                        if ws_state_gate_enabled {
+                                            if matches!(ws_result, WsGateResult::NoData | WsGateResult::Stale { .. }) {
+                                                let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
+                                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                                ws_result = {
+                                                    let cache_r = ws_condition_cache.read().await;
+                                                    ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                                };
+                                            }
+                                        }
+
                                         let gate_blocked = match &ws_result {
                                             WsGateResult::NotActive { state, age_ms } => {
                                                 warn!("🚫 WS-GATE #{}: condition {} state={} (ws_age={}ms) — DROP",
                                                     aid, &condition_id, state, age_ms);
-                                                ledger_write("BET_FAILED", &serde_json::json!({
+                                                // CONDITION BLACKLIST: WS says not active → blacklist
+                                                blacklisted_conditions.insert(condition_id.clone(), std::time::Instant::now());
+                                                ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                     "alert_id": aid, "match_key": match_key_for_bet,
                                                     "condition_id": condition_id, "outcome_id": outcome_id,
                                                     "error": format!("WS gate: condition state={}", state),
@@ -3669,25 +3998,62 @@ async fn main() -> Result<()> {
                                                 ws_gate_active_count += 1;
                                                 false // proceed!
                                             }
-                                            WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
-                                                // Fallback to GQL gate
-                                                match &ws_result {
-                                                    WsGateResult::Stale { .. } => ws_gate_stale_fallback_count += 1,
-                                                    WsGateResult::NoData => ws_gate_nodata_fallback_count += 1,
-                                                    _ => {}
-                                                }
+                                            WsGateResult::Stale { age_ms } => {
+                                                ws_gate_stale_fallback_count += 1;
+                                                // WS data stale → fallback to GQL age check
                                                 if condition_age_ms > CONDITION_MAX_AGE_MS {
-                                                    let fb_reason = match &ws_result {
-                                                        WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
-                                                        WsGateResult::NoData => "WsNoData->GqlStale".to_string(),
-                                                        _ => "WsDisabled->GqlStale".to_string(),
-                                                    };
-                                                    warn!("🚫 PRE-FLIGHT GATE #{}: condition {} [{}] gql_age={}ms > {}ms — dropping",
-                                                        aid, &condition_id, fb_reason, condition_age_ms, CONDITION_MAX_AGE_MS);
-                                                    ledger_write("BET_FAILED", &serde_json::json!({
+                                                    warn!("🚫 PRE-FLIGHT #{}: WsStale({}ms)+GqlStale({}ms) — dropping",
+                                                        aid, age_ms, condition_age_ms);
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": match_key_for_bet,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
-                                                        "error": format!("pre-flight gate: {}", fb_reason),
+                                                        "error": format!("WS stale ({}ms) + GQL stale ({}ms)", age_ms, condition_age_ms),
+                                                        "reason_code": "WsStaleGqlStale",
+                                                        "is_condition_state_reject": true,
+                                                        "ws_age_ms": age_ms,
+                                                        "condition_age_ms": condition_age_ms,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "edge",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    info!("⚡ WS-GATE #{}: WsStale({}ms) but GQL fresh({}ms) — proceeding",
+                                                        aid, age_ms, condition_age_ms);
+                                                    false
+                                                }
+                                            }
+                                            WsGateResult::NoData => {
+                                                ws_gate_nodata_fallback_count += 1;
+                                                // No WS data → fallback to GQL age check
+                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": match_key_for_bet,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": format!("WS no data + GQL stale ({}ms)", condition_age_ms),
+                                                        "reason_code": "WsNoDataGqlStale",
+                                                        "is_condition_state_reject": true,
+                                                        "condition_age_ms": condition_age_ms,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "edge",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    info!("⚡ WS-GATE #{}: WsNoData but GQL fresh({}ms) — proceeding",
+                                                        aid, condition_age_ms);
+                                                    false
+                                                }
+                                            }
+                                            WsGateResult::Disabled => {
+                                                // WS gate disabled → fallback to GQL gate
+                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                    warn!("🚫 PRE-FLIGHT GATE #{}: condition {} [WsDisabled->GqlStale] gql_age={}ms > {}ms — dropping",
+                                                        aid, &condition_id, condition_age_ms, CONDITION_MAX_AGE_MS);
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": match_key_for_bet,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": "pre-flight gate: WsDisabled->GqlStale",
                                                         "reason_code": "PreFlightStale",
                                                         "is_condition_state_reject": true,
                                                         "condition_age_ms": condition_age_ms,
@@ -3697,11 +4063,11 @@ async fn main() -> Result<()> {
                                                     }));
                                                     log_event("PREFLIGHT_GATE", &serde_json::json!({
                                                         "alert_id": aid, "condition_id": condition_id,
-                                                        "condition_age_ms": condition_age_ms, "reason": fb_reason,
+                                                        "condition_age_ms": condition_age_ms, "reason": "WsDisabled->GqlStale",
                                                     }));
                                                     true
                                                 } else {
-                                                    false // GQL says fresh enough → proceed
+                                                    false
                                                 }
                                             }
                                         };
@@ -3717,42 +4083,22 @@ async fn main() -> Result<()> {
                                         info!("🤖 AUTO-BET #{}: {} @ {:.2} ${:.2} edge={:.1}%",
                                             aid, leading_team, azuro_odds, stake, edge.edge_pct);
 
-                                        // Send alert WITH auto-bet notice
-                                        let sport_label = edge.match_key.split("::").next().unwrap_or("?").to_uppercase();
-                                        let msg = format!(
-                                            "🤖 <b>#{} AUTO-BET</b> 🟢 HIGH\n\
-                                             🏷️ <b>{}</b>\n\
-                                             \n\
-                                             <b>{}</b> vs <b>{}</b>\n\
-                                             🔴 LIVE: <b>{}-{}</b> (bylo {}-{})\n\
-                                             \n\
-                                             📊 <b>{}</b> VEDE!\n\
-                                             ⚡ EDGE: <b>{:.1}%</b>\n\
-                                             🎯 Kurz: <b>{:.2}</b>\n\
-                                             💰 Stake: <b>${:.2}</b>\n\
-                                             \n\
-                                             ⏳ Automaticky sázím...",
-                                            aid,
-                                            sport_label,
-                                            edge.team1, edge.team2,
-                                            edge.score1, edge.score2, edge.prev_score1, edge.prev_score2,
-                                            leading_team,
-                                            edge.edge_pct,
-                                            azuro_odds,
-                                            stake
-                                        );
-                                        if let Err(e) = tg_send_message(&client, &token, chat_id, &msg).await {
-                                            error!("Failed to send auto-bet pre-alert: {}", e);
-                                        } else {
-                                            score_alert_sent = true;
-                                        }
-
                                         // Place the bet — with retry on "condition not active"
                                         let decision_instant = std::time::Instant::now();
                                         let decision_ts = Utc::now();
-                                        let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
-                                        let min_odds_display = azuro_odds * min_odds_factor_for_match(&match_key_for_bet);
                                         let amount_raw = (stake * 1e6) as u64;
+
+                                        // Retry loop: Azuro pauses conditions during score events
+                                        // (set/game point in tennis, goal in football). We retry twice
+                                        // after 5s each in case the condition re-activates.
+                                        let max_retries = AUTO_BET_RETRY_MAX;
+                                        let mut attempt = 0;
+                                        let mut minodds_fallback_applied = false;
+                                        let mut bet_success = false;
+                                        loop {
+                                        let min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
+                                        let min_odds = (azuro_odds * min_odds_factor * 1e12) as u64;
+                                        let min_odds_display = azuro_odds * min_odds_factor;
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
                                             "outcomeId": outcome_id,
@@ -3762,14 +4108,6 @@ async fn main() -> Result<()> {
                                             "team2": edge.team2,
                                             "valueTeam": leading_team,
                                         });
-
-                                        // Retry loop: Azuro pauses conditions during score events
-                                        // (set/game point in tennis, goal in football). We retry twice
-                                        // after 5s each in case the condition re-activates.
-                                        let max_retries = AUTO_BET_RETRY_MAX;
-                                        let mut attempt = 0;
-                                        let mut bet_success = false;
-                                        loop {
                                         // Signal TTL check — abort if decision is stale
                                         if decision_instant.elapsed() > std::time::Duration::from_secs(SIGNAL_TTL_SECS) {
                                             warn!("⏰ AUTO-BET #{}: Signal TTL expired ({}ms elapsed) — aborting stale bet",
@@ -3777,8 +4115,16 @@ async fn main() -> Result<()> {
                                             inflight_conditions.remove(&cond_id_str);
                                             inflight_conditions.remove(&match_key_for_bet);
                                             let _ = tg_send_message(&client, &token, chat_id,
-                                                &format!("⏰ <b>AUTO-BET #{} TTL EXPIRED</b> ({}ms) — sázka zastaralá, zrušeno.",
-                                                    aid, decision_instant.elapsed().as_millis())
+                                                &format!(
+                                                    "⏰ <b>AUTO-BET #{} TTL EXPIRED</b>\n\
+                                                     🏷️ <b>{}</b> | path: <b>edge</b>\n\
+                                                     🧩 match: <b>{}</b>\n\
+                                                     ⏱ elapsed: {}ms",
+                                                    aid,
+                                                    match_key_for_bet.split("::").next().unwrap_or("?").to_uppercase(),
+                                                    match_key_for_bet,
+                                                    decision_instant.elapsed().as_millis()
+                                                )
                                             ).await;
                                             break;
                                         }
@@ -3827,18 +4173,60 @@ async fn main() -> Result<()> {
                                                                 || err_lower.contains("revert")
                                                                 || err_lower.contains("nonce");
                                                             if is_condition_paused && !is_fatal && attempt < max_retries {
-                                                                attempt += 1;
-                                                                let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
-                                                                let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
-                                                                let delay_ms = base_delay + jitter;
-                                                                info!("🔄 AUTO-BET #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
-                                                                    aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
-                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                                                                continue; // retry the loop
+                                                                if let Some((new_condition_id, new_outcome_id)) = remap_execution_ids_from_state(
+                                                                    &state,
+                                                                    &match_key_for_bet,
+                                                                    &edge.team1,
+                                                                    &edge.team2,
+                                                                    edge.leading_side,
+                                                                ) {
+                                                                    if new_condition_id != condition_id || new_outcome_id != outcome_id {
+                                                                        info!("🔁 AUTO-BET #{} remap retry: cond {}→{} out {}→{}",
+                                                                            aid, condition_id, new_condition_id, outcome_id, new_outcome_id);
+                                                                        inflight_conditions.remove(&cond_id_str);
+                                                                        condition_id = new_condition_id;
+                                                                        outcome_id = new_outcome_id;
+                                                                        cond_id_str = condition_id.clone();
+                                                                        inflight_conditions.insert(cond_id_str.clone());
+                                                                        attempt += 1;
+                                                                        tokio::time::sleep(std::time::Duration::from_millis(REMAP_RETRY_DELAY_MS)).await;
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                                let too_stale_for_retry = condition_age_ms > RETRY_CONDITION_MAX_AGE_MS;
+                                                                let too_late_for_retry = decision_instant.elapsed().as_millis() as u64 > (PIPELINE_BUDGET_MS / 2);
+                                                                if too_stale_for_retry || too_late_for_retry {
+                                                                    info!("⏭️ AUTO-BET #{} retry skipped (stale={} late={} age={}ms pipeline={}ms)",
+                                                                        aid,
+                                                                        too_stale_for_retry,
+                                                                        too_late_for_retry,
+                                                                        condition_age_ms,
+                                                                        decision_instant.elapsed().as_millis());
+                                                                } else {
+                                                                    attempt += 1;
+                                                                    let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
+                                                                    let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
+                                                                    let delay_ms = base_delay + jitter;
+                                                                    info!("🔄 AUTO-BET #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
+                                                                        aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
+                                                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                                                    continue; // retry the loop
+                                                                }
                                                             }
                                                             // Classify error for noise reduction
                                                             let is_minodds_reject = err_lower.contains("min odds") || err_lower.contains("minodds")
                                                                 || err_lower.contains("real odds");
+                                                            if is_minodds_reject && !minodds_fallback_applied && attempt < max_retries {
+                                                                attempt += 1;
+                                                                minodds_fallback_applied = true;
+                                                                let base_delay = 120;
+                                                                let jitter = ((aid as u64).wrapping_mul(11).wrapping_add(attempt as u64 * 17)) % 80;
+                                                                let delay_ms = base_delay + jitter;
+                                                                info!("🔁 AUTO-BET #{} min-odds fallback retry {}/{}: factor step -{:.2}, wait {}ms ({})",
+                                                                    aid, attempt, max_retries, MIN_ODDS_FALLBACK_STEP, delay_ms, err);
+                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                                                continue;
+                                                            }
                                                             let is_dedup = err_lower.contains("dedup") || err_lower.contains("already bet");
                                                             let is_condition_state_reject = is_condition_paused;
                                                             let reason_code = if is_condition_state_reject { "ConditionNotRunning" }
@@ -3846,6 +4234,18 @@ async fn main() -> Result<()> {
                                                                 else if is_dedup { "Dedup" }
                                                                 else if is_fatal { "Fatal" }
                                                                 else { "Unknown" };
+                                                            // CONDITION BLACKLIST: add failed condition to blacklist
+                                                            if is_condition_state_reject || is_minodds_reject {
+                                                                blacklisted_conditions.insert(condition_id.clone(), std::time::Instant::now());
+                                                                info!("🚫 BLACKLISTED condition {} (reason={}, TTL={}s)",
+                                                                    &condition_id, reason_code, CONDITION_BLACKLIST_TTL_SECS);
+                                                            }
+                                                            // MATCH BLACKLIST: ConditionNotRunning → block entire match
+                                                            if is_condition_state_reject {
+                                                                blacklisted_matches.insert(match_key_for_bet.clone(), std::time::Instant::now());
+                                                                info!("🚫 MATCH BLACKLISTED {} (ConditionNotRunning, TTL={}s)",
+                                                                    &match_key_for_bet, MATCH_BLACKLIST_TTL_SECS);
+                                                            }
                                                             error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={}, rtt={}ms, pipeline={}ms, requested_odds={:.4}, min_odds={:.4}, reason={})",
                                                                 aid, err,
                                                                 &condition_id,
@@ -3875,13 +4275,19 @@ async fn main() -> Result<()> {
                                                             // Don't spam TG for dedup (409) — it's normal operational behavior
                                                             if !is_dedup {
                                                                 let _ = tg_send_message(&client, &token, chat_id,
-                                                                    &format!("❌ <b>AUTO-BET #{} FAILED</b>\n\nError: {}\nCondition: {}\nMatch: {}\nRetries: {}\n⏱ RTT: {}ms | Pipeline: {}ms\nOdds: {:.4} → min {:.4}",
-                                                                        aid, err,
+                                                                    &format_auto_bet_failed_message(
+                                                                        aid,
+                                                                        "edge",
+                                                                        &match_key_for_bet,
                                                                         &condition_id,
-                                                                        match_key_for_bet,
+                                                                        reason_code,
+                                                                        err,
                                                                         attempt,
-                                                                        rtt_ms, pipeline_ms,
-                                                                        azuro_odds, min_odds_display)
+                                                                        rtt_ms,
+                                                                        pipeline_ms,
+                                                                        azuro_odds,
+                                                                        min_odds_display,
+                                                                    )
                                                                 ).await;
                                                             } else {
                                                                 info!("🔇 Suppressed TG for dedup rejection #{}: {}", aid, err);
@@ -3896,10 +4302,13 @@ async fn main() -> Result<()> {
                                                                 &condition_id,
                                                                 match_key_for_bet);
                                                             let _ = tg_send_message(&client, &token, chat_id,
-                                                                &format!("❌ <b>AUTO-BET #{} REJECTED</b>\n\nState: {}\nCondition: {}\nMatch: {}\nCondition may be paused/resolved.",
-                                                                    aid, br.state.as_deref().unwrap_or("?"),
+                                                                &format_auto_bet_rejected_message(
+                                                                    aid,
+                                                                    "edge",
+                                                                    &match_key_for_bet,
                                                                     &condition_id,
-                                                                    match_key_for_bet)
+                                                                    br.state.as_deref().unwrap_or("?"),
+                                                                )
                                                             ).await;
                                                             // === LEDGER: REJECTED ===
                                                             ledger_write("REJECTED", &serde_json::json!({
@@ -4027,22 +4436,23 @@ async fn main() -> Result<()> {
                                                                 }));
                                                             }
 
-                                                            let lim_s = "∞".to_string();
-                                                            let result_msg = if is_dry_run {
-                                                                format!("🧪 <b>AUTO-BET #{} DRY-RUN</b>\n{} @ {:.2} ${:.2}\n⚠️ Nebyl odeslán on-chain.", aid, leading_team, azuro_odds, stake)
+                                                            let result_msg = format_auto_bet_result_message(
+                                                                aid,
+                                                                "edge",
+                                                                &match_key_for_bet,
+                                                                leading_team,
+                                                                azuro_odds,
+                                                                stake,
+                                                                bet_id,
+                                                                bet_state,
+                                                                auto_bet_count,
+                                                                is_dry_run,
+                                                            );
+                                                            if let Err(e) = tg_send_message(&client, &token, chat_id, &result_msg).await {
+                                                                error!("Failed to send auto-bet result alert: {}", e);
                                                             } else {
-                                                                format!(
-                                                                    "✅ <b>AUTO-BET #{} PLACED!</b>\n\
-                                                                     {} @ {:.2} | ${:.2}\n\
-                                                                     Bet ID: <code>{}</code>\n\
-                                                                     State: {}\n\
-                                                                     Auto-bets dnes: {}/{}",
-                                                                    aid, leading_team, azuro_odds, stake,
-                                                                    bet_id, bet_state,
-                                                                    auto_bet_count, lim_s
-                                                                )
-                                                            };
-                                                            let _ = tg_send_message(&client, &token, chat_id, &result_msg).await;
+                                                                score_alert_sent = true;
+                                                            }
 
                                                             // === UNIFIED FOLLOW-UP: Poll Created bets to detect async Rejected ===
                                                             if !is_dry_run && (bet_state == "Created" || bet_state == "Pending") {
@@ -4053,6 +4463,11 @@ async fn main() -> Result<()> {
                                                                 let follow_aid = aid;
                                                                 let follow_team = leading_team.to_string();
                                                                 let follow_chat = chat_id;
+                                                                let follow_match_key = match_key_for_bet.clone();
+                                                                let follow_condition_id = condition_id.clone();
+                                                                let follow_outcome_id = outcome_id.clone();
+                                                                let follow_odds = azuro_odds;
+                                                                let follow_stake = stake;
                                                                 tokio::spawn(async move {
                                                                     tokio::time::sleep(Duration::from_secs(20)).await;
                                                                     if let Ok(resp) = follow_client.get(
@@ -4065,16 +4480,39 @@ async fn main() -> Result<()> {
                                                                                 .and_then(|v| v.as_str()).unwrap_or("");
                                                                             if final_state == "Rejected" || final_state == "Failed" || final_state == "Cancelled" {
                                                                                 let alert = format!(
-                                                                                    "❌ <b>AUTO-BET #{} REJECTED (follow-up)</b>\n\n\
-                                                                                     {} — transakce reverted on-chain.\n\
-                                                                                     Error: {}\n\
-                                                                                     💰 Peníze nebyly strženy.",
-                                                                                    follow_aid, follow_team, err_msg);
+                                                                                    "❌ <b>AUTO-BET #{} REJECTED (follow-up)</b>\n\
+                                                                                     path: <b>edge</b>\n\
+                                                                                     💡 Pick: <b>{}</b>\n\
+                                                                                     🧠 on-chain state: <b>{}</b>\n\
+                                                                                     📝 {}",
+                                                                                    follow_aid, follow_team, final_state, err_msg);
                                                                                 let _ = tg_send_message(
                                                                                     &follow_client, &follow_token,
                                                                                     follow_chat, &alert).await;
                                                                                 warn!("❌ AUTO-BET #{} FOLLOW-UP REJECTED: {} err={}",
                                                                                     follow_aid, follow_bet_id, err_msg);
+                                                                                // LEDGER: write on-chain REJECTED event
+                                                                                {
+                                                                                    let entry = serde_json::json!({
+                                                                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                        "event": "ON_CHAIN_REJECTED",
+                                                                                        "alert_id": follow_aid,
+                                                                                        "match_key": follow_match_key,
+                                                                                        "condition_id": follow_condition_id,
+                                                                                        "outcome_id": follow_outcome_id,
+                                                                                        "bet_id": follow_bet_id,
+                                                                                        "on_chain_state": final_state,
+                                                                                        "error": err_msg,
+                                                                                        "path": "edge",
+                                                                                        "odds": follow_odds,
+                                                                                        "stake": follow_stake,
+                                                                                    });
+                                                                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                                        .create(true).append(true).open("data/ledger.jsonl") {
+                                                                                        use std::io::Write;
+                                                                                        let _ = writeln!(f, "{}", entry);
+                                                                                    }
+                                                                                }
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
@@ -4096,7 +4534,15 @@ async fn main() -> Result<()> {
                                                         inflight_conditions.remove(&cond_id_str);
                                                         inflight_conditions.remove(&match_key_for_bet);
                                                         let _ = tg_send_message(&client, &token, chat_id,
-                                                            &format!("❌ Auto-bet #{} response error: {}", aid, e)
+                                                            &format!(
+                                                                "❌ <b>AUTO-BET #{} RESPONSE ERROR</b>\n\
+                                                                 path: <b>edge</b>\n\
+                                                                 match: <b>{}</b>\n\
+                                                                 {}",
+                                                                aid,
+                                                                match_key_for_bet,
+                                                                e,
+                                                            )
                                                         ).await;
                                                     }
                                                 }
@@ -4106,7 +4552,15 @@ async fn main() -> Result<()> {
                                                 inflight_conditions.remove(&cond_id_str);
                                                 inflight_conditions.remove(&match_key_for_bet);
                                                 let _ = tg_send_message(&client, &token, chat_id,
-                                                    &format!("❌ Executor offline pro auto-bet #{}: {}", aid, e)
+                                                    &format!(
+                                                        "❌ <b>AUTO-BET #{} EXECUTOR OFFLINE</b>\n\
+                                                         path: <b>edge</b>\n\
+                                                         match: <b>{}</b>\n\
+                                                         {}",
+                                                        aid,
+                                                        match_key_for_bet,
+                                                        e,
+                                                    )
                                                 ).await;
                                             }
                                         }
@@ -4114,16 +4568,36 @@ async fn main() -> Result<()> {
                                         } // end retry loop
 
                                         } // end pre-flight gate else block
+                                    } else if condition_blacklisted {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (blacklisted condition): {}",
+                                            edge.match_key);
+                                    } else if match_blacklisted {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (blacklisted match): {}",
+                                            edge.match_key);
+                                    } else if already_bet_this && !rebet_ok {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (dedup): {} (base={})",
+                                            edge.match_key, base_match_key);
                                     } else if !mute_manual_alerts {
                                         // Manual alert (MEDIUM confidence or auto-bet disabled)
-                                        let msg = format_score_edge_alert(edge, aid);
-                                        match tg_send_message(&client, &token, chat_id, &msg).await {
-                                            Ok(msg_id) => {
-                                                score_alert_sent = true;
-                                                msg_id_to_alert_id.insert(msg_id, aid);
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to send score edge alert: {}", e);
+                                        let now_alert = Utc::now();
+                                        let too_soon = manual_offer_last_sent
+                                            .get(&edge.match_key)
+                                            .map(|ts| (now_alert - *ts).num_seconds() < MANUAL_MATCH_COOLDOWN_SECS)
+                                            .unwrap_or(false);
+                                        if too_soon {
+                                            info!("⏱️ MANUAL ALERT THROTTLED: {} (cooldown={}s)",
+                                                edge.match_key, MANUAL_MATCH_COOLDOWN_SECS);
+                                        } else {
+                                            let msg = format_score_edge_alert(edge, aid);
+                                            match tg_send_message(&client, &token, chat_id, &msg).await {
+                                                Ok(msg_id) => {
+                                                    score_alert_sent = true;
+                                                    msg_id_to_alert_id.insert(msg_id, aid);
+                                                    manual_offer_last_sent.insert(edge.match_key.clone(), now_alert);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to send score edge alert: {}", e);
+                                                }
                                             }
                                         }
                                     } else {
@@ -4174,7 +4648,7 @@ async fn main() -> Result<()> {
                                         .filter(|s| !s.trim().is_empty())
                                         .count();
 
-                                    let cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
+                                    let mut cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
                                     let match_key_for_bet = anomaly.match_key.clone();
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
                                     // BUG FIX: Check base_match_key too → prevents triple exposure on same match
@@ -4258,6 +4732,40 @@ async fn main() -> Result<()> {
                                     let anomaly_pending_ok = active_bets.len() < MAX_CONCURRENT_PENDING;
                                     let anomaly_streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
+                                    // CONDITION BLACKLIST: skip conditions that previously failed
+                                    let anomaly_condition_blacklisted = anomaly.condition_id.as_ref()
+                                        .map(|cid| {
+                                            if let Some(bl_time) = blacklisted_conditions.get(cid) {
+                                                if bl_time.elapsed() < std::time::Duration::from_secs(CONDITION_BLACKLIST_TTL_SECS) {
+                                                    info!("🚫 CONDITION BLACKLISTED (anomaly): {} — failed {}s ago, skipping",
+                                                        cid, bl_time.elapsed().as_secs());
+                                                    true
+                                                } else {
+                                                    blacklisted_conditions.remove(cid);
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        })
+                                        .unwrap_or(false);
+
+                                    // MATCH-LEVEL BLACKLIST: skip entire match when conditions keep dying
+                                    let anomaly_match_blacklisted = {
+                                        if let Some(bl_time) = blacklisted_matches.get(&anomaly.match_key) {
+                                            if bl_time.elapsed() < std::time::Duration::from_secs(MATCH_BLACKLIST_TTL_SECS) {
+                                                info!("🚫 MATCH BLACKLISTED (anomaly): {} — failed {}s ago, skipping",
+                                                    &anomaly.match_key, bl_time.elapsed().as_secs());
+                                                true
+                                            } else {
+                                                blacklisted_matches.remove(&anomaly.match_key);
+                                                false
+                                            }
+                                        } else {
+                                            false
+                                        }
+                                    };
+
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
@@ -4269,6 +4777,8 @@ async fn main() -> Result<()> {
                                         && !azuro_odds_identical
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
+                                        && !anomaly_condition_blacklisted // CONDITION BLACKLIST: skip dead conditions
+                                        && !anomaly_match_blacklisted     // MATCH BLACKLIST: skip dead matches
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
                                         && anomaly_stake >= 0.50 // EXPOSURE CAP
@@ -4285,8 +4795,8 @@ async fn main() -> Result<()> {
 
                                     if should_auto_bet_anomaly {
                                         let stake = anomaly_stake;
-                                        let condition_id = anomaly.condition_id.as_ref().unwrap().clone();
-                                        let outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
+                                        let mut condition_id = anomaly.condition_id.as_ref().unwrap().clone();
+                                        let mut outcome_id = anomaly.outcome_id.as_ref().unwrap().clone();
 
                                         // Condition freshness: how stale is our last sighting? (GQL)
                                         let condition_age_ms_b = condition_last_seen.get(&condition_id)
@@ -4294,15 +4804,30 @@ async fn main() -> Result<()> {
                                             .unwrap_or(999999);
 
                                         // === PRE-FLIGHT GATE (Path B): WS-first with GQL fallback ===
-                                        let ws_result_b = {
+                                        let mut ws_result_b = {
                                             let cache_r = ws_condition_cache.read().await;
                                             ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
                                         };
+
+                                        // Same subscription race as Path A — probe once to avoid GQL fallback.
+                                        if ws_state_gate_enabled {
+                                            if matches!(ws_result_b, WsGateResult::NoData | WsGateResult::Stale { .. }) {
+                                                let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
+                                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                                ws_result_b = {
+                                                    let cache_r = ws_condition_cache.read().await;
+                                                    ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                                };
+                                            }
+                                        }
+
                                         let gate_blocked_b = match &ws_result_b {
                                             WsGateResult::NotActive { state, age_ms } => {
                                                 warn!("🚫 WS-GATE ODDS #{}: condition {} state={} (ws_age={}ms) — DROP",
                                                     aid, &condition_id, state, age_ms);
-                                                ledger_write("BET_FAILED", &serde_json::json!({
+                                                // CONDITION BLACKLIST: WS says not active → blacklist
+                                                blacklisted_conditions.insert(condition_id.clone(), std::time::Instant::now());
+                                                ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                     "alert_id": aid, "match_key": anomaly.match_key,
                                                     "condition_id": condition_id, "outcome_id": outcome_id,
                                                     "error": format!("WS gate: condition state={}", state),
@@ -4327,24 +4852,62 @@ async fn main() -> Result<()> {
                                                 ws_gate_active_count += 1;
                                                 false
                                             }
-                                            WsGateResult::Stale { .. } | WsGateResult::NoData | WsGateResult::Disabled => {
-                                                match &ws_result_b {
-                                                    WsGateResult::Stale { .. } => ws_gate_stale_fallback_count += 1,
-                                                    WsGateResult::NoData => ws_gate_nodata_fallback_count += 1,
-                                                    _ => {}
-                                                }
+                                            WsGateResult::Stale { age_ms } => {
+                                                ws_gate_stale_fallback_count += 1;
+                                                // WS data stale → fallback to GQL age check
                                                 if condition_age_ms_b > CONDITION_MAX_AGE_MS {
-                                                    let fb_reason_b = match &ws_result_b {
-                                                        WsGateResult::Stale { age_ms: a } => format!("WsStale({}ms)->GqlStale", a),
-                                                        WsGateResult::NoData => "WsNoData->GqlStale".to_string(),
-                                                        _ => "WsDisabled->GqlStale".to_string(),
-                                                    };
-                                                    warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} [{}] gql_age={}ms > {}ms — dropping",
-                                                        aid, &condition_id, fb_reason_b, condition_age_ms_b, CONDITION_MAX_AGE_MS);
-                                                    ledger_write("BET_FAILED", &serde_json::json!({
+                                                    warn!("🚫 PRE-FLIGHT ODDS #{}: WsStale({}ms)+GqlStale({}ms) — dropping",
+                                                        aid, age_ms, condition_age_ms_b);
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": anomaly.match_key,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
-                                                        "error": format!("pre-flight gate: {}", fb_reason_b),
+                                                        "error": format!("WS stale ({}ms) + GQL stale ({}ms)", age_ms, condition_age_ms_b),
+                                                        "reason_code": "WsStaleGqlStale",
+                                                        "is_condition_state_reject": true,
+                                                        "ws_age_ms": age_ms,
+                                                        "condition_age_ms": condition_age_ms_b,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "anomaly_odds",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    info!("⚡ WS-GATE ODDS #{}: WsStale({}ms) but GQL fresh({}ms) — proceeding",
+                                                        aid, age_ms, condition_age_ms_b);
+                                                    false
+                                                }
+                                            }
+                                            WsGateResult::NoData => {
+                                                ws_gate_nodata_fallback_count += 1;
+                                                // No WS data → fallback to GQL age check
+                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": anomaly.match_key,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": format!("WS no data + GQL stale ({}ms)", condition_age_ms_b),
+                                                        "reason_code": "WsNoDataGqlStale",
+                                                        "is_condition_state_reject": true,
+                                                        "condition_age_ms": condition_age_ms_b,
+                                                        "requested_odds": azuro_odds,
+                                                        "stake": stake, "path": "anomaly_odds",
+                                                        "retries": 0, "pipeline_ms": 0, "rtt_ms": 0,
+                                                    }));
+                                                    true
+                                                } else {
+                                                    info!("⚡ WS-GATE ODDS #{}: WsNoData but GQL fresh({}ms) — proceeding",
+                                                        aid, condition_age_ms_b);
+                                                    false
+                                                }
+                                            }
+                                            WsGateResult::Disabled => {
+                                                // WS gate disabled → fallback to GQL gate
+                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                    warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} [WsDisabled->GqlStale] gql_age={}ms > {}ms — dropping",
+                                                        aid, &condition_id, condition_age_ms_b, CONDITION_MAX_AGE_MS);
+                                                    ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
+                                                        "alert_id": aid, "match_key": anomaly.match_key,
+                                                        "condition_id": condition_id, "outcome_id": outcome_id,
+                                                        "error": "pre-flight gate: WsDisabled->GqlStale",
                                                         "reason_code": "PreFlightStale",
                                                         "is_condition_state_reject": true,
                                                         "condition_age_ms": condition_age_ms_b,
@@ -4354,11 +4917,11 @@ async fn main() -> Result<()> {
                                                     }));
                                                     log_event("PREFLIGHT_GATE", &serde_json::json!({
                                                         "alert_id": aid, "condition_id": condition_id,
-                                                        "condition_age_ms": condition_age_ms_b, "reason": &fb_reason_b,
+                                                        "condition_age_ms": condition_age_ms_b, "reason": "WsDisabled->GqlStale",
                                                     }));
                                                     true
                                                 } else {
-                                                    false // GQL says fresh enough → proceed
+                                                    false
                                                 }
                                             }
                                         };
@@ -4366,37 +4929,17 @@ async fn main() -> Result<()> {
                                             // Don't mark inflight — we never sent it
                                         } else {
 
-                                        let conf_emoji = if anomaly.confidence == "HIGH" { "🟢" } else { "🟡" };
-                                        let pre_msg = format!(
-                                            "🤖 <b>#{} AUTO-BET ODDS ANOMALY</b> {} {}\n\
-                                             \n\
-                                             <b>{}</b> vs <b>{}</b>\n\
-                                             🎯 Value side: <b>{}</b> @ <b>{:.2}</b>\n\
-                                             ⚡ Discrepancy: <b>{:.1}%</b>\n\
-                                             💰 Stake: <b>${:.2}</b>\n\
-                                             \n\
-                                             ⏳ Automaticky sázím...",
-                                            aid,
-                                            conf_emoji,
-                                            anomaly.confidence,
-                                            anomaly.team1,
-                                            anomaly.team2,
-                                            value_team,
-                                            azuro_odds,
-                                            anomaly.discrepancy_pct,
-                                            stake
-                                        );
-                                        if let Err(e) = tg_send_message(&client, &token, chat_id, &pre_msg).await {
-                                            error!("Failed to send anomaly auto-bet pre-alert: {}", e);
-                                        } else {
-                                            anomaly_alert_sent = true;
-                                        }
-
                                         let decision_instant = std::time::Instant::now();
                                         let decision_ts_b = Utc::now();
-                                        let min_odds = (azuro_odds * min_odds_factor_for_match(&match_key_for_bet) * 1e12) as u64;
-                                        let min_odds_display_b = azuro_odds * min_odds_factor_for_match(&match_key_for_bet);
                                         let amount_raw = (stake * 1e6) as u64;
+
+                                        let max_retries = AUTO_BET_RETRY_MAX;
+                                        let mut attempt = 0;
+                                        let mut minodds_fallback_applied = false;
+                                        loop {
+                                        let min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
+                                        let min_odds = (azuro_odds * min_odds_factor * 1e12) as u64;
+                                        let min_odds_display_b = azuro_odds * min_odds_factor;
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
                                             "outcomeId": outcome_id,
@@ -4406,10 +4949,6 @@ async fn main() -> Result<()> {
                                             "team2": anomaly.team2,
                                             "valueTeam": value_team,
                                         });
-
-                                        let max_retries = AUTO_BET_RETRY_MAX;
-                                        let mut attempt = 0;
-                                        loop {
                                         // Signal TTL check — abort if decision is stale
                                         if decision_instant.elapsed() > std::time::Duration::from_secs(SIGNAL_TTL_SECS) {
                                             warn!("⏰ AUTO-BET ODDS #{}: Signal TTL expired ({}ms elapsed) — aborting stale bet",
@@ -4417,8 +4956,16 @@ async fn main() -> Result<()> {
                                             inflight_conditions.remove(&cond_id_str);
                                             inflight_conditions.remove(&match_key_for_bet);
                                             let _ = tg_send_message(&client, &token, chat_id,
-                                                &format!("⏰ <b>AUTO-BET ODDS #{} TTL EXPIRED</b> ({}ms) — sázka zastaralá, zrušeno.",
-                                                    aid, decision_instant.elapsed().as_millis())
+                                                &format!(
+                                                    "⏰ <b>AUTO-BET #{} TTL EXPIRED</b>\n\
+                                                     🏷️ <b>{}</b> | path: <b>anomaly_odds</b>\n\
+                                                     🧩 match: <b>{}</b>\n\
+                                                     ⏱ elapsed: {}ms",
+                                                    aid,
+                                                    match_key_for_bet.split("::").next().unwrap_or("?").to_uppercase(),
+                                                    match_key_for_bet,
+                                                    decision_instant.elapsed().as_millis()
+                                                )
                                             ).await;
                                             break;
                                         }
@@ -4466,17 +5013,59 @@ async fn main() -> Result<()> {
                                                                 || err_lower.contains("revert")
                                                                 || err_lower.contains("nonce");
                                                             if is_condition_paused && !is_fatal && attempt < max_retries {
-                                                                attempt += 1;
-                                                                let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
-                                                                let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
-                                                                let delay_ms = base_delay + jitter;
-                                                                info!("🔄 AUTO-BET ODDS #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
-                                                                    aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
-                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                                                                continue;
+                                                                if let Some((new_condition_id, new_outcome_id)) = remap_execution_ids_from_state(
+                                                                    &state,
+                                                                    &match_key_for_bet,
+                                                                    &anomaly.team1,
+                                                                    &anomaly.team2,
+                                                                    anomaly.value_side,
+                                                                ) {
+                                                                    if new_condition_id != condition_id || new_outcome_id != outcome_id {
+                                                                        info!("🔁 AUTO-BET ODDS #{} remap retry: cond {}→{} out {}→{}",
+                                                                            aid, condition_id, new_condition_id, outcome_id, new_outcome_id);
+                                                                        inflight_conditions.remove(&cond_id_str);
+                                                                        condition_id = new_condition_id;
+                                                                        outcome_id = new_outcome_id;
+                                                                        cond_id_str = condition_id.clone();
+                                                                        inflight_conditions.insert(cond_id_str.clone());
+                                                                        attempt += 1;
+                                                                        tokio::time::sleep(std::time::Duration::from_millis(REMAP_RETRY_DELAY_MS)).await;
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                                let too_stale_for_retry = condition_age_ms_b > RETRY_CONDITION_MAX_AGE_MS;
+                                                                let too_late_for_retry = decision_instant.elapsed().as_millis() as u64 > (PIPELINE_BUDGET_MS / 2);
+                                                                if too_stale_for_retry || too_late_for_retry {
+                                                                    info!("⏭️ AUTO-BET ODDS #{} retry skipped (stale={} late={} age={}ms pipeline={}ms)",
+                                                                        aid,
+                                                                        too_stale_for_retry,
+                                                                        too_late_for_retry,
+                                                                        condition_age_ms_b,
+                                                                        decision_instant.elapsed().as_millis());
+                                                                } else {
+                                                                    attempt += 1;
+                                                                    let base_delay = AUTO_BET_RETRY_DELAYS_MS.get(attempt.saturating_sub(1)).copied().unwrap_or(500);
+                                                                    let jitter = ((aid as u64).wrapping_mul(7).wrapping_add(attempt as u64 * 13)) % (base_delay / 2 + 1);
+                                                                    let delay_ms = base_delay + jitter;
+                                                                    info!("🔄 AUTO-BET ODDS #{} retry {}/{}: condition paused, waiting {}ms (base={}+jitter={})... ({})",
+                                                                        aid, attempt, max_retries, delay_ms, base_delay, jitter, err);
+                                                                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                                                    continue;
+                                                                }
                                                             }
                                                             let is_minodds_b = err_lower.contains("min odds") || err_lower.contains("minodds")
                                                                 || err_lower.contains("real odds");
+                                                            if is_minodds_b && !minodds_fallback_applied && attempt < max_retries {
+                                                                attempt += 1;
+                                                                minodds_fallback_applied = true;
+                                                                let base_delay = 120;
+                                                                let jitter = ((aid as u64).wrapping_mul(11).wrapping_add(attempt as u64 * 17)) % 80;
+                                                                let delay_ms = base_delay + jitter;
+                                                                info!("🔁 AUTO-BET ODDS #{} min-odds fallback retry {}/{}: factor step -{:.2}, wait {}ms ({})",
+                                                                    aid, attempt, max_retries, MIN_ODDS_FALLBACK_STEP, delay_ms, err);
+                                                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                                                                continue;
+                                                            }
                                                             let is_dedup_b = err_lower.contains("dedup") || err_lower.contains("already bet");
                                                             let is_condition_state_reject_b = is_condition_paused;
                                                             let reason_code_b = if is_condition_state_reject_b { "ConditionNotRunning" }
@@ -4484,6 +5073,18 @@ async fn main() -> Result<()> {
                                                                 else if is_dedup_b { "Dedup" }
                                                                 else if is_fatal { "Fatal" }
                                                                 else { "Unknown" };
+                                                            // CONDITION BLACKLIST: add failed condition to blacklist
+                                                            if is_condition_state_reject_b || is_minodds_b {
+                                                                blacklisted_conditions.insert(condition_id.clone(), std::time::Instant::now());
+                                                                info!("🚫 BLACKLISTED condition {} (reason={}, TTL={}s)",
+                                                                    &condition_id, reason_code_b, CONDITION_BLACKLIST_TTL_SECS);
+                                                            }
+                                                            // MATCH BLACKLIST: ConditionNotRunning → block entire match
+                                                            if is_condition_state_reject_b {
+                                                                blacklisted_matches.insert(anomaly.match_key.clone(), std::time::Instant::now());
+                                                                info!("🚫 MATCH BLACKLISTED {} (ConditionNotRunning, TTL={}s)",
+                                                                    &anomaly.match_key, MATCH_BLACKLIST_TTL_SECS);
+                                                            }
                                                             error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={}, rtt={}ms, pipeline={}ms, odds={:.4}, min={:.4}, reason={})",
                                                                 aid, err,
                                                                 &condition_id,
@@ -4511,8 +5112,19 @@ async fn main() -> Result<()> {
                                                             }));
                                                             if !is_dedup_b {
                                                                 let _ = tg_send_message(&client, &token, chat_id,
-                                                                    &format!("❌ <b>AUTO-BET ODDS #{} FAILED</b>\n\nError: {}\nCondition: {}\n⏱ RTT: {}ms | Pipeline: {}ms",
-                                                                        aid, err, &condition_id, rtt_ms_b, pipeline_ms_b)
+                                                                    &format_auto_bet_failed_message(
+                                                                        aid,
+                                                                        "anomaly_odds",
+                                                                        &match_key_for_bet,
+                                                                        &condition_id,
+                                                                        reason_code_b,
+                                                                        err,
+                                                                        attempt,
+                                                                        rtt_ms_b,
+                                                                        pipeline_ms_b,
+                                                                        azuro_odds,
+                                                                        min_odds_display_b,
+                                                                    )
                                                                 ).await;
                                                             } else {
                                                                 info!("🔇 Suppressed TG for dedup rejection odds #{}: {}", aid, err);
@@ -4526,9 +5138,13 @@ async fn main() -> Result<()> {
                                                                 &condition_id,
                                                                 match_key_for_bet);
                                                             let _ = tg_send_message(&client, &token, chat_id,
-                                                                &format!("❌ <b>AUTO-BET ODDS #{} REJECTED</b>\n\nState: {}\nCondition: {}",
-                                                                    aid, br.state.as_deref().unwrap_or("?"),
-                                                                    &condition_id)
+                                                                &format_auto_bet_rejected_message(
+                                                                    aid,
+                                                                    "anomaly_odds",
+                                                                    &match_key_for_bet,
+                                                                    &condition_id,
+                                                                    br.state.as_deref().unwrap_or("?"),
+                                                                )
                                                             ).await;
                                                             inflight_conditions.remove(&cond_id_str);
                                                             inflight_conditions.remove(&match_key_for_bet);
@@ -4620,23 +5236,23 @@ async fn main() -> Result<()> {
                                                                 }));
                                                             }
 
-                                                            let lim_a = "∞".to_string();
-                                                            let result_msg = if is_dry_run {
-                                                                format!("🧪 <b>AUTO-BET ODDS #{} DRY-RUN</b>\n{} @ {:.2} ${:.2}",
-                                                                    aid, value_team, azuro_odds, stake)
+                                                            let result_msg = format_auto_bet_result_message(
+                                                                aid,
+                                                                "anomaly_odds",
+                                                                &match_key_for_bet,
+                                                                &value_team,
+                                                                azuro_odds,
+                                                                stake,
+                                                                bet_id,
+                                                                bet_state,
+                                                                auto_bet_count,
+                                                                is_dry_run,
+                                                            );
+                                                            if let Err(e) = tg_send_message(&client, &token, chat_id, &result_msg).await {
+                                                                error!("Failed to send auto-bet anomaly result alert: {}", e);
                                                             } else {
-                                                                format!(
-                                                                    "✅ <b>AUTO-BET ODDS #{} PLACED!</b>\n\
-                                                                     {} @ {:.2} | ${:.2}\n\
-                                                                     Bet ID: <code>{}</code>\n\
-                                                                     State: {}\n\
-                                                                     Auto-bets dnes: {}/{}",
-                                                                    aid, value_team, azuro_odds, stake,
-                                                                    bet_id, bet_state,
-                                                                    auto_bet_count, lim_a
-                                                                )
-                                                            };
-                                                            let _ = tg_send_message(&client, &token, chat_id, &result_msg).await;
+                                                                anomaly_alert_sent = true;
+                                                            }
 
                                                             // === UNIFIED FOLLOW-UP: Poll Created bets to detect async Rejected ===
                                                             if !is_dry_run && (bet_state == "Created" || bet_state == "Pending") {
@@ -4647,6 +5263,11 @@ async fn main() -> Result<()> {
                                                                 let follow_aid = aid;
                                                                 let follow_team = value_team.clone();
                                                                 let follow_chat = chat_id;
+                                                                let follow_match_key = anomaly.match_key.clone();
+                                                                let follow_condition_id = condition_id.clone();
+                                                                let follow_outcome_id = outcome_id.clone();
+                                                                let follow_odds = azuro_odds;
+                                                                let follow_stake = stake;
                                                                 tokio::spawn(async move {
                                                                     tokio::time::sleep(Duration::from_secs(20)).await;
                                                                     if let Ok(resp) = follow_client.get(
@@ -4659,16 +5280,39 @@ async fn main() -> Result<()> {
                                                                                 .and_then(|v| v.as_str()).unwrap_or("");
                                                                             if final_state == "Rejected" || final_state == "Failed" || final_state == "Cancelled" {
                                                                                 let alert = format!(
-                                                                                    "❌ <b>AUTO-BET ODDS #{} REJECTED (follow-up)</b>\n\n\
-                                                                                     {} — transakce reverted on-chain.\n\
-                                                                                     Error: {}\n\
-                                                                                     💰 Peníze nebyly strženy.",
-                                                                                    follow_aid, follow_team, err_msg);
+                                                                                    "❌ <b>AUTO-BET #{} REJECTED (follow-up)</b>\n\
+                                                                                     path: <b>anomaly_odds</b>\n\
+                                                                                     💡 Pick: <b>{}</b>\n\
+                                                                                     🧠 on-chain state: <b>{}</b>\n\
+                                                                                     📝 {}",
+                                                                                    follow_aid, follow_team, final_state, err_msg);
                                                                                 let _ = tg_send_message(
                                                                                     &follow_client, &follow_token,
                                                                                     follow_chat, &alert).await;
                                                                                 warn!("❌ AUTO-BET ODDS #{} FOLLOW-UP REJECTED: {} err={}",
                                                                                     follow_aid, follow_bet_id, err_msg);
+                                                                                // LEDGER: write on-chain REJECTED event
+                                                                                {
+                                                                                    let entry = serde_json::json!({
+                                                                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                        "event": "ON_CHAIN_REJECTED",
+                                                                                        "alert_id": follow_aid,
+                                                                                        "match_key": follow_match_key,
+                                                                                        "condition_id": follow_condition_id,
+                                                                                        "outcome_id": follow_outcome_id,
+                                                                                        "bet_id": follow_bet_id,
+                                                                                        "on_chain_state": final_state,
+                                                                                        "error": err_msg,
+                                                                                        "path": "anomaly_odds",
+                                                                                        "odds": follow_odds,
+                                                                                        "stake": follow_stake,
+                                                                                    });
+                                                                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                                        .create(true).append(true).open("data/ledger.jsonl") {
+                                                                                        use std::io::Write;
+                                                                                        let _ = writeln!(f, "{}", entry);
+                                                                                    }
+                                                                                }
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
@@ -4687,7 +5331,15 @@ async fn main() -> Result<()> {
                                                     }
                                                     Err(e) => {
                                                         let _ = tg_send_message(&client, &token, chat_id,
-                                                            &format!("❌ Auto-bet odds #{} response error: {}", aid, e)
+                                                            &format!(
+                                                                "❌ <b>AUTO-BET #{} RESPONSE ERROR</b>\n\
+                                                                 path: <b>anomaly_odds</b>\n\
+                                                                 match: <b>{}</b>\n\
+                                                                 {}",
+                                                                aid,
+                                                                match_key_for_bet,
+                                                                e,
+                                                            )
                                                         ).await;
                                                         break;
                                                     }
@@ -4695,22 +5347,50 @@ async fn main() -> Result<()> {
                                             }
                                             Err(e) => {
                                                 let _ = tg_send_message(&client, &token, chat_id,
-                                                    &format!("❌ Executor offline pro auto-bet odds #{}: {}", aid, e)
+                                                    &format!(
+                                                        "❌ <b>AUTO-BET #{} EXECUTOR OFFLINE</b>\n\
+                                                         path: <b>anomaly_odds</b>\n\
+                                                         match: <b>{}</b>\n\
+                                                         {}",
+                                                        aid,
+                                                        match_key_for_bet,
+                                                        e,
+                                                    )
                                                 ).await;
                                                 break;
                                             }
                                         }
                                         } // end loop
                                         } // end pre-flight gate else block (Path B)
+                                    } else if anomaly_condition_blacklisted {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (blacklisted condition anomaly): {}",
+                                            anomaly.match_key);
+                                    } else if anomaly_match_blacklisted {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (blacklisted match anomaly): {}",
+                                            anomaly.match_key);
+                                    } else if already_bet_this {
+                                        info!("🔕 MANUAL ALERT SUPPRESSED (anomaly dedup): {} (base={})",
+                                            anomaly.match_key, base_match_key);
                                     } else if !mute_manual_alerts {
-                                        let msg = format_anomaly_alert(&anomaly, aid);
-                                        match tg_send_message(&client, &token, chat_id, &msg).await {
-                                            Ok(msg_id) => {
-                                                anomaly_alert_sent = true;
-                                                msg_id_to_alert_id.insert(msg_id, aid);
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to send alert: {}", e);
+                                        let now_alert = Utc::now();
+                                        let too_soon = manual_offer_last_sent
+                                            .get(&anomaly.match_key)
+                                            .map(|ts| (now_alert - *ts).num_seconds() < MANUAL_MATCH_COOLDOWN_SECS)
+                                            .unwrap_or(false);
+                                        if too_soon {
+                                            info!("⏱️ MANUAL ALERT THROTTLED (anomaly): {} (cooldown={}s)",
+                                                anomaly.match_key, MANUAL_MATCH_COOLDOWN_SECS);
+                                        } else {
+                                            let msg = format_anomaly_alert(&anomaly, aid);
+                                            match tg_send_message(&client, &token, chat_id, &msg).await {
+                                                Ok(msg_id) => {
+                                                    anomaly_alert_sent = true;
+                                                    msg_id_to_alert_id.insert(msg_id, aid);
+                                                    manual_offer_last_sent.insert(anomaly.match_key.clone(), now_alert);
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to send alert: {}", e);
+                                                }
                                             }
                                         }
                                     } else {
@@ -6300,6 +6980,26 @@ async fn main() -> Result<()> {
                                                 continue;
                                             }
                                         };
+
+                                        // Manual dedup guard (same as auto-bet protection):
+                                        // don't allow re-betting same condition/base match from stale alert messages.
+                                        let manual_base_match_key = strip_map_winner_suffix(&anomaly.match_key);
+                                        let manual_dedup_base = already_bet_base_matches.contains(&manual_base_match_key)
+                                            && anomaly.match_key != manual_base_match_key;
+                                        let manual_dedup = already_bet_conditions.contains(&condition_id)
+                                            || already_bet_matches.contains(&anomaly.match_key)
+                                            || manual_dedup_base
+                                            || inflight_conditions.contains(&condition_id)
+                                            || inflight_conditions.contains(&anomaly.match_key);
+                                        if manual_dedup {
+                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                &format!(
+                                                    "🚫 <b>MANUAL BET BLOCKED (DEDUP)</b>\n\nAlert #{}\n{}\ncondition {} je už vsazená / in-flight.",
+                                                    aid, anomaly.match_key, condition_id
+                                                )
+                                            ).await;
+                                            continue;
+                                        }
 
                                         let azuro_odds = if selected_side == 1 { anomaly.azuro_w1 } else { anomaly.azuro_w2 };
                                         let value_team = if selected_side == 1 { &anomaly.team1 } else { &anomaly.team2 };
