@@ -72,8 +72,9 @@ const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
 const AUTO_BET_RETRY_MAX: usize = 2;
 /// Jitter base delays per retry attempt — actual = base + rand(0..base/2)
 const AUTO_BET_RETRY_DELAYS_MS: [u64; 2] = [80, 200];
-/// Min-odds fallback step for one rescue retry (e.g. 0.92 -> 0.86)
-const MIN_ODDS_FALLBACK_STEP: f64 = 0.06;
+/// Min-odds fallback step for one rescue retry (e.g. 0.84 -> 0.76)
+/// Increased 0.06→0.08 to give rescue-retry more room (52x MinOddsReject in 24h audit)
+const MIN_ODDS_FALLBACK_STEP: f64 = 0.08;
 /// Retry condition-paused only for reasonably fresh conditions
 const RETRY_CONDITION_MAX_AGE_MS: u64 = 1200;
 /// Small pause before retrying after execution ID remap
@@ -96,10 +97,14 @@ const PIPELINE_BUDGET_MS: u64 = 1200;
 const SUSPENDED_MARKET_MIN_ODDS: f64 = 1.05;
 const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
-/// Relaxed further (0.92 -> 0.88) to reduce minOdds rejects + on-chain reverts due to slippage.
-const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.88;
-/// Tennis tends to move faster around points; use even looser minOdds to avoid constant rejects.
-const MIN_ODDS_FACTOR_TENNIS: f64 = 0.86;
+/// Relaxed 0.88→0.84 after 24h audit (52x MinOddsReject, 40 tennis, 7 esports, 4 basket, 1 football).
+/// Live markets can move 12-18% between 3s poll cycles — 0.84 allows 16% slippage on first try.
+const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.84;
+/// Tennis moves fastest around points; 0.82 allows 18% slippage on first try.
+/// With fallback step 0.08, rescue retry hits 0.74 — generous but still capped by AUTO_BET_MIN_ODDS=1.15.
+const MIN_ODDS_FACTOR_TENNIS: f64 = 0.82;
+/// Basketball live also has fast score swings; use intermediate factor.
+const MIN_ODDS_FACTOR_BASKETBALL: f64 = 0.83;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
 /// Was 3 — practically unreachable (HLTV typically has 1-2 bookmakers per match)
 const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
@@ -443,10 +448,10 @@ fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
 
 fn min_odds_factor_for_match(match_key: &str) -> f64 {
     let sport = match_key.split("::").next().unwrap_or("");
-    if sport == "tennis" {
-        MIN_ODDS_FACTOR_TENNIS
-    } else {
-        MIN_ODDS_FACTOR_DEFAULT
+    match sport {
+        "tennis" => MIN_ODDS_FACTOR_TENNIS,
+        "basketball" => MIN_ODDS_FACTOR_BASKETBALL,
+        _ => MIN_ODDS_FACTOR_DEFAULT,
     }
 }
 
@@ -3331,7 +3336,7 @@ async fn main() -> Result<()> {
     // After ConditionNotRunning or on-chain Rejected, the match's conditions are usually all dead.
     // New condition_ids get generated per score update → condition-level blacklist alone is insufficient.
     let mut blacklisted_matches: HashMap<String, std::time::Instant> = HashMap::new();
-    const MATCH_BLACKLIST_TTL_SECS: u64 = 300; // 5 min — match-level cooldown
+    const MATCH_BLACKLIST_TTL_SECS: u64 = 600; // 10 min — match-level cooldown (raised from 300s: 3x CondNR on same match within 16min)
 
     // === DEDUP: track already-bet match keys + condition IDs (persisted across restarts) ===
     let bet_history_path = "data/bet_history.txt";
