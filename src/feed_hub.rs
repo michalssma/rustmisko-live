@@ -836,10 +836,10 @@ fn gate_odds(odds: &OddsPayload, seen_at: DateTime<Utc>) -> (bool, String) {
     let stale_ok = age.num_seconds().abs() <= 10;
 
     if !liquidity_ok {
-        return (false, "liquidity<2000".to_string());
+        return (false, "liquidity<500".to_string());
     }
     if !spread_ok {
-        return (false, "spread>1.5%".to_string());
+        return (false, "spread>5%".to_string());
     }
     if !stale_ok {
         return (false, "stale>10s".to_string());

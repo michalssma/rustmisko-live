@@ -90,6 +90,9 @@ function topEntries(map, n) {
 }
 
 async function main() {
+  const mode = String(getArg('mode', 'stop-on-target'));
+  const stopOnTarget = mode !== 'timer';
+
   const targetDelta = Number(getArg('target', '3'));
   const pollMs = Number(getArg('pollMs', '300'));
   const maxMinutes = Number(getArg('maxMinutes', '120'));
@@ -109,6 +112,7 @@ async function main() {
   const stopOutPath = path.join(runRoot, 'stop_output.txt');
 
   fs.writeFileSync(timelinePath, `RUN_START=${new Date().toISOString()}\nledger=${ledgerPath}\nstopCmd=${stopCmd}\ntargetAutoPlacedDelta=${targetDelta}\n\n`, 'utf8');
+  fs.appendFileSync(timelinePath, `mode=${mode} stopOnTarget=${stopOnTarget}\n`, 'utf8');
 
   const baseline = countAutoPlacedBaseline(ledgerPath);
   fs.appendFileSync(timelinePath, `baseline_auto_placed=${baseline}\n`, 'utf8');
@@ -126,10 +130,157 @@ async function main() {
   const failed = [];
   const skipped = [];
   const rejected = [];
+  const onChainAccepted = [];
+  const onChainRejected = [];
 
   const reasonCounts = new Map();
   const errorCounts = new Map();
   const reasonErrorCounts = new Map();
+
+  function writeAudit(stopTs) {
+    const audit = {
+      runRoot,
+      mode,
+      start_ts: new Date(startTs).toISOString(),
+      stop_ts: stopTs,
+      ledgerPath,
+      baseline_auto_placed: baseline,
+      new_auto_placed: newAutoPlaced,
+      captured: {
+        placed: placed.length,
+        bet_failed: failed.length,
+        auto_bet_skipped: skipped.length,
+        rejected: rejected.length,
+        on_chain_accepted: onChainAccepted.length,
+        on_chain_rejected: onChainRejected.length,
+      },
+      top_reason_codes: topEntries(reasonCounts, 20),
+      top_reason_error: topEntries(reasonErrorCounts, 30),
+      sample_placed_auto: placed.filter(isAutoPlaced).slice(0, 10),
+      sample_on_chain_accepted: onChainAccepted.slice(0, 10),
+      sample_on_chain_rejected: onChainRejected.slice(0, 10),
+      sample_failures: failed.slice(0, 10),
+      sample_skipped: skipped.slice(0, 10),
+    };
+
+    writeJson(auditJsonPath, audit);
+
+    const placedAuto = placed.filter(isAutoPlaced);
+    const placedAutoSummary = placedAuto.map((r) => ({
+      alert_id: r.alert_id,
+      bet_id: r.bet_id,
+      match_key: r.match_key,
+      sport: sportFromMatchKey(r.match_key),
+      path: r.path,
+      odds: r.odds,
+      amount_usd: r.amount_usd,
+      min_odds: r.min_odds,
+      condition_id: r.condition_id,
+      outcome_id: r.outcome_id,
+      condition_age_ms: r.condition_age_ms,
+      pipeline_ms: r.pipeline_ms,
+      rtt_ms: r.rtt_ms,
+      decision_ts: r.decision_ts,
+    }));
+
+    const failureSummary = failed.map((r) => ({
+      alert_id: r.alert_id,
+      match_key: r.match_key,
+      sport: sportFromMatchKey(r.match_key),
+      path: r.path,
+      reason_code: r.reason_code,
+      error: r.error,
+      requested_odds: r.requested_odds,
+      min_odds: r.min_odds,
+      stake: r.stake,
+      condition_age_ms: r.condition_age_ms,
+      pipeline_ms: r.pipeline_ms,
+      rtt_ms: r.rtt_ms,
+      retries: r.retries,
+      condition_id: r.condition_id,
+      outcome_id: r.outcome_id,
+    }));
+
+    const skippedSummary = skipped.map((r) => ({
+      alert_id: r.alert_id,
+      match_key: r.match_key,
+      sport: sportFromMatchKey(r.match_key),
+      path: r.path,
+      reason_code: r.reason_code,
+      error: r.error,
+      requested_odds: r.requested_odds,
+      stake: r.stake,
+      ws_state: r.ws_state,
+      ws_age_ms: r.ws_age_ms,
+      condition_age_ms: r.condition_age_ms,
+      condition_id: r.condition_id,
+      outcome_id: r.outcome_id,
+    }));
+
+    writeJson(path.join(runRoot, 'placed_auto.json'), placedAutoSummary);
+    writeJson(path.join(runRoot, 'bet_failed.json'), failureSummary);
+    writeJson(path.join(runRoot, 'auto_bet_skipped.json'), skippedSummary);
+
+    const md = [];
+    md.push(`# AUTO-BUY AUDIT`);
+    md.push('');
+    md.push(`- start: ${new Date(startTs).toISOString()}`);
+    md.push(`- stop: ${stopTs || ''}`);
+    md.push(`- mode: ${mode}`);
+    md.push(`- baseline_auto_placed: ${baseline}`);
+    md.push(`- new_auto_placed: ${newAutoPlaced}`);
+    md.push(`- captured: PLACED=${placed.length}, BET_FAILED=${failed.length}, AUTO_BET_SKIPPED=${skipped.length}, REJECTED=${rejected.length}, ON_CHAIN_ACCEPTED=${onChainAccepted.length}, ON_CHAIN_REJECTED=${onChainRejected.length}`);
+    md.push('');
+    md.push(`## On-chain (Accepted/Rejected)`);
+    if (onChainAccepted.length === 0 && onChainRejected.length === 0) {
+      md.push('- (žádné)');
+    } else {
+      md.push(`- accepted: ${onChainAccepted.length}`);
+      md.push(`- rejected: ${onChainRejected.length}`);
+    }
+    md.push('');
+    md.push(`## Prošly (AUTO PLACED)`);
+    if (placedAutoSummary.length === 0) {
+      md.push('- (žádné)');
+    } else {
+      for (const pRow of placedAutoSummary.slice(0, 20)) {
+        md.push(`- aid=${pRow.alert_id} sport=${pRow.sport} mk=${pRow.match_key} odds=${pRow.odds} stake=${pRow.amount_usd} min_odds=${pRow.min_odds} age_ms=${pRow.condition_age_ms} rtt=${pRow.rtt_ms}ms pipe=${pRow.pipeline_ms}ms bet_id=${pRow.bet_id}`);
+      }
+    }
+    md.push('');
+    md.push(`## Neprošly (BET_FAILED)`);
+    if (failureSummary.length === 0) {
+      md.push('- (žádné)');
+    } else {
+      for (const fRow of failureSummary.slice(0, 30)) {
+        md.push(`- aid=${fRow.alert_id} sport=${fRow.sport} mk=${fRow.match_key} reason=${fRow.reason_code} odds=${fRow.requested_odds} min_odds=${fRow.min_odds} stake=${fRow.stake} retries=${fRow.retries} age_ms=${fRow.condition_age_ms} err=${String(fRow.error).slice(0, 160)}`);
+      }
+    }
+    md.push('');
+    md.push(`## Skipped (AUTO_BET_SKIPPED)`);
+    if (skippedSummary.length === 0) {
+      md.push('- (žádné)');
+    } else {
+      for (const sRow of skippedSummary.slice(0, 30)) {
+        md.push(`- aid=${sRow.alert_id} sport=${sRow.sport} mk=${sRow.match_key} reason=${sRow.reason_code} ws_age_ms=${sRow.ws_age_ms ?? ''} gql_age_ms=${sRow.condition_age_ms ?? ''} err=${String(sRow.error).slice(0, 160)}`);
+      }
+    }
+    md.push('');
+    md.push('## Top důvody (reason_code)');
+    for (const [k, v] of topEntries(reasonCounts, 20)) {
+      md.push(`- ${k}: ${v}`);
+    }
+    md.push('');
+    md.push('## Top kombinace (reason_code | error)');
+    for (const [k, v] of topEntries(reasonErrorCounts, 20)) {
+      md.push(`- ${k}: ${v}`);
+    }
+    md.push('');
+
+    fs.writeFileSync(auditMdPath, md.join('\n') + '\n', 'utf8');
+    fs.appendFileSync(timelinePath, `AUDIT_WRITTEN ts=${new Date().toISOString()}\n`, 'utf8');
+    console.log(`[watch] audit written: ${auditMdPath}`);
+  }
 
   let newAutoPlaced = 0;
   let stopTriggered = false;
@@ -140,13 +291,14 @@ async function main() {
   const deadlineTs = startTs + maxMinutes * 60_000;
 
   console.log(`[watch] runRoot=${runRoot}`);
+  console.log(`[watch] mode=${mode} stopOnTarget=${stopOnTarget}`);
   console.log(`[watch] baseline_auto_placed=${baseline} tail_offset=${offset}`);
 
   while (Date.now() < deadlineTs) {
     // heartbeat every 30s
     if (Date.now() - lastHeartbeat > 30_000) {
       lastHeartbeat = Date.now();
-      console.log(`[watch] ts=${new Date().toISOString()} new_auto_placed=${newAutoPlaced}/${targetDelta} captured placed=${placed.length} failed=${failed.length} skipped=${skipped.length} rejected=${rejected.length}`);
+      console.log(`[watch] ts=${new Date().toISOString()} new_auto_placed=${newAutoPlaced}/${targetDelta} captured placed=${placed.length} failed=${failed.length} skipped=${skipped.length} rejected=${rejected.length} on_chain_accepted=${onChainAccepted.length} on_chain_rejected=${onChainRejected.length}`);
     }
 
     let size;
@@ -206,9 +358,18 @@ async function main() {
           incMap(errorCounts, err);
           incMap(reasonErrorCounts, `${reason} | ${err}`);
           console.log(`[REJECTED] ${summarizeRow(row)}`);
+        } else if (eventType === 'ON_CHAIN_ACCEPTED') {
+          onChainAccepted.push(row);
+          console.log(`[ON_CHAIN_ACCEPTED] ${summarizeRow(row)}`);
+        } else if (eventType === 'ON_CHAIN_REJECTED') {
+          onChainRejected.push(row);
+          const err = row?.error || row?.errorMessage || '';
+          incMap(errorCounts, err);
+          incMap(reasonErrorCounts, `ON_CHAIN_REJECTED | ${err}`);
+          console.log(`[ON_CHAIN_REJECTED] ${summarizeRow(row)}`);
         }
 
-        if (!stopTriggered && newAutoPlaced >= targetDelta) {
+        if (stopOnTarget && !stopTriggered && newAutoPlaced >= targetDelta) {
           stopTriggered = true;
           stopTriggeredAt = new Date().toISOString();
           fs.appendFileSync(timelinePath, `TARGET_REACHED ts=${stopTriggeredAt} new_auto_placed=${newAutoPlaced}\n`, 'utf8');
@@ -246,141 +407,15 @@ async function main() {
                 else if (et === 'BET_FAILED') failed.push(r);
                 else if (et === 'AUTO_BET_SKIPPED') skipped.push(r);
                 else if (et === 'REJECTED') rejected.push(r);
+                else if (et === 'ON_CHAIN_ACCEPTED') onChainAccepted.push(r);
+                else if (et === 'ON_CHAIN_REJECTED') onChainRejected.push(r);
               }
             }
           } catch {
             // ignore
           }
 
-          const audit = {
-            runRoot,
-            start_ts: new Date(startTs).toISOString(),
-            stop_ts: stopTriggeredAt,
-            ledgerPath,
-            baseline_auto_placed: baseline,
-            new_auto_placed: newAutoPlaced,
-            captured: {
-              placed: placed.length,
-              bet_failed: failed.length,
-              auto_bet_skipped: skipped.length,
-              rejected: rejected.length,
-            },
-            top_reason_codes: topEntries(reasonCounts, 20),
-            top_reason_error: topEntries(reasonErrorCounts, 30),
-            sample_placed_auto: placed.filter(isAutoPlaced).slice(0, 10),
-            sample_failures: failed.slice(0, 10),
-            sample_skipped: skipped.slice(0, 10),
-          };
-
-          writeJson(auditJsonPath, audit);
-
-          const placedAuto = placed.filter(isAutoPlaced);
-          const placedAutoSummary = placedAuto.map((r) => ({
-            alert_id: r.alert_id,
-            bet_id: r.bet_id,
-            match_key: r.match_key,
-            sport: sportFromMatchKey(r.match_key),
-            path: r.path,
-            odds: r.odds,
-            amount_usd: r.amount_usd,
-            min_odds: r.min_odds,
-            condition_id: r.condition_id,
-            outcome_id: r.outcome_id,
-            condition_age_ms: r.condition_age_ms,
-            pipeline_ms: r.pipeline_ms,
-            rtt_ms: r.rtt_ms,
-            decision_ts: r.decision_ts,
-          }));
-
-          const failureSummary = failed.map((r) => ({
-            alert_id: r.alert_id,
-            match_key: r.match_key,
-            sport: sportFromMatchKey(r.match_key),
-            path: r.path,
-            reason_code: r.reason_code,
-            error: r.error,
-            requested_odds: r.requested_odds,
-            min_odds: r.min_odds,
-            stake: r.stake,
-            condition_age_ms: r.condition_age_ms,
-            pipeline_ms: r.pipeline_ms,
-            rtt_ms: r.rtt_ms,
-            retries: r.retries,
-            condition_id: r.condition_id,
-            outcome_id: r.outcome_id,
-          }));
-
-          const skippedSummary = skipped.map((r) => ({
-            alert_id: r.alert_id,
-            match_key: r.match_key,
-            sport: sportFromMatchKey(r.match_key),
-            path: r.path,
-            reason_code: r.reason_code,
-            error: r.error,
-            requested_odds: r.requested_odds,
-            stake: r.stake,
-            ws_state: r.ws_state,
-            ws_age_ms: r.ws_age_ms,
-            condition_age_ms: r.condition_age_ms,
-            condition_id: r.condition_id,
-            outcome_id: r.outcome_id,
-          }));
-
-          writeJson(path.join(runRoot, 'placed_auto.json'), placedAutoSummary);
-          writeJson(path.join(runRoot, 'bet_failed.json'), failureSummary);
-          writeJson(path.join(runRoot, 'auto_bet_skipped.json'), skippedSummary);
-
-          const md = [];
-          md.push(`# AUTO-BUY AUDIT`);
-          md.push('');
-          md.push(`- start: ${new Date(startTs).toISOString()}`);
-          md.push(`- stop: ${stopTriggeredAt}`);
-          md.push(`- baseline_auto_placed: ${baseline}`);
-          md.push(`- new_auto_placed: ${newAutoPlaced}`);
-          md.push(`- captured: PLACED=${placed.length}, BET_FAILED=${failed.length}, AUTO_BET_SKIPPED=${skipped.length}, REJECTED=${rejected.length}`);
-          md.push('');
-          md.push(`## Prošly (AUTO PLACED)`);
-          if (placedAutoSummary.length === 0) {
-            md.push('- (žádné)');
-          } else {
-            for (const pRow of placedAutoSummary.slice(0, 20)) {
-              md.push(`- aid=${pRow.alert_id} sport=${pRow.sport} mk=${pRow.match_key} odds=${pRow.odds} stake=${pRow.amount_usd} min_odds=${pRow.min_odds} age_ms=${pRow.condition_age_ms} rtt=${pRow.rtt_ms}ms pipe=${pRow.pipeline_ms}ms bet_id=${pRow.bet_id}`);
-            }
-          }
-          md.push('');
-          md.push(`## Neprošly (BET_FAILED)`);
-          if (failureSummary.length === 0) {
-            md.push('- (žádné)');
-          } else {
-            for (const fRow of failureSummary.slice(0, 30)) {
-              md.push(`- aid=${fRow.alert_id} sport=${fRow.sport} mk=${fRow.match_key} reason=${fRow.reason_code} odds=${fRow.requested_odds} min_odds=${fRow.min_odds} stake=${fRow.stake} retries=${fRow.retries} age_ms=${fRow.condition_age_ms} err=${String(fRow.error).slice(0, 160)}`);
-            }
-          }
-          md.push('');
-          md.push(`## Skipped (AUTO_BET_SKIPPED)`);
-          if (skippedSummary.length === 0) {
-            md.push('- (žádné)');
-          } else {
-            for (const sRow of skippedSummary.slice(0, 30)) {
-              md.push(`- aid=${sRow.alert_id} sport=${sRow.sport} mk=${sRow.match_key} reason=${sRow.reason_code} ws_age_ms=${sRow.ws_age_ms ?? ''} gql_age_ms=${sRow.condition_age_ms ?? ''} err=${String(sRow.error).slice(0, 160)}`);
-            }
-          }
-          md.push('');
-          md.push('## Top důvody (reason_code)');
-          for (const [k, v] of topEntries(reasonCounts, 20)) {
-            md.push(`- ${k}: ${v}`);
-          }
-          md.push('');
-          md.push('## Top kombinace (reason_code | error)');
-          for (const [k, v] of topEntries(reasonErrorCounts, 20)) {
-            md.push(`- ${k}: ${v}`);
-          }
-          md.push('');
-
-          fs.writeFileSync(auditMdPath, md.join('\n') + '\n', 'utf8');
-          fs.appendFileSync(timelinePath, `AUDIT_WRITTEN ts=${new Date().toISOString()}\n`, 'utf8');
-
-          console.log(`[watch] audit written: ${auditMdPath}`);
+          writeAudit(stopTriggeredAt);
           return;
         }
       }
@@ -389,8 +424,10 @@ async function main() {
     await sleep(pollMs);
   }
 
-  fs.appendFileSync(timelinePath, `TIMEOUT ts=${new Date().toISOString()} new_auto_placed=${newAutoPlaced}\n`, 'utf8');
+  const timeoutAt = new Date().toISOString();
+  fs.appendFileSync(timelinePath, `TIMEOUT ts=${timeoutAt} new_auto_placed=${newAutoPlaced}\n`, 'utf8');
   console.log(`[watch] TIMEOUT after ${maxMinutes} minutes (new_auto_placed=${newAutoPlaced}/${targetDelta})`);
+  writeAudit(null);
 }
 
 main().catch((e) => {

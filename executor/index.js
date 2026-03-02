@@ -45,7 +45,6 @@ const RPC_URL = process.env.RPC_URL || "https://polygon-bor-rpc.publicnode.com";
 // NOTE: Ankr + polygon-rpc.com removed — require API keys since ~Feb 2026
 const RPC_URLS = [
   RPC_URL,
-  "https://1rpc.io/matic",
   "https://polygon.drpc.org",
 ];
 
@@ -75,6 +74,7 @@ const CONTRACTS = {
     core: "0xF9548Be470A4e130c90ceA8b179FCD66D2972AC7",
     relayer: "0x8dA05c0021e6b35865FDC959c54dCeF3A4AbBa9d",
     azuroBet: "0x7A1c3FEf712753374C4DCe34254B96faF2B7265B",
+    paymaster: "0xeD5760fC2d2f6d363d73e576173e5e8Ca6A877e1",
     cashout: "0x4a2BB4211cCF9b9eA6eF01D0a61448154ED19095",
     betToken: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", // USDT
     betTokenDecimals: 6,
@@ -85,6 +85,7 @@ const CONTRACTS = {
     core: "0xF9548Be470A4e130c90ceA8b179FCD66D2972AC7",
     relayer: "0x8dA05c0021e6b35865FDC959c54dCeF3A4AbBa9d",
     azuroBet: "0x7A1c3FEf712753374C4DCe34254B96faF2B7265B",
+    paymaster: "0x943dD83042572226eFc485AD7Ecc605DFF7D2172",
     cashout: "0x4a2BB4211cCF9b9eA6eF01D0a61448154ED19095",
     betToken: "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
     betTokenDecimals: 18,
@@ -154,12 +155,26 @@ const ERC20_ABI = parseAbi([
   "function decimals() view returns (uint8)",
 ]);
 
+const PAYMASTER_ABI = parseAbi([
+  "function feeFund(address) view returns (uint256)",
+  "function freeBetsFund(address) view returns (uint256)",
+]);
+
 // ============================================================
 // Express App
 // ============================================================
 
 const app = express();
 app.use(express.json());
+
+function parseBool(v, defaultValue) {
+  if (v === undefined || v === null) return defaultValue;
+  if (typeof v === 'boolean') return v;
+  const s = String(v).trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'n' || s === 'off') return false;
+  return defaultValue;
+}
 
 // Track active bets for auto-cashout
 const activeBets = new Map();
@@ -208,6 +223,11 @@ function markBetInflight(conditionId, outcomeId) {
 function markBetSent(conditionId, outcomeId) {
   const fp = betFingerprint(conditionId, outcomeId);
   recentBetFingerprints.set(fp, { ts: Date.now(), status: 'sent' });
+}
+
+function clearRecentBet(conditionId, outcomeId) {
+  const fp = betFingerprint(conditionId, outcomeId);
+  recentBetFingerprints.delete(fp);
 }
 
 function rollbackBetInflight(conditionId, outcomeId) {
@@ -437,6 +457,12 @@ app.get("/health", async (req, res) => {
       relayerAllowance: "0",
       activeBets: activeBets.size,
       toolkitAvailable: toolkit !== null,
+      relayerConfig: {
+        relayerFeeAmount: (process.env.AZURO_RELAYER_FEE_AMOUNT ?? "0").toString(),
+        isBetSponsored: parseBool(process.env.AZURO_IS_BET_SPONSORED, false),
+        isFeeSponsored: parseBool(process.env.AZURO_IS_FEE_SPONSORED, false),
+        isSponsoredBetReturnable: parseBool(process.env.AZURO_IS_SPONSORED_BET_RETURNABLE, false),
+      },
     });
   }
   try {
@@ -459,6 +485,33 @@ app.get("/health", async (req, res) => {
       contracts.betTokenDecimals,
     );
 
+    const paymasterAllowance = contracts.paymaster
+      ? await publicClient.readContract({
+          address: contracts.betToken,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [account.address, contracts.paymaster],
+        })
+      : 0n;
+
+    const paymasterFeeFund = contracts.paymaster
+      ? await publicClient.readContract({
+          address: contracts.paymaster,
+          abi: PAYMASTER_ABI,
+          functionName: "feeFund",
+          args: [account.address],
+        })
+      : 0n;
+
+    const paymasterFreeBetsFund = contracts.paymaster
+      ? await publicClient.readContract({
+          address: contracts.paymaster,
+          abi: PAYMASTER_ABI,
+          functionName: "freeBetsFund",
+          args: [account.address],
+        })
+      : 0n;
+
     res.json({
       status: "ok",
       wallet: account.address,
@@ -467,8 +520,17 @@ app.get("/health", async (req, res) => {
       betToken: contracts.betToken,
       balance: formattedBalance,
       relayerAllowance: formattedAllowance,
+      paymasterAllowance: formatUnits(paymasterAllowance, contracts.betTokenDecimals),
+      paymasterFeeFund: formatUnits(paymasterFeeFund, contracts.betTokenDecimals),
+      paymasterFreeBetsFund: formatUnits(paymasterFreeBetsFund, contracts.betTokenDecimals),
       activeBets: activeBets.size,
       toolkitAvailable: toolkit !== null,
+      relayerConfig: {
+        relayerFeeAmount: (process.env.AZURO_RELAYER_FEE_AMOUNT ?? "0").toString(),
+        isBetSponsored: parseBool(process.env.AZURO_IS_BET_SPONSORED, false),
+        isFeeSponsored: parseBool(process.env.AZURO_IS_FEE_SPONSORED, false),
+        isSponsoredBetReturnable: parseBool(process.env.AZURO_IS_SPONSORED_BET_RETURNABLE, false),
+      },
     });
   } catch (e) {
     res.json({
@@ -527,35 +589,85 @@ app.post("/approve", async (req, res) => {
   try {
     const maxUint256 = 2n ** 256n - 1n;
 
-    // Check current allowance first
-    const currentAllowance = await publicClient.readContract({
-      address: contracts.betToken,
-      abi: ERC20_ABI,
-      functionName: "allowance",
-      args: [account.address, contracts.relayer],
-    });
+    const target = (req.body?.target ?? "relayer").toString().toLowerCase();
+    const wantRelayer = target === "relayer" || target === "both";
+    const wantPaymaster = target === "paymaster" || target === "both";
 
-    if (currentAllowance > 0n) {
-      res.json({
-        status: "already_approved",
-        allowance: formatUnits(currentAllowance, contracts.betTokenDecimals),
+    if (!wantRelayer && !wantPaymaster) {
+      return res.status(400).json({
+        status: "error",
+        error: "Invalid target. Use: relayer | paymaster | both",
+        target,
       });
-      return;
     }
 
-    const hash = await walletClient.writeContract({
-      address: contracts.betToken,
-      abi: ERC20_ABI,
-      functionName: "approve",
-      args: [contracts.relayer, maxUint256],
-    });
+    if (wantRelayer && !contracts.relayer) {
+      return res.status(500).json({
+        status: "error",
+        error: "Missing relayer contract address for this chain",
+        chainId: CHAIN_ID,
+      });
+    }
 
-    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    if (wantPaymaster && !contracts.paymaster) {
+      return res.status(500).json({
+        status: "error",
+        error: "Missing paymaster contract address for this chain",
+        chainId: CHAIN_ID,
+      });
+    }
 
+    const approvals = [];
+
+    const maybeApprove = async (spender, label) => {
+      const currentAllowance = await publicClient.readContract({
+        address: contracts.betToken,
+        abi: ERC20_ABI,
+        functionName: "allowance",
+        args: [account.address, spender],
+      });
+
+      if (currentAllowance > 0n) {
+        approvals.push({
+          label,
+          spender,
+          status: "already_approved",
+          allowance: formatUnits(currentAllowance, contracts.betTokenDecimals),
+        });
+        return;
+      }
+
+      const hash = await walletClient.writeContract({
+        address: contracts.betToken,
+        abi: ERC20_ABI,
+        functionName: "approve",
+        args: [spender, maxUint256],
+      });
+
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      approvals.push({
+        label,
+        spender,
+        status: "approved",
+        txHash: hash,
+        blockNumber: receipt.blockNumber.toString(),
+      });
+    };
+
+    if (wantRelayer) {
+      await maybeApprove(contracts.relayer, "relayer");
+    }
+    if (wantPaymaster) {
+      await maybeApprove(contracts.paymaster, "paymaster");
+    }
+
+    const didApprove = approvals.some((a) => a.status === "approved");
     res.json({
-      status: "approved",
-      txHash: hash,
-      blockNumber: receipt.blockNumber.toString(),
+      status: didApprove ? "approved" : "already_approved",
+      chainId: CHAIN_ID,
+      wallet: account.address,
+      token: contracts.betToken,
+      approvals,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -661,16 +773,30 @@ app.post("/bet", async (req, res) => {
 
     if (toolkit) {
       // === Official toolkit path ===
+      const cfgRelayerFeeAmount = (req.body.relayerFeeAmount ?? process.env.AZURO_RELAYER_FEE_AMOUNT ?? "0").toString();
+      const cfgIsBetSponsored = parseBool(req.body.isBetSponsored ?? process.env.AZURO_IS_BET_SPONSORED, false);
+      const cfgIsFeeSponsored = parseBool(req.body.isFeeSponsored ?? process.env.AZURO_IS_FEE_SPONSORED, false);
+      const cfgIsSponsoredBetReturnable = parseBool(
+        req.body.isSponsoredBetReturnable ?? process.env.AZURO_IS_SPONSORED_BET_RETURNABLE,
+        false,
+      );
+
+      if (!cfgIsFeeSponsored && (cfgRelayerFeeAmount === "0" || cfgRelayerFeeAmount === "0.0")) {
+        console.warn(
+          `⚠️ Suspicious config: isFeeSponsored=false but relayerFeeAmount=${cfgRelayerFeeAmount}. This may cause relayer rejection/revert.`,
+        );
+      }
+
       const clientData = {
         attention: "RustMisko CS2 Bot",
         affiliate: account.address,
         core: contracts.core,
         expiresAt,
         chainId: CHAIN_ID,
-        relayerFeeAmount: "0",
-        isBetSponsored: false,
-        isFeeSponsored: false,
-        isSponsoredBetReturnable: false,
+        relayerFeeAmount: cfgRelayerFeeAmount,
+        isBetSponsored: cfgIsBetSponsored,
+        isFeeSponsored: cfgIsFeeSponsored,
+        isSponsoredBetReturnable: cfgIsSponsoredBetReturnable,
       };
 
       const bet = {
@@ -725,7 +851,7 @@ app.post("/bet", async (req, res) => {
           graphBetId,
           conditionId,
           outcomeId: cleanOutcomeId,
-          stake: parseFloat(amount) / 1e6,
+          stake: parseFloat(amount) / 10 ** contracts.betTokenDecimals,
           odds: parseFloat(minOdds || "0") / 1e12,
           sport: (req.body.matchKey || "").split("::")[0] || "?",
           matchKey: req.body.matchKey || "",
@@ -744,7 +870,7 @@ app.post("/bet", async (req, res) => {
         rollbackBetInflight(conditionId, outcomeId);
       }
 
-      res.json({
+      return res.json({
         status: "ok",
         betId: result.id,
         tokenId: discoveredTokenId,
@@ -753,9 +879,10 @@ app.post("/bet", async (req, res) => {
         error: result.errorMessage || result.error,
       });
     } else {
-      // === Direct contract interaction fallback ===
-      // This is a simplified path — for full reliability, use toolkit
-      res.status(501).json({
+      console.log(`🔓 IDEM: Rollback lock (toolkit missing): condition=${conditionId}`);
+      bettedConditions.delete(conditionId);
+      rollbackBetInflight(conditionId, outcomeId);
+      return res.status(501).json({
         error: "Toolkit not available. Install: cd executor && npm install",
         hint: "npm install @azuro-org/toolkit viem express",
       });
@@ -788,9 +915,16 @@ app.post("/bet", async (req, res) => {
     } else {
       // Definitive error (bad params, rejected pre-send, etc.) — safe to rollback
       console.error(`❌ Bet error: ${errMsg} — rolling back idempotence lock`);
+      if (e?.shortMessage) console.error(`   shortMessage: ${e.shortMessage}`);
+      if (e?.cause?.message) console.error(`   cause: ${e.cause.message}`);
       bettedConditions.delete(conditionId);
       rollbackBetInflight(conditionId, outcomeId);
-      res.status(500).json({ error: e.message, details: e.stack });
+      res.status(500).json({
+        error: e.message,
+        shortMessage: e.shortMessage,
+        cause: e.cause?.message,
+        details: e.stack,
+      });
     }
   }
 });
@@ -817,9 +951,26 @@ app.get("/bet/:id", async (req, res) => {
 
     // Update active bet state
     if (activeBets.has(req.params.id)) {
-      activeBets.get(req.params.id).state = result.state;
-      if (result.state === "Rejected") {
+      const entry = activeBets.get(req.params.id);
+      const prevState = entry?.state;
+      entry.state = result.state;
+      // Keep legacy field for UI/debugging
+      entry.status = (result.state || "unknown").toLowerCase();
+
+      if (result.state === "Rejected" || result.state === "Failed" || result.state === "Canceled") {
+        // Confirmed terminal failure — unlock idempotence so the condition can be retried.
+        // Without this, a Created->Rejected transition permanently blocks all future bets on the same condition.
+        if (entry?.conditionId) {
+          console.log(
+            `\ud83d\udd13 IDEM: Unlocking after ${result.state}: condition=${entry.conditionId} outcome=${entry.outcomeId}`,
+          );
+          bettedConditions.delete(entry.conditionId);
+          clearRecentBet(entry.conditionId, entry.outcomeId);
+        }
         activeBets.delete(req.params.id);
+        saveActiveBetsToDisk();
+      } else if (prevState !== result.state) {
+        saveActiveBetsToDisk();
       }
     }
 

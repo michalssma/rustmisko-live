@@ -6,7 +6,7 @@
 //! Auto-cashout monitoruje aktivní sázky a cashoutuje při profitu.
 //!
 //! Spuštění:
-//!   $env:TELEGRAM_BOT_TOKEN="7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk"
+//!   $env:TELEGRAM_BOT_TOKEN="<token>"
 //!   $env:TELEGRAM_CHAT_ID="6458129071"
 //!   $env:FEED_HUB_URL="http://127.0.0.1:8081"
 //!   $env:EXECUTOR_URL="http://127.0.0.1:3030"  # Node.js sidecar
@@ -41,7 +41,8 @@ const CASHOUT_CHECK_SECS: u64 = 30;
 /// Minimum profit % to auto-cashout
 const CASHOUT_MIN_PROFIT_PCT: f64 = 3.0;
 /// Minimum score-edge % to trigger alert
-const MIN_SCORE_EDGE_PCT: f64 = 8.0;
+/// Relaxed 8% -> 6% to increase opportunity throughput (still requires edge)
+const MIN_SCORE_EDGE_PCT: f64 = 6.0;
 /// Score edge cooldown per match (seconds)
 const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches score changes
 /// === AUTO-BET CONFIG ===
@@ -70,7 +71,7 @@ const BLOCK_GENERIC_ESPORTS_BETS: bool = false;
 /// GPT audit: max 2 retry for ConditionNotRunning; 3rd attempt is wasted latency
 const AUTO_BET_RETRY_MAX: usize = 2;
 /// Jitter base delays per retry attempt — actual = base + rand(0..base/2)
-const AUTO_BET_RETRY_DELAYS_MS: [u64; 2] = [200, 500];
+const AUTO_BET_RETRY_DELAYS_MS: [u64; 2] = [80, 200];
 /// Min-odds fallback step for one rescue retry (e.g. 0.92 -> 0.86)
 const MIN_ODDS_FALLBACK_STEP: f64 = 0.06;
 /// Retry condition-paused only for reasonably fresh conditions
@@ -95,10 +96,10 @@ const PIPELINE_BUDGET_MS: u64 = 1200;
 const SUSPENDED_MARKET_MIN_ODDS: f64 = 1.05;
 const SUSPENDED_MARKET_MAX_ODDS: f64 = 50.0;
 /// Slippage guard factors (minOdds = displayed_odds * factor)
-/// Relaxed from 0.97 → 0.92: reduce MinOddsReject due to on-chain/oracle slippage
-const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.92;
-/// Tennis tends to move faster around points; use looser minOdds to avoid constant rejects
-const MIN_ODDS_FACTOR_TENNIS: f64 = 0.90;
+/// Relaxed further (0.92 -> 0.88) to reduce minOdds rejects + on-chain reverts due to slippage.
+const MIN_ODDS_FACTOR_DEFAULT: f64 = 0.88;
+/// Tennis tends to move faster around points; use even looser minOdds to avoid constant rejects.
+const MIN_ODDS_FACTOR_TENNIS: f64 = 0.86;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
 /// Was 3 — practically unreachable (HLTV typically has 1-2 bookmakers per match)
 const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
@@ -888,6 +889,9 @@ struct SentAlert {
 // ====================================================================
 
 async fn tg_send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) -> Result<i64> {
+    if token.trim().is_empty() || chat_id == 0 {
+        return Ok(0);
+    }
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
     let body = serde_json::json!({
         "chat_id": chat_id,
@@ -895,28 +899,56 @@ async fn tg_send_message(client: &reqwest::Client, token: &str, chat_id: i64, te
         "parse_mode": "HTML",
         "disable_web_page_preview": true,
     });
-    let resp = client.post(&url).json(&body).send().await?;
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Telegram sendMessage request failed: {}", e);
+            return Ok(0);
+        }
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         warn!("Telegram sendMessage failed: {} — {}", status, body);
-        anyhow::bail!("Telegram sendMessage failed: {} — {}", status, body);
+        // Non-fatal: keep bot running even if Telegram is misconfigured.
+        return Ok(0);
     }
-    let resp_json: serde_json::Value = resp.json().await?;
+    let resp_json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("Telegram sendMessage JSON parse failed: {}", e);
+            return Ok(0);
+        }
+    };
     let msg_id = resp_json["result"]["message_id"].as_i64().unwrap_or(0);
     Ok(msg_id)
 }
 
 async fn tg_get_updates(client: &reqwest::Client, token: &str, offset: i64) -> Result<TgUpdatesResponse> {
+    if token.trim().is_empty() {
+        return Ok(TgUpdatesResponse { ok: false, result: vec![] });
+    }
     let url = format!(
         "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=5&allowed_updates=[\"message\",\"message_reaction\"]",
         token, offset
     );
-    let resp = client.get(&url).send().await?;
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("getUpdates request failed: {}", e);
+            return Ok(TgUpdatesResponse { ok: false, result: vec![] });
+        }
+    };
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("getUpdates HTTP {}: {}", status, body);
+        // Non-fatal: invalid token (401) or forbidden (403) should not crash the bot.
+        // Auto-bet logic can still run; Telegram features will be effectively disabled.
+        warn!("getUpdates HTTP {}: {}", status, body);
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Ok(TgUpdatesResponse { ok: false, result: vec![] });
+        }
+        return Ok(TgUpdatesResponse { ok: false, result: vec![] });
     }
     let parsed: TgUpdatesResponse = serde_json::from_str(&body)
         .with_context(|| format!("Failed to parse getUpdates: {}", &body[..body.len().min(200)]))?;
@@ -924,10 +956,28 @@ async fn tg_get_updates(client: &reqwest::Client, token: &str, offset: i64) -> R
 }
 
 async fn tg_get_me(client: &reqwest::Client, token: &str) -> Result<i64> {
+    if token.trim().is_empty() {
+        return Ok(0);
+    }
     let url = format!("https://api.telegram.org/bot{}/getMe", token);
-    let resp: serde_json::Value = client.get(&url).send().await?.json().await?;
-    let bot_id = resp["result"]["id"].as_i64().unwrap_or(0);
-    Ok(bot_id)
+    let resp: serde_json::Value = match client.get(&url).send().await {
+        Ok(r) => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Telegram getMe JSON parse failed: {}", e);
+                return Ok(0);
+            }
+        },
+        Err(e) => {
+            warn!("Telegram getMe request failed: {}", e);
+            return Ok(0);
+        }
+    };
+    if resp["ok"].as_bool() == Some(false) {
+        warn!("Telegram getMe failed: {}", resp.to_string());
+        return Ok(0);
+    }
+    Ok(resp["result"]["id"].as_i64().unwrap_or(0))
 }
 
 // ====================================================================
@@ -2932,13 +2982,28 @@ fn format_auto_bet_result_message(
             aid, sport, path, team, odds, stake
         )
     } else {
+        let header = if bet_state == "Accepted" {
+            "✅ <b>AUTO-BET #{aid} CONFIRMED</b>"
+        } else if bet_state == "Created" || bet_state == "Pending" {
+            "📨 <b>AUTO-BET #{aid} SUBMITTED</b>"
+        } else {
+            "✅ <b>AUTO-BET #{aid} PLACED</b>"
+        };
         format!(
-            "✅ <b>AUTO-BET #{} PLACED</b>\n\
+            "{}\n\
              🏷️ <b>{}</b> | path: <b>{}</b>\n\
              💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>\n\
              🧾 Bet ID: <code>{}</code> | state: <b>{}</b>\n\
              📈 Auto-bets dnes: <b>{}</b>",
-            aid, sport, path, team, odds, stake, bet_id, bet_state, auto_bet_count
+            header.replace("{aid}", &aid.to_string()),
+            sport,
+            path,
+            team,
+            odds,
+            stake,
+            bet_id,
+            bet_state,
+            auto_bet_count
         )
     }
 }
@@ -3092,8 +3157,7 @@ fn extract_alert_id_from_text(text: &str) -> Option<u32> {
 async fn main() -> Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?)).init();
 
-    let token = std::env::var("TELEGRAM_BOT_TOKEN")
-        .unwrap_or_else(|_| "7611316975:AAG_bStGX283uHCdog96y07eQfyyBhOGYuk".to_string());
+    let token = std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
     let feed_hub_url = std::env::var("FEED_HUB_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8081".to_string());
     let executor_url = std::env::var("EXECUTOR_URL")
@@ -3103,9 +3167,16 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    // Get bot info
-    let bot_id = tg_get_me(&client, &token).await?;
-    info!("Telegram bot started, bot_id={}", bot_id);
+    if token.trim().is_empty() {
+        warn!("TELEGRAM_BOT_TOKEN not set — running without Telegram.");
+    } else {
+        let bot_id = tg_get_me(&client, &token).await.unwrap_or(0);
+        if bot_id == 0 {
+            warn!("Telegram configured, but getMe failed — continuing without Telegram.");
+        } else {
+            info!("Telegram bot started, bot_id={}", bot_id);
+        }
+    }
 
     // Discover chat_id: either from env or from first message
     let mut chat_id: Option<i64> = std::env::var("TELEGRAM_CHAT_ID")
@@ -3359,12 +3430,18 @@ async fn main() -> Result<()> {
         }
     }
 
-    // If no chat_id, wait for user to send /start
-    if chat_id.is_none() {
+    // If no chat_id, wait for user to send /start (timeboxed; never block auto-bets forever)
+    if chat_id.is_none() && !token.trim().is_empty() {
         info!("No TELEGRAM_CHAT_ID set. Waiting for /start message from user...");
         info!("Open Telegram and send /start to your bot");
 
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+
         loop {
+            if std::time::Instant::now() >= deadline {
+                warn!("Timed out waiting for /start — continuing without Telegram.");
+                break;
+            }
             match tg_get_updates(&client, &token, update_offset).await {
                 Ok(updates) => {
                     for u in &updates.result {
@@ -3374,7 +3451,7 @@ async fn main() -> Result<()> {
                             if text.starts_with("/start") {
                                 chat_id = Some(msg.chat.id);
                                 info!("Chat ID discovered: {}", msg.chat.id);
-                                tg_send_message(&client, &token, msg.chat.id,
+                                let _ = tg_send_message(&client, &token, msg.chat.id,
                                     &format!(
                                         "🤖 <b>RustMisko Alert Bot v3</b> activated!\n\n\
                                          Automatický CS2 Azuro betting system.\n\
@@ -3384,7 +3461,7 @@ async fn main() -> Result<()> {
                                          🏠 Feed Hub: {}\n\
                                          🔧 Executor: {}", feed_hub_url, executor_url
                                     )
-                                ).await?;
+                                ).await;
                                 break;
                             }
                         }
@@ -3397,8 +3474,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    let chat_id = chat_id.unwrap();
-    info!("Alert bot running. chat_id={}, feed_hub={}, executor={}", chat_id, feed_hub_url, executor_url);
+    let chat_id = chat_id.unwrap_or(0);
+    if chat_id != 0 {
+        info!("Alert bot running. chat_id={}, feed_hub={}, executor={}", chat_id, feed_hub_url, executor_url);
+    } else {
+        info!("Alert bot running WITHOUT Telegram. feed_hub={}, executor={}", feed_hub_url, executor_url);
+    }
 
     // Check executor health at startup
     let executor_status = match client.get(format!("{}/health", executor_url)).send().await {
@@ -3959,11 +4040,15 @@ async fn main() -> Result<()> {
                                         if ws_state_gate_enabled {
                                             if matches!(ws_result, WsGateResult::NoData | WsGateResult::Stale { .. }) {
                                                 let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
-                                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                                ws_result = {
-                                                    let cache_r = ws_condition_cache.read().await;
-                                                    ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
-                                                };
+                                                // SPEED-FIRST: pokud je GQL fresh, nečekáme vůbec (minimalizace odds slippage).
+                                                // Pokud je GQL stale, dáme krátký probe, ať WS stihne dorazit.
+                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                                    ws_result = {
+                                                        let cache_r = ws_condition_cache.read().await;
+                                                        ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                                    };
+                                                }
                                             }
                                         }
 
@@ -4219,7 +4304,7 @@ async fn main() -> Result<()> {
                                                             if is_minodds_reject && !minodds_fallback_applied && attempt < max_retries {
                                                                 attempt += 1;
                                                                 minodds_fallback_applied = true;
-                                                                let base_delay = 120;
+                                                                let base_delay = 30;
                                                                 let jitter = ((aid as u64).wrapping_mul(11).wrapping_add(attempt as u64 * 17)) % 80;
                                                                 let delay_ms = base_delay + jitter;
                                                                 info!("🔁 AUTO-BET #{} min-odds fallback retry {}/{}: factor step -{:.2}, wait {}ms ({})",
@@ -4434,6 +4519,23 @@ async fn main() -> Result<()> {
                                                                         "FF_RESYNC_FREEZE": FF_RESYNC_FREEZE,
                                                                     }
                                                                 }));
+
+                                                                // === LEDGER: ON-CHAIN ACCEPTED (immediate) ===
+                                                                if bet_state == "Accepted" {
+                                                                    ledger_write("ON_CHAIN_ACCEPTED", &serde_json::json!({
+                                                                        "alert_id": aid,
+                                                                        "match_key": edge.match_key,
+                                                                        "condition_id": condition_id,
+                                                                        "outcome_id": outcome_id,
+                                                                        "bet_id": bet_id,
+                                                                        "on_chain_state": bet_state,
+                                                                        "token_id": token_id_opt,
+                                                                        "graph_bet_id": graph_bet_id_opt,
+                                                                        "path": "edge",
+                                                                        "odds": azuro_odds,
+                                                                        "stake": stake,
+                                                                    }));
+                                                                }
                                                             }
 
                                                             let result_msg = format_auto_bet_result_message(
@@ -4516,8 +4618,49 @@ async fn main() -> Result<()> {
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                let alert = format!(
+                                                                                    "✅ <b>AUTO-BET #{} CONFIRMED (follow-up)</b>\n\
+                                                                                     path: <b>edge</b>\n\
+                                                                                     💡 Pick: <b>{}</b>\n\
+                                                                                     🧾 Bet ID: <code>{}</code>\n\
+                                                                                     🧠 on-chain state: <b>{}</b>\n\
+                                                                                     🪙 tokenId: <code>{}</code>",
+                                                                                    follow_aid,
+                                                                                    follow_team,
+                                                                                    follow_bet_id,
+                                                                                    final_state,
+                                                                                    token_id,
+                                                                                );
+                                                                                let _ = tg_send_message(
+                                                                                    &follow_client,
+                                                                                    &follow_token,
+                                                                                    follow_chat,
+                                                                                    &alert,
+                                                                                ).await;
                                                                                 info!("✅ AUTO-BET #{} FOLLOW-UP CONFIRMED: state={} tokenId={}",
                                                                                     follow_aid, final_state, token_id);
+                                                                                // LEDGER: write on-chain ACCEPTED event
+                                                                                {
+                                                                                    let entry = serde_json::json!({
+                                                                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                        "event": "ON_CHAIN_ACCEPTED",
+                                                                                        "alert_id": follow_aid,
+                                                                                        "match_key": follow_match_key,
+                                                                                        "condition_id": follow_condition_id,
+                                                                                        "outcome_id": follow_outcome_id,
+                                                                                        "bet_id": follow_bet_id,
+                                                                                        "on_chain_state": final_state,
+                                                                                        "token_id": token_id,
+                                                                                        "path": "edge",
+                                                                                        "odds": follow_odds,
+                                                                                        "stake": follow_stake,
+                                                                                    });
+                                                                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                                        .create(true).append(true).open("data/ledger.jsonl") {
+                                                                                        use std::io::Write;
+                                                                                        let _ = writeln!(f, "{}", entry);
+                                                                                    }
+                                                                                }
                                                                             } else {
                                                                                 info!("⏳ AUTO-BET #{} FOLLOW-UP: state={} (still pending)",
                                                                                     follow_aid, final_state);
@@ -4813,11 +4956,14 @@ async fn main() -> Result<()> {
                                         if ws_state_gate_enabled {
                                             if matches!(ws_result_b, WsGateResult::NoData | WsGateResult::Stale { .. }) {
                                                 let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
-                                                tokio::time::sleep(Duration::from_millis(200)).await;
-                                                ws_result_b = {
-                                                    let cache_r = ws_condition_cache.read().await;
-                                                    ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
-                                                };
+                                                // SPEED-FIRST: při GQL fresh nečekat; při GQL stale krátký probe pro WS.
+                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                                    ws_result_b = {
+                                                        let cache_r = ws_condition_cache.read().await;
+                                                        ws_gate_check(&cache_r, &condition_id, ws_state_gate_enabled)
+                                                    };
+                                                }
                                             }
                                         }
 
@@ -5058,7 +5204,7 @@ async fn main() -> Result<()> {
                                                             if is_minodds_b && !minodds_fallback_applied && attempt < max_retries {
                                                                 attempt += 1;
                                                                 minodds_fallback_applied = true;
-                                                                let base_delay = 120;
+                                                                let base_delay = 30;
                                                                 let jitter = ((aid as u64).wrapping_mul(11).wrapping_add(attempt as u64 * 17)) % 80;
                                                                 let delay_ms = base_delay + jitter;
                                                                 info!("🔁 AUTO-BET ODDS #{} min-odds fallback retry {}/{}: factor step -{:.2}, wait {}ms ({})",
@@ -5234,6 +5380,23 @@ async fn main() -> Result<()> {
                                                                         "FF_RESYNC_FREEZE": FF_RESYNC_FREEZE,
                                                                     }
                                                                 }));
+
+                                                                // === LEDGER: ON-CHAIN ACCEPTED (immediate) ===
+                                                                if bet_state == "Accepted" {
+                                                                    ledger_write("ON_CHAIN_ACCEPTED", &serde_json::json!({
+                                                                        "alert_id": aid,
+                                                                        "match_key": anomaly.match_key,
+                                                                        "condition_id": condition_id,
+                                                                        "outcome_id": outcome_id,
+                                                                        "bet_id": bet_id,
+                                                                        "on_chain_state": bet_state,
+                                                                        "token_id": token_id_opt,
+                                                                        "graph_bet_id": graph_bet_id_opt,
+                                                                        "path": "anomaly_odds",
+                                                                        "odds": azuro_odds,
+                                                                        "stake": stake,
+                                                                    }));
+                                                                }
                                                             }
 
                                                             let result_msg = format_auto_bet_result_message(
@@ -5316,8 +5479,49 @@ async fn main() -> Result<()> {
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                let alert = format!(
+                                                                                    "✅ <b>AUTO-BET #{} CONFIRMED (follow-up)</b>\n\
+                                                                                     path: <b>anomaly_odds</b>\n\
+                                                                                     💡 Pick: <b>{}</b>\n\
+                                                                                     🧾 Bet ID: <code>{}</code>\n\
+                                                                                     🧠 on-chain state: <b>{}</b>\n\
+                                                                                     🪙 tokenId: <code>{}</code>",
+                                                                                    follow_aid,
+                                                                                    follow_team,
+                                                                                    follow_bet_id,
+                                                                                    final_state,
+                                                                                    token_id,
+                                                                                );
+                                                                                let _ = tg_send_message(
+                                                                                    &follow_client,
+                                                                                    &follow_token,
+                                                                                    follow_chat,
+                                                                                    &alert,
+                                                                                ).await;
                                                                                 info!("✅ AUTO-BET ODDS #{} FOLLOW-UP CONFIRMED: state={} tokenId={}",
                                                                                     follow_aid, final_state, token_id);
+                                                                                // LEDGER: write on-chain ACCEPTED event
+                                                                                {
+                                                                                    let entry = serde_json::json!({
+                                                                                        "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                        "event": "ON_CHAIN_ACCEPTED",
+                                                                                        "alert_id": follow_aid,
+                                                                                        "match_key": follow_match_key,
+                                                                                        "condition_id": follow_condition_id,
+                                                                                        "outcome_id": follow_outcome_id,
+                                                                                        "bet_id": follow_bet_id,
+                                                                                        "on_chain_state": final_state,
+                                                                                        "token_id": token_id,
+                                                                                        "path": "anomaly_odds",
+                                                                                        "odds": follow_odds,
+                                                                                        "stake": follow_stake,
+                                                                                    });
+                                                                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                                        .create(true).append(true).open("data/ledger.jsonl") {
+                                                                                        use std::io::Write;
+                                                                                        let _ = writeln!(f, "{}", entry);
+                                                                                    }
+                                                                                }
                                                                             } else {
                                                                                 info!("⏳ AUTO-BET ODDS #{} FOLLOW-UP: state={} (still pending)",
                                                                                     follow_aid, final_state);
