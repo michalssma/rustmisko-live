@@ -464,6 +464,15 @@ fn min_odds_factor_with_fallback(match_key: &str, fallback_applied: bool) -> f64
     }
 }
 
+/// Compute on-chain minOdds (in 1e12 format) with a floor of 1.01.
+/// Without this floor, low Azuro odds (e.g. 1.18 * 0.83 = 0.98) produce sub-1.0
+/// minOdds which provides ZERO slippage protection since odds can never be < 1.0.
+fn compute_min_odds_raw(azuro_odds: f64, factor: f64) -> (u64, f64) {
+    let display = (azuro_odds * factor).max(1.01);
+    let raw = (display * 1e12) as u64;
+    (raw, display)
+}
+
 /// Additional sport-specific safety guard for auto-bet.
 /// Returns true if the specific match situation is safe enough for auto-bet.
 /// This is checked IN ADDITION to edge/odds thresholds.
@@ -1050,11 +1059,91 @@ struct ScoreEdge {
     cs2_map_confidence: Option<&'static str>,
     /// Cross-validation stake multiplier (1.0 = normal, 1.25 = boosted)
     cv_stake_mult: f64,
+    /// Detailed score string from live feed (for esports anomaly guard)
+    detailed_score: Option<String>,
 }
 
 // ====================================================================
 // CS2 ROUND SCORE PARSER — extract current round from Chance detailed_score
 // ====================================================================
+
+/// Parse CS2 round score from Dust2.us detailed_score string.
+/// Example: "R:9-3 M:0-0" → Some((9, 3)) for round score
+/// Example: "R:6-8 M:1-0" → Some((6, 8)) for round score
+fn parse_dust2_round_score(detailed: &str) -> Option<(i32, i32)> {
+    // Look for "R:X-Y" pattern
+    if let Some(r_pos) = detailed.find("R:") {
+        let after = &detailed[r_pos + 2..];
+        let parts: Vec<&str> = after.split_whitespace().next()?.split('-').collect();
+        if parts.len() == 2 {
+            if let (Ok(a), Ok(b)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                if a >= 0 && a <= 30 && b >= 0 && b <= 30 {
+                    return Some((a, b));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse CS2 map score from Dust2.us detailed_score string.
+/// Example: "R:9-3 M:1-0" → Some((1, 0)) for map score
+fn parse_dust2_map_score(detailed: &str) -> Option<(i32, i32)> {
+    if let Some(m_pos) = detailed.find("M:") {
+        let after = &detailed[m_pos + 2..];
+        let parts: Vec<&str> = after.split_whitespace().next().unwrap_or(after).split('-').collect();
+        if parts.len() == 2 {
+            if let (Ok(a), Ok(b)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                if a >= 0 && a <= 5 && b >= 0 && b <= 5 {
+                    return Some((a, b));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Universal CS2/esports round score extractor — tries all formats.
+/// Returns Some((round1, round2)) from any source format.
+fn parse_esports_round_score(detailed: &str) -> Option<(i32, i32)> {
+    // Try Dust2 format first (most precise)
+    if let Some(rs) = parse_dust2_round_score(detailed) {
+        return Some(rs);
+    }
+    // Then Chance/Tipsport format
+    parse_cs2_round_score(detailed)
+}
+
+/// Universal CS2/esports map score extractor — tries all formats.
+/// Returns Some((map1, map2)) from any source format.
+fn parse_esports_map_score(detailed: &str, score1: i32, score2: i32) -> (i32, i32) {
+    // Try Dust2 "M:X-Y" format first
+    if let Some(ms) = parse_dust2_map_score(detailed) { return ms; }
+    // Try parsing current map from Chance "N.mapa" format
+    // Fallback: use live score1/score2 (= map score from HLTV/Tipsport)
+    (score1, score2)
+}
+
+/// Esports anomaly guard: is the match "in-progress" enough to trust odds anomaly?
+/// Returns true if match has progressed past early-game noise zone.
+/// Logic: map_diff ≥ 1 (someone won a map) OR round_total ≥ 5 (current map in progress).
+/// This blocks: fresh match starts (0-0, round 0-0) where Azuro oracle hasn't adjusted.
+fn esports_anomaly_guard(score1: i32, score2: i32, detailed: Option<&str>) -> bool {
+    // Map score check: if someone is leading in maps, odds are meaningful
+    let map_diff = (score1 - score2).abs();
+    if map_diff >= 1 { return true; }
+
+    // Round score check: if enough rounds played, market has had time to react
+    if let Some(det) = detailed {
+        if let Some((r1, r2)) = parse_esports_round_score(det) {
+            let total_rounds = r1 + r2;
+            return total_rounds >= 5; // ~2.5 min into map minimum
+        }
+    }
+
+    // No detailed score and maps are 0-0 → match just started → skip
+    false
+}
 
 /// Parse CS2 round score from Chance.cz detailed_score string.
 /// Examples:
@@ -1976,7 +2065,7 @@ fn find_score_edges(
                     ) {
                         Some(s) => s,
                         None => {
-                            let leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
+                            let _leading_team = if leading_side == 1 { &live.payload.team1 } else { &live.payload.team2 };
                             info!("  🛑 {} MW {}: TEAM IDENTITY AMBIGUOUS! live={}+{} azuro={}+{} — BLOCKING bet",
                                 match_key, mw.market, live.payload.team1, live.payload.team2, mw.team1, mw.team2);
                             continue;
@@ -2049,6 +2138,7 @@ fn find_score_edges(
                         azuro_url: mw.url.clone(),
                         cs2_map_confidence: Some(map_confidence_tier),
                         cv_stake_mult,
+                        detailed_score: live.payload.detailed_score.clone(),
                     });
                 }
             }
@@ -2192,6 +2282,7 @@ fn find_score_edges(
             azuro_url: azuro.payload.url.clone(),
             cs2_map_confidence: None, // match_winner, not map_winner
             cv_stake_mult,
+            detailed_score: live.payload.detailed_score.clone(),
         });
     }
 
@@ -2288,6 +2379,8 @@ struct OddsAnomaly {
     is_live: bool,
     /// Live score if available
     live_score: Option<String>,
+    /// Detailed score from bookmaker scraper (round-level for CS2)
+    detailed_score: Option<String>,
     // === Azuro execution data ===
     game_id: Option<String>,
     condition_id: Option<String>,
@@ -2573,6 +2666,8 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
         let live_score = live_keys.get(match_key.as_str()).map(|l| {
             format!("{}-{}", l.payload.score1, l.payload.score2)
         });
+        let detailed_score = live_keys.get(match_key.as_str())
+            .and_then(|l| l.payload.detailed_score.clone());
 
         // LIVE-ONLY mode: ignore prematch odds anomalies completely.
         if !is_live {
@@ -2804,6 +2899,7 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                     teams_swapped: any_swapped,
                     is_live,
                     live_score: live_score.clone(),
+                    detailed_score: detailed_score.clone(),
                     game_id: azuro.game_id.clone(),
                     condition_id: azuro.condition_id.clone(),
                     outcome1_id: azuro.outcome1_id.clone(),
@@ -2831,6 +2927,7 @@ fn find_odds_anomalies(state: &StateResponse) -> Vec<OddsAnomaly> {
                     teams_swapped: any_swapped,
                     is_live,
                     live_score: live_score.clone(),
+                    detailed_score: detailed_score.clone(),
                     game_id: azuro.game_id.clone(),
                     condition_id: azuro.condition_id.clone(),
                     outcome1_id: azuro.outcome1_id.clone(),
@@ -3758,6 +3855,7 @@ async fn main() -> Result<()> {
                                         teams_swapped: false,
                                         is_live: true,
                                         live_score: Some(format!("{}-{}", edge.score1, edge.score2)),
+                                        detailed_score: edge.detailed_score.clone(),
                                         game_id: edge.game_id.clone(),
                                         condition_id: edge.condition_id.clone(),
                                         outcome1_id: edge.outcome1_id.clone(),
@@ -4187,8 +4285,7 @@ async fn main() -> Result<()> {
                                         let mut bet_success = false;
                                         loop {
                                         let min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
-                                        let min_odds = (azuro_odds * min_odds_factor * 1e12) as u64;
-                                        let min_odds_display = azuro_odds * min_odds_factor;
+                                        let (min_odds, min_odds_display) = compute_min_odds_raw(azuro_odds, min_odds_factor);
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
                                             "outcomeId": outcome_id,
@@ -4838,10 +4935,11 @@ async fn main() -> Result<()> {
                                     // Score-edge path has sport_auto_bet_guard + model validation;
                                     // anomaly path is purely odds-comparison → needs stricter sport rules.
                                     let anomaly_sport_allowed = match anomaly_sport {
-                                        // Football: ENABLED with conservative guard — require ≥10% disc + 2 sources
-                                        // Risk: single-source Tipsport for obscure leagues.
-                                        // Mitigation: MIN_MARKET_SOURCES=2 + penalty system catches most noise.
-                                        "football" => true,
+                                        // Football: DISABLED for anomaly path (2026-03-02)
+                                        // 0/2 football anomaly bets lost in 24h audit.
+                                        // Football odds discrepancy is noisy (league diversity, bookmaker lag).
+                                        // Football auto-bets still allowed via score-edge path (goal_diff model).
+                                        "football" => false,
                                         // Basketball: ENABLED — anomaly odds comparison is valid for mainstream leagues
                                         // Score-edge path also lives with point-diff model.
                                         "basketball" => true,
@@ -4864,6 +4962,28 @@ async fn main() -> Result<()> {
                                                     anomaly.match_key, anomaly.live_score);
                                             }
                                             tennis_ok
+                                        }
+                                        // Esports (CS2, LoL, Dota, Valorant): require match in-progress
+                                        // At match start (0-0 maps, 0-0 rounds) Azuro oracle hasn't adjusted
+                                        // and odds discrepancy is noise. Need map_diff≥1 OR ≥5 rounds played.
+                                        // Uses live_score (map score) + detailed_score (round-level from Tipsport/Chance/Dust2).
+                                        "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => {
+                                            let (s1, s2) = if let Some(ref score) = anomaly.live_score {
+                                                let parts: Vec<&str> = score.split('-').collect();
+                                                if parts.len() == 2 {
+                                                    (parts[0].trim().parse::<i32>().unwrap_or(0),
+                                                     parts[1].trim().parse::<i32>().unwrap_or(0))
+                                                } else { (0, 0) }
+                                            } else { (0, 0) };
+                                            let esports_ok = esports_anomaly_guard(
+                                                s1, s2,
+                                                anomaly.detailed_score.as_deref(),
+                                            );
+                                            if !esports_ok {
+                                                info!("🎮 ANOMALY SPORT GUARD: {} score={:?} detailed={:?} — esports needs map_diff≥1 or ≥5 rounds",
+                                                    anomaly.match_key, anomaly.live_score, anomaly.detailed_score);
+                                            }
+                                            esports_ok
                                         }
                                         _ => true,
                                     };
@@ -5089,8 +5209,7 @@ async fn main() -> Result<()> {
                                         let mut minodds_fallback_applied = false;
                                         loop {
                                         let min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
-                                        let min_odds = (azuro_odds * min_odds_factor * 1e12) as u64;
-                                        let min_odds_display_b = azuro_odds * min_odds_factor;
+                                        let (min_odds, min_odds_display_b) = compute_min_odds_raw(azuro_odds, min_odds_factor);
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
                                             "outcomeId": outcome_id,
@@ -5369,12 +5488,24 @@ async fn main() -> Result<()> {
                                                                     "team1": anomaly.team1, "team2": anomaly.team2,
                                                                     "value_team": value_team,
                                                                     "amount_usd": stake, "odds": azuro_odds,
+                                                                    "min_odds": min_odds_display_b,
                                                                     "condition_id": condition_id,
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
                                                                     "path": "anomaly_odds",
                                                                     "condition_age_ms": condition_age_ms_b,
+                                                                    // Anomaly audit data — enables post-hoc signal validation
+                                                                    "anomaly_confidence": anomaly.confidence,
+                                                                    "anomaly_disc_pct": anomaly.discrepancy_pct,
+                                                                    "anomaly_market_bookmaker": anomaly.market_bookmaker,
+                                                                    "anomaly_azuro_w1": anomaly.azuro_w1,
+                                                                    "anomaly_azuro_w2": anomaly.azuro_w2,
+                                                                    "anomaly_market_w1": anomaly.market_w1,
+                                                                    "anomaly_market_w2": anomaly.market_w2,
+                                                                    "anomaly_live_score": anomaly.live_score,
+                                                                    "anomaly_detailed_score": anomaly.detailed_score,
+                                                                    "anomaly_market_source_count": market_source_count,
                                                                     "flags": {
                                                                         "FF_EXPOSURE_CAPS": FF_EXPOSURE_CAPS,
                                                                         "FF_REBET_ENABLED": FF_REBET_ENABLED,
@@ -6966,7 +7097,11 @@ async fn main() -> Result<()> {
                                     if let Ok(resp) = client.get(format!("{}/my-bets", executor_url)).send().await {
                                         if let Ok(mb) = resp.json::<serde_json::Value>().await {
                                             let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            let won = mb.get("won").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            // executor returns "alreadyPaid" (settled+claimed wins); keep fallback for older schemas
+                                            let won = mb.get("alreadyPaid")
+                                                .and_then(|v| v.as_u64())
+                                                .or_else(|| mb.get("won").and_then(|v| v.as_u64()))
+                                                .unwrap_or(0);
                                             let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
                                             let pending_count = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
                                             let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -7237,7 +7372,7 @@ async fn main() -> Result<()> {
                                         ).await;
 
                                         // POST to executor
-                                        let min_odds = (azuro_odds * min_odds_factor_for_match(&anomaly.match_key) * 1e12) as u64;
+                                        let (min_odds, _min_odds_display_cmd) = compute_min_odds_raw(azuro_odds, min_odds_factor_for_match(&anomaly.match_key));
                                         let amount_raw = (amount * 1e6) as u64; // USDT 6 decimals
 
                                         let bet_body = serde_json::json!({
