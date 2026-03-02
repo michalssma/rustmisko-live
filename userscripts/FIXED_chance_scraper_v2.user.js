@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         Chance.cz → Feed Hub Live Scraper (FIXED v2)
 // @namespace    rustmisko
-// @version      2.0
+// @version      2.1
 // @description  Čistý parser pro Chance.cz + WS ingest do feed-hubu (fotbal/tenis/basket + CS2/LoL/Dota/Valorant)
 // @author       RustMisko
 // @match        https://www.chance.cz/*
@@ -19,6 +19,8 @@
         const SCAN_INTERVAL_MS = 2000;
         const RECONNECT_MS = 5000;
         const HEARTBEAT_MS = 20000;
+        // feed-hub staleness cleanup je 120s; když se skóre/kurzy nehýbou, musíme občas refreshnout i beze změny
+        const RESEND_UNCHANGED_MS = 20000;
         const SOURCE_NAME = "chance";
         const BOOKMAKER = "chance";
         const DEBUG = false;
@@ -30,7 +32,7 @@
         let scanTimer = null;
         let hbTimer = null;
 
-        const lastFingerprintByKey = new Map();
+        const lastSendStateByKey = new Map();
         let lastResults = [];
 
         const PREFIX = "[Chance→Hub FIXEDv2]";
@@ -195,7 +197,14 @@
                     if (label === "1" || label === "0" || label === "2" || label === "10" || label === "02" || label === "12") {
                         if (ods[label] === undefined) continue; // zajímají nás jen hlavní 1, 0, 2
                         
-                        const valStr = lines[i+1].replace(',', '.');
+                        const rawVal = (lines[i + 1] || '').trim();
+                        // Odds jsou prakticky vždy desetinná čísla (např. 1.85 / 1,85).
+                        // Tohle chrání proti falešným pozitivům (např. tenis body 0/15/30/40).
+                        if (!(rawVal.includes('.') || rawVal.includes(','))) continue;
+
+                        const valStr = rawVal.replace(',', '.');
+                        if (!/^\d+\.\d+$/.test(valStr)) continue;
+
                         const val = parseFloat(valStr);
                         // Kurz musí být logické číslo > 1
                         if (!isNaN(val) && val > 1.0) {
@@ -265,10 +274,22 @@
 
     function shouldSend(kind, key, fingerprint) {
         const k = `${kind}||${key}`;
-        const prev = lastFingerprintByKey.get(k);
-        if (prev === fingerprint) return false;
-        lastFingerprintByKey.set(k, fingerprint);
-        return true;
+        const now = Date.now();
+        const prev = lastSendStateByKey.get(k);
+        if (!prev) {
+            lastSendStateByKey.set(k, { fp: fingerprint, sentAt: now });
+            return true;
+        }
+
+        const fpChanged = prev.fp !== fingerprint;
+        const tooOld = (now - (prev.sentAt || 0)) >= RESEND_UNCHANGED_MS;
+
+        if (fpChanged || tooOld) {
+            lastSendStateByKey.set(k, { fp: fingerprint, sentAt: now });
+            return true;
+        }
+
+        return false;
     }
 
     function buildLiveEnvelope(parsed, sport) {
@@ -414,6 +435,11 @@
             const sport = normalizeSport(parsed);
             if (!sport) return;
             if (sport !== 'football' && sport !== 'tennis' && sport !== 'basketball' && sport !== 'cs2' && sport !== 'dota-2' && sport !== 'league-of-legends' && sport !== 'valorant' && sport !== 'esports') {
+                return;
+            }
+
+            // Odfiltrování obvious „virtuál/efootball“ (typicky: Team (nickname))
+            if (sport === 'football' && (/(\(.+\))/.test(parsed.team1) || /(\(.+\))/.test(parsed.team2))) {
                 return;
             }
 
