@@ -4,7 +4,7 @@ Tento dokument popisuje **kanonické schéma zpráv**, které ingestuje `feed-hu
 
 Poznámky:
 - **Flashscore scrapers nejsou součástí** (nepoužíváme je).
-- Skript `FIXED_chance_scraper_v2.user.js` v této mapě **záměrně neřeším** (bude další úloha).
+- Chance ingest je řešen userscriptem `FIXED_chance_scraper_v2.user.js`.
 
 ---
 
@@ -145,7 +145,7 @@ Server-side safety net:
 Níže jsou jen zdroje, které se teď reálně používají.
 
 ### 5.1 Chance live scraper
-Soubor: `userscripts/chance_live_scraper.user.js`
+Soubor: `userscripts/FIXED_chance_scraper_v2.user.js`
 
 WS `source`: typicky `chance` (dle skriptu)
 
@@ -154,6 +154,7 @@ Posílá:
   - `bookmaker: "chance"`
   - `market: "match_winner"`
   - `sport`: multi-sport (včetně esportů jako `cs2`, `dota-2`, `league-of-legends`, `valorant`)
+  - **Pozn.:** 1X2 (3-way) trhy se **bezpečně skipují** (feed-hub dnes očekává 2-way `odds_team1/odds_team2`).
 - `type: "live_match"`
   - `score1/score2` + občas `detailed_score`
 - `type: "heartbeat"`
