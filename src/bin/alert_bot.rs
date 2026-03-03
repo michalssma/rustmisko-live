@@ -514,6 +514,7 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 1.5;
 const AUTO_BET_ODDS_ANOMALY_REF_ODDS: f64 = 1.25;
 const AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 2.50;
+const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.80;
 
 /// Odds-proportional anomaly stake: safe low odds → higher stake, risky high odds → lower
 /// Formula: base × (ref_odds / azuro_odds)^1.5
@@ -585,6 +586,7 @@ fn trim_stake(
     sport: &str,              // sport key for per-sport cap
     cross_val_multiplier: f64, // 1.0 or 1.25 — boosted stake for cross-validated bets
     sod_bankroll: f64,        // start-of-day bankroll for daily loss limit (prevents shrinking box)
+    stake_path: &str,         // "score_edge" | "anomaly" (path-aware daily budget)
 ) -> f64 {
     // Effective daily limit: min(hard_limit, tier-based cap)
     // Uses SOD bankroll so the limit doesn't shrink as you lose bets during the day
@@ -595,9 +597,15 @@ fn trim_stake(
         DAILY_LOSS_LIMIT_USD.min(sod_bankroll * daily_loss_frac)
     };
 
+    let path_daily_limit = if stake_path == "anomaly" {
+        effective_daily_limit * ANOMALY_DAILY_LIMIT_MULT
+    } else {
+        effective_daily_limit
+    };
+
     if !FF_EXPOSURE_CAPS {
         let base = calculated_stake * cross_val_multiplier;
-        return base.min((effective_daily_limit - daily_net_loss).max(0.0));
+        return base.min((path_daily_limit - daily_net_loss).max(0.0));
     }
 
     let (per_bet_frac, per_cond_frac, per_match_frac, _, inflight_frac) = get_exposure_caps(bankroll);
@@ -607,7 +615,7 @@ fn trim_stake(
 
     let cond_room = (per_cond_cap - condition_exposure).max(0.0);
     let match_room = (per_match_cap - match_exposure).max(0.0);
-    let daily_room = (effective_daily_limit - daily_net_loss).max(0.0);
+    let daily_room = (path_daily_limit - daily_net_loss).max(0.0);
 
     // Inflight cap: prevent too much capital locked in pending bets
     let inflight_room = if FF_INFLIGHT_CAP {
@@ -638,10 +646,10 @@ fn trim_stake(
     // OBSERVABILITY: log trim_stake evaluation for every bet attempt
     if final_stake < boosted_stake * 0.99 || final_stake < 0.50 {
         tracing::debug!(
-            "📊 TRIM_STAKE: raw={:.2} boosted={:.2} final={:.2} | caps: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2}",
+            "📊 TRIM_STAKE: raw={:.2} boosted={:.2} final={:.2} | caps: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} path_daily_lim={:.2} path={}",
             calculated_stake, boosted_stake, final_stake,
             per_bet_cap, cond_room, match_room, daily_room, inflight_room, sport_room,
-            sod_bankroll, bankroll, effective_daily_limit
+            sod_bankroll, bankroll, effective_daily_limit, path_daily_limit, stake_path
         );
     }
 
@@ -649,7 +657,7 @@ fn trim_stake(
     // log a full cap breakdown at INFO so we can root-cause “SCORE placed=0”.
     if calculated_stake >= 0.50 && final_stake < 0.50 {
         tracing::info!(
-            "🛡️ TRIM_TO_ZERO: raw={:.2} boosted={:.2} final={:.2} | rooms: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | inflight_total={:.2} sport_exp={:.2} cond_exp={:.2} match_exp={:.2} daily_loss={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} sport={}",
+            "🛡️ TRIM_TO_ZERO: raw={:.2} boosted={:.2} final={:.2} | rooms: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | inflight_total={:.2} sport_exp={:.2} cond_exp={:.2} match_exp={:.2} daily_loss={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} path_daily_lim={:.2} sport={} path={}",
             calculated_stake,
             boosted_stake,
             final_stake,
@@ -667,7 +675,9 @@ fn trim_stake(
             sod_bankroll,
             bankroll,
             effective_daily_limit,
-            sport
+            path_daily_limit,
+            sport,
+            stake_path
         );
     }
 
@@ -4116,7 +4126,7 @@ async fn main() -> Result<()> {
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
                                     let cv_sm = edge.cv_stake_mult;
                                     let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
-                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll);
+                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge");
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -5134,7 +5144,7 @@ async fn main() -> Result<()> {
                                         AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD, AUTO_BET_ODDS_ANOMALY_REF_ODDS,
                                         (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5));
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
-                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll);
+                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly");
 
                                     // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
                                     let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;
