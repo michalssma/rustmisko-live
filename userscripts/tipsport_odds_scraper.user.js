@@ -573,6 +573,11 @@
     // Strategy: scan character by character to find the first odds-like decimal
     // that is NOT a period/set/map/minute label.
     let garbage = text.substring(minIdx).trim();
+
+    // Step 0: strip leading main score prefix (e.g. "1:2" from "1:22.pol. - 89.min")
+    // The cutPatterns matched the score pattern at minIdx, so garbage starts with "X:Y"
+    // followed directly by the detailed info. Strip it so "1:22.pol." → "2.pol."
+    garbage = garbage.replace(/^\d{1,3}\s*:\s*\d{1,3}\s*/, '');
     
     // Step 1: strip trailing "+NN" bet count and trailing "-"
     garbage = garbage.replace(/[-]?\s*\+\d+\s*$/g, '').trim();

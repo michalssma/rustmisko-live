@@ -894,6 +894,70 @@ fn parse_ts(ts: &Option<String>) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
+/// Sanitize detailed_score: strip leading main score prefix that some scrapers leak.
+/// e.g. "1:22.pol. - 89.min" → "2.pol. - 89.min" (score "1:2" was stuck to "2.pol.")
+/// Also: "0:0Lepší ze 3" → "Lepší ze 3"
+fn sanitize_detailed_score(ds: &str) -> String {
+    // Strip leading score pattern: digits:digits optionally followed by whitespace
+    let trimmed = ds.trim();
+    if trimmed.is_empty() { return trimmed.to_string(); }
+    // Match leading N:N (1-3 digits each side)
+    let mut chars = trimmed.chars().peekable();
+    let mut pos = 0;
+    // Count leading digits
+    while chars.peek().map_or(false, |c| c.is_ascii_digit()) { chars.next(); pos += 1; }
+    if pos == 0 || pos > 3 { return trimmed.to_string(); }
+    // Expect ':'
+    if chars.peek() != Some(&':') { return trimmed.to_string(); }
+    chars.next(); pos += 1;
+    // Count digits after ':'
+    let mut d2 = 0;
+    while chars.peek().map_or(false, |c| c.is_ascii_digit()) { chars.next(); pos += 1; d2 += 1; }
+    if d2 == 0 || d2 > 3 { return trimmed.to_string(); }
+    // Optional whitespace
+    while chars.peek().map_or(false, |c| c.is_whitespace()) { chars.next(); pos += 1; }
+    // Whatever remains is the actual detailed_score
+    let rest = &trimmed[pos..];
+    if rest.is_empty() { return trimmed.to_string(); } // was just the score, keep original
+    rest.to_string()
+}
+
+/// Enrich detailed_score: if the new entry has None but the existing entry for the
+/// same key has Some(ds) that is fresh (< 120s), carry it forward.
+/// This prevents data loss when a source without detailed_score (e.g. Fortuna)
+/// overwrites a source that has it (e.g. Tipsport).
+fn enrich_detailed_score(
+    new_ds: &Option<String>,
+    existing: Option<&LiveMatchState>,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if new_ds.is_some() {
+        return new_ds.clone();
+    }
+    // New has no detailed_score — try to carry forward from existing
+    if let Some(prev) = existing {
+        let age = now.signed_duration_since(prev.seen_at).num_seconds();
+        if age < 120 {
+            if let Some(ref ds) = prev.payload.detailed_score {
+                if !ds.is_empty() {
+                    return Some(ds.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Normalize status to canonical "Live" (handles "LIVE", "live", etc.)
+fn normalize_status(s: &str) -> String {
+    let low = s.trim().to_lowercase();
+    if low == "live" || low == "živě" || low == "probíhá" {
+        "Live".to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 fn gate_odds(odds: &OddsPayload, seen_at: DateTime<Utc>) -> (bool, String) {
     // null = ok (Azuro doesn't always send liquidity/spread)
     let liquidity_ok = odds.liquidity_usd.map_or(true, |l| l >= 500.0);
@@ -1328,12 +1392,21 @@ fn parse_football_minute(detailed: &str) -> Option<i64> {
             return Some(min);
         }
     }
-    // Pattern 3: ".pol." without minute → estimate from half
-    if detailed.contains("1.pol") {
-        return Some(25); // first half, assume ~25th min
-    }
-    if detailed.contains("2.pol") {
-        return Some(65); // second half, assume ~65th min
+    // Pattern 3: "N.pol" with word boundary — match "1.pol" or "2.pol" but NOT "0:01.pol"
+    // Use regex-like check: character before digit must be whitespace, start-of-string, or non-digit
+    for (half, minute_est) in [("1.pol", 25i64), ("2.pol", 65i64)] {
+        if let Some(idx) = detailed.find(half) {
+            // Verify this is a genuine half marker, not a score prefix artifact
+            // The char before the digit should NOT be another digit or ':'
+            if idx == 0 {
+                return Some(minute_est);
+            }
+            let prev_char = detailed.as_bytes()[idx - 1];
+            if prev_char != b':' && !prev_char.is_ascii_digit() {
+                return Some(minute_est);
+            }
+            // If preceded by ':' or digit → this is a score prefix leak, skip
+        }
     }
     None
 }
@@ -1985,8 +2058,11 @@ async fn handle_fortuna_post(state: &FeedHubState, body_str: &str) -> (bool, Str
             }
         }
 
-        // Upsert live state
+        // Upsert live state (enrich detailed_score from existing entry if available)
         {
+            let mut live_w = state.live.write().await;
+            let existing = live_w.get(&key);
+            let enriched_ds = enrich_detailed_score(&None, existing, now);
             let live_entry = LiveMatchState {
                 source: source.clone(),
                 seen_at: now,
@@ -1996,12 +2072,12 @@ async fn handle_fortuna_post(state: &FeedHubState, body_str: &str) -> (bool, Str
                     team2: m.team2.clone(),
                     score1,
                     score2,
-                    detailed_score: None,
+                    detailed_score: enriched_ds,
                     status: m.status.clone(),
                     url: None,
                 },
             };
-            state.live.write().await.insert(key.clone(), live_entry);
+            live_w.insert(key.clone(), live_entry);
             live_count += 1;
         }
 
@@ -2237,7 +2313,20 @@ async fn handle_socket(
                                             warn!("live_match payload parse error from {}: {}", env_source, e);
                                             (false, format!("payload_parse_error:{}", e))
                                         }
-                                        Ok(payload) => {
+                                        Ok(mut payload) => {
+                                    // === SANITIZE: strip score prefix from detailed_score + normalize status ===
+                                    if let Some(ref ds) = payload.detailed_score {
+                                        let clean = sanitize_detailed_score(ds);
+                                        if clean != *ds {
+                                            payload.detailed_score = Some(clean);
+                                        }
+                                    }
+                                    if let Some(ref st) = payload.status {
+                                        let norm = normalize_status(st);
+                                        if norm != *st {
+                                            payload.status = Some(norm);
+                                        }
+                                    }
                                     if is_virtual_match(&payload.sport, &payload.team1, &payload.team2) {
                                         (true, "live_match_filtered_virtual".to_string())
                                     } else {
@@ -2255,14 +2344,22 @@ async fn handle_socket(
                                         );
                                     }
 
-                                    state.live.write().await.insert(
-                                        key.clone(),
-                                        LiveMatchState {
-                                            source: env_source.clone(),
-                                            seen_at,
-                                            payload: payload.clone(),
-                                        },
-                                    );
+                                    {
+                                        let mut live_w = state.live.write().await;
+                                        let existing = live_w.get(&key);
+                                        let mut final_payload = payload.clone();
+                                        final_payload.detailed_score = enrich_detailed_score(
+                                            &payload.detailed_score, existing, seen_at,
+                                        );
+                                        live_w.insert(
+                                            key.clone(),
+                                            LiveMatchState {
+                                                source: env_source.clone(),
+                                                seen_at,
+                                                payload: final_payload,
+                                            },
+                                        );
+                                    }
 
                                     let _ = db_tx.try_send(DbMsg::LiveUpsert(DbLiveRow {
                                         ts: seen_at,

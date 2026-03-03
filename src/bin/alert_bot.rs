@@ -57,6 +57,10 @@ const AUTO_BET_MIN_ODDS: f64 = 1.15;
 const AUTO_BET_MAX_ODDS: f64 = 2.50;
 /// CS2 map_winner exception: allow higher odds (score-based edge is more reliable on maps)
 const AUTO_BET_MAX_ODDS_CS2_MAP: f64 = 3.00;
+const SCORE_EDGE_STAKE_MAX_MULT: f64 = 2.5;
+const ESPORTS_MAPLEVEL_MATCH_EDGE_MIN_PCT: f64 = 16.0;
+const ESPORTS_MAPLEVEL_MATCH_MAX_ODDS: f64 = 1.65;
+const FOOTBALL_LATE_GAME_MINUTE: i32 = 70;
 /// Manual/Reaction default stake in USD
 const MANUAL_BET_DEFAULT_USD: f64 = 3.0;
 /// Manual/Reaction max odds cap (risk guard)
@@ -506,7 +510,19 @@ fn sport_auto_bet_guard(sport: &str, opp: &Opportunity) -> bool {
 
 /// Prematch odds anomaly auto-bet: ENABLED for LIVE as well
 const AUTO_BET_ODDS_ANOMALY_ENABLED: bool = true;
-const AUTO_BET_ODDS_ANOMALY_STAKE_USD: f64 = 2.0;
+const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 1.5;
+const AUTO_BET_ODDS_ANOMALY_REF_ODDS: f64 = 1.25;
+const AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR: f64 = 0.50;
+const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 2.50;
+
+/// Odds-proportional anomaly stake: safe low odds → higher stake, risky high odds → lower
+/// Formula: base × (ref_odds / azuro_odds)^1.5
+fn anomaly_stake_for_odds(azuro_odds: f64) -> f64 {
+    let scale = (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5);
+    (AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD * scale)
+        .max(AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR)
+        .min(AUTO_BET_ODDS_ANOMALY_STAKE_CAP)
+}
 
 // ====================================================================
 // EXPOSURE CAPS — Dynamic bankroll-based risk management (GPT/Gemini consensus)
@@ -520,13 +536,13 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_USD: f64 = 2.0;
 fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64, f64) {
     // Returns: (per_bet_frac, per_condition_frac, per_match_frac, daily_loss_frac, inflight_frac)
     if bankroll < 150.0 {
-        (0.05, 0.10, 0.15, 0.30, 0.45)  // micro: 5% bet, 10% cond, 15% match, 30% daily, 45% inflight
+        (0.05, 0.10, 0.15, 0.30, 0.47)  // micro: 5% bet, 10% cond, 15% match, 30% daily, 47% inflight
     } else if bankroll < 500.0 {
-        (0.03, 0.08, 0.12, 0.20, 0.40)  // small
+        (0.03, 0.08, 0.12, 0.20, 0.42)  // small
     } else if bankroll < 1500.0 {
-        (0.02, 0.06, 0.10, 0.15, 0.35)  // medium
+        (0.02, 0.06, 0.10, 0.15, 0.37)  // medium
     } else {
-        (0.015, 0.05, 0.08, 0.10, 0.30) // large
+        (0.015, 0.05, 0.08, 0.10, 0.32) // large
     }
 }
 
@@ -626,6 +642,32 @@ fn trim_stake(
             calculated_stake, boosted_stake, final_stake,
             per_bet_cap, cond_room, match_room, daily_room, inflight_room, sport_room,
             sod_bankroll, bankroll, effective_daily_limit
+        );
+    }
+
+    // IMPORTANT: When a potentially valid bet (>= $0.50) gets trimmed to $0,
+    // log a full cap breakdown at INFO so we can root-cause “SCORE placed=0”.
+    if calculated_stake >= 0.50 && final_stake < 0.50 {
+        tracing::info!(
+            "🛡️ TRIM_TO_ZERO: raw={:.2} boosted={:.2} final={:.2} | rooms: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | inflight_total={:.2} sport_exp={:.2} cond_exp={:.2} match_exp={:.2} daily_loss={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} sport={}",
+            calculated_stake,
+            boosted_stake,
+            final_stake,
+            per_bet_cap,
+            cond_room,
+            match_room,
+            daily_room,
+            inflight_room,
+            sport_room,
+            inflight_total,
+            sport_exposure,
+            condition_exposure,
+            match_exposure,
+            daily_net_loss,
+            sod_bankroll,
+            bankroll,
+            effective_daily_limit,
+            sport
         );
     }
 
@@ -1043,6 +1085,8 @@ struct ScoreEdge {
     /// Current live score
     score1: i32,
     score2: i32,
+    /// Raw live status string (e.g. "76'", "2. pol", "Half-time")
+    live_status: String,
     /// Previous score (before change)
     prev_score1: i32,
     prev_score2: i32,
@@ -1477,27 +1521,37 @@ fn score_to_win_prob(leading_score: i32, losing_score: i32) -> Option<f64> {
 
     if max_score > 3 {
         // ROUND scores within a map (CS2 MR12: first to 13)
-        // BUG FIX: Round-level leads predict MAP wins, NOT MATCH wins.
-        // The old `* 0.55` conversion was fabricated and empirically wrong:
-        //   - fluxo_vs_oddik: 3 match_winner bets from round leads → ALL LOST
-        //   - liquid_vs_lyon: match_winner from round lead → LOST
-        // Round edges should ONLY generate map_winner bets (via find_score_edges
-        // STEP 1). If no map_winner market exists, we skip entirely.
-        // Returning None here ensures match_winner fallback never triggers
-        // from round-level scores.
+        // Round-level leads predict MAP wins, NOT MATCH wins.
+        // Round edges should ONLY generate map_winner bets (STEP 1).
+        // Returning None ensures match_winner fallback never triggers.
         return None;
     } else {
         // MAP scores (Bo3/Bo5 format)
-        // IMPORTANT: (1, 0) is REMOVED — in CS2/LoL Bo3, winning map 1
-        // means you won YOUR MAP PICK (expected). Opponent plays their pick
-        // on map 2 → effectively ~55% not 68%. Azuro odds at 1.90-2.00 are
-        // CORRECT, not stale. Real edge is only 5%, not 17%.
-        // Only map_winner with ROUND-level edges (diff >= 3) are profitable.
+        // (1, 0) RE-ENABLED at conservative 58%: map pick advantage is real
+        // but small. With sanitized data + min_edge 12%, this only triggers
+        // when Azuro odds are genuinely stale (implied < 46%).
         match (leading_score, losing_score) {
+            (1, 0) => Some(0.58),  // Won 1 map → ~58% (conservative)
             (2, 0) => None,        // Already won → too late
             (2, 1) => None,        // Already won
-            _ => None,             // (1,0) = won 1 map pick → no reliable edge
+            _ => None,
         }
+    }
+}
+
+/// LoL / Valorant map score → win probability (Bo3/Bo5).
+/// Separate from CS2 because the map-pick dynamics differ slightly.
+///   LoL Bo3: teams ban/pick champions per game, map pick less relevant
+///   Valorant Bo3: map veto similar to CS2
+/// Conservative: (1,0) → 58% (same as CS2 for now)
+fn map_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
+    if leading <= losing { return None; }
+    match (leading, losing) {
+        (1, 0) => Some(0.58),  // Won 1 map/game in Bo3
+        (2, 0) => None,        // Already won
+        (2, 1) => None,        // Already won
+        (3, 0) | (3, 1) | (3, 2) => None, // Bo5 won
+        _ => None,
     }
 }
 
@@ -1564,6 +1618,88 @@ fn football_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
     }
 }
 
+fn parse_football_minute(status: &str) -> Option<i32> {
+    let lower = status.to_lowercase();
+    if lower.contains("poločas") || lower.contains("half") {
+        return Some(45);
+    }
+
+    let mut digits = String::new();
+    let mut started = false;
+    for ch in status.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            started = true;
+        } else if started {
+            break;
+        }
+    }
+
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<i32>().ok()
+    }
+}
+
+fn score_edge_stake_multiplier(edge: &ScoreEdge, sport: &str, azuro_odds: f64) -> f64 {
+    let edge_mult: f64 = if edge.edge_pct >= 25.0 {
+        1.8
+    } else if edge.edge_pct >= 20.0 {
+        1.5
+    } else if edge.edge_pct >= 16.0 {
+        1.3
+    } else {
+        1.0
+    };
+
+    let phase_mult: f64 = match sport {
+        "football" => {
+            let goal_diff = (edge.score1 - edge.score2).abs();
+            if goal_diff >= 2 {
+                1.3
+            } else if goal_diff >= 1 {
+                if parse_football_minute(&edge.live_status).map_or(false, |m| m >= FOOTBALL_LATE_GAME_MINUTE) {
+                    1.5
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            }
+        }
+        "cs2" | "esports" | "lol" | "dota-2" | "valorant" | "league-of-legends" => {
+            if let Some(ref detailed) = edge.detailed_score {
+                if let Some((r1, r2)) = parse_esports_round_score(detailed) {
+                    let total_rounds = r1 + r2;
+                    if total_rounds >= 20 {
+                        1.6
+                    } else if total_rounds >= 16 {
+                        1.45
+                    } else if total_rounds >= 12 {
+                        1.25
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    };
+
+    let mut mult: f64 = (edge_mult * phase_mult).min(SCORE_EDGE_STAKE_MAX_MULT);
+    if azuro_odds >= 2.1 {
+        mult = mult.min(1.2);
+    } else if azuro_odds >= 1.8 {
+        mult = mult.min(1.4);
+    }
+    mult
+}
+
 /// Dota-2 kill score → estimated win probability.
 /// Kill leads in Dota-2 correlate with gold/XP advantage.
 /// Requires significant lead to be actionable (kills swing fast).
@@ -1607,34 +1743,46 @@ fn basketball_score_to_win_prob(leading: i32, losing: i32) -> Option<f64> {
     // Early game (< 30 total) — leads are volatile
     if total < 30 {
         return match diff {
-            1..=2  => None,            // Too close early
-            3..=4  => Some(0.55),
-            5..=9  => Some(0.60),
+            1..=3  => None,            // Too close early
+            4..=6  => Some(0.56),
+            7..=9  => Some(0.60),
             10..=14 => Some(0.67),
             _ => Some(0.75),           // 15+ early
         };
     }
 
-    // Mid game (30-80 total)
+    // Mid game (30-80 total) — leads start to matter
     if total < 80 {
         return match diff {
             1..=2  => None,            // Small lead, high variance
-            3..=4  => Some(0.58),
-            5..=9  => Some(0.62),
+            3..=5  => Some(0.57),
+            6..=9  => Some(0.63),
             10..=14 => Some(0.72),
             15..=19 => Some(0.80),
             _ => Some(0.87),           // 20+ mid
         };
     }
 
-    // Late game (80+ total) — leads are decisive
+    // Late game (80-140 total) — leads are more decisive
+    if total < 140 {
+        return match diff {
+            1..=2  => None,
+            3..=4  => Some(0.60),
+            5..=7  => Some(0.66),
+            8..=12 => Some(0.76),
+            13..=17 => Some(0.85),
+            _ => Some(0.91),           // 18+ late
+        };
+    }
+
+    // Very late game (140+ total, ~4th quarter) — leads are decisive
     match diff {
         1..=2  => None,
-        3..=4  => Some(0.62),
-        5..=9  => Some(0.68),
-        10..=14 => Some(0.80),
-        15..=19 => Some(0.88),
-        _ => Some(0.93),               // 20+ late game
+        3..=4  => Some(0.63),
+        5..=7  => Some(0.70),
+        8..=12 => Some(0.82),
+        13..=17 => Some(0.90),
+        _ => Some(0.95),               // 18+ very late
     }
 }
 
@@ -1828,12 +1976,20 @@ fn find_score_edges(
         let is_basketball = match_key.starts_with("basketball::");
         let is_mma = match_key.starts_with("mma::");
 
-        // ⛔ FOOTBALL SCORE-EDGE DISABLED — single-source Tipsport data unreliable
-        // for obscure leagues (J3 League, Australian NPL), no cross-validation.
-        // Campbelltown vs Metro Stars LOST despite 85% model prob → model/data broken.
+        // Football: RE-ENABLED with detailed_score minute guard.
+        // Previous bug (Campbelltown loss) was caused by corrupted detailed_score prefix
+        // leak — minute parser returned wrong half → wrong fair probability.
+        // Now fixed: sanitize_detailed_score() + parse_football_minute() word-boundary fix.
+        // Guard: REQUIRE parseable minute from detailed_score (= reliable data).
+        let is_lol = match_key.starts_with("league-of-legends::");
+        let is_valorant = match_key.starts_with("valorant::");
         if is_football {
-            info!("  ⏭️ {} {}-{}: football score-edge DISABLED (single-source risk)", match_key, s1, s2);
-            continue;
+            let ds = live.payload.detailed_score.as_deref().unwrap_or("");
+            let has_minute = ds.contains(".min") || ds.contains("min.") || ds.contains("poločas") || ds.contains("pol.");
+            if !has_minute {
+                info!("  ⏭️ {} {}-{}: football score-edge SKIPPED (no minute in detailed_score: '{}')", match_key, s1, s2, ds);
+                continue;
+            }
         }
 
         let expected_prob = if is_tennis {
@@ -1863,6 +2019,19 @@ fn find_score_edges(
                 None => {
                     info!("  ⏭️ {} {}-{}: dota-2 score not actionable (diff={}, total={})",
                         match_key, s1, s2, leading_maps - losing_maps, s1 + s2);
+                    continue;
+                }
+            }
+        } else if is_lol || is_valorant {
+            // LoL / Valorant: Bo3/Bo5 MAP scores (same model as CS2 maps)
+            // LoL: map (game) scores 0-2 in Bo3, 0-3 in Bo5
+            // Valorant: map scores 0-2 in Bo3
+            // (1,0) = won 1 map → ~58% (map pick advantage, less than CS2)
+            match map_score_to_win_prob(leading_maps, losing_maps) {
+                Some(p) => p,
+                None => {
+                    info!("  ⏭️ {} {}-{}: {} map score not actionable",
+                        match_key, s1, s2, if is_lol { "LoL" } else { "Valorant" });
                     continue;
                 }
             }
@@ -2132,6 +2301,7 @@ fn find_score_edges(
                         team2: live.payload.team2.clone(),
                         score1: s1,
                         score2: s2,
+                        live_status: live.payload.status.clone(),
                         prev_score1: prev_s1,
                         prev_score2: prev_s2,
                         leading_side,
@@ -2276,6 +2446,7 @@ fn find_score_edges(
             team2: live.payload.team2.clone(),
             score1: s1,
             score2: s2,
+            live_status: live.payload.status.clone(),
             prev_score1: prev_s1,
             prev_score2: prev_s2,
             leading_side,
@@ -3636,13 +3807,13 @@ async fn main() -> Result<()> {
                  <b>Path B — Odds Anomaly:</b>\n   \
                  Favorit-only, HIGH conf, sources ≥{}\n   \
                  Tennis: set_diff≥1 | Football: ON | Basketball: ON\n   \
-                 Stake: ${:.0} | Identická odds blokována\n\n\
+                 Stake: ${:.1}×(1.25/odds)^1.5 | Identická odds blokována\n\n\
                  <b>Sdílené limity:</b>\n   \
                  Odds: {:.2}–{:.2} | Stake: ${:.0}\n   \
                  Daily loss: ${:.0} | Watchdog: {}s\n\
                  💰 <b>AUTO-CLAIM: ON</b> (každých {}s)",
                 AUTO_BET_MIN_MARKET_SOURCES,
-                AUTO_BET_ODDS_ANOMALY_STAKE_USD,
+                AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD,
                 AUTO_BET_MIN_ODDS, AUTO_BET_MAX_ODDS, AUTO_BET_STAKE_USD,
                 DAILY_LOSS_LIMIT_USD, WATCHDOG_TIMEOUT_SECS,
                 CLAIM_CHECK_SECS)
@@ -3933,7 +4104,10 @@ async fn main() -> Result<()> {
                                     let (sport_auto_allowed, sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
                                     let base_stake = dynamic_base_stake(current_bankroll, sport);
-                                    let raw_stake = base_stake * sport_multiplier;
+                                    let score_stake_mult = score_edge_stake_multiplier(edge, sport, azuro_odds);
+                                    let raw_stake = base_stake * sport_multiplier * score_stake_mult;
+                                    info!("📈 SCORE STAKE MULT: {} edge={:.1}% sport={} odds={:.2} mult={:.2} raw=${:.2}",
+                                        edge.match_key, edge.edge_pct, sport, azuro_odds, score_stake_mult, raw_stake);
 
                                     // === EXPOSURE CAPS + STAKE TRIMMER ===
                                     let cond_exp = condition_exposure.get(&cond_id_str).copied().unwrap_or(0.0);
@@ -3970,9 +4144,17 @@ async fn main() -> Result<()> {
                                             set_diff >= 1
                                         }
                                         "football" => {
-                                            // Only auto-bet when goal_diff >= 2
+                                            // Auto-bet when goal_diff >=2 OR goal_diff=1 in late game (70'+)
                                             let goal_diff = (edge.score1 - edge.score2).abs();
-                                            goal_diff >= 2
+                                            if goal_diff >= 2 {
+                                                true
+                                            } else if goal_diff >= 1 {
+                                                parse_football_minute(&edge.live_status)
+                                                    .map(|m| m >= FOOTBALL_LATE_GAME_MINUTE)
+                                                    .unwrap_or(false)
+                                            } else {
+                                                false
+                                            }
                                         }
                                         // ESPORTS guard: BLOCK match_winner auto-bet on map-level scores!
                                         // In Bo3 (CS2/LoL/Dota), score 1-0 means won your map pick → no real edge.
@@ -3983,12 +4165,21 @@ async fn main() -> Result<()> {
                                             if is_map_winner_bet {
                                                 true // map_winner bets (round-level edges) are always OK
                                             } else {
-                                                // match_winner: only allow if score is round-level (max > 3)
+                                                // match_winner: allow map-level only when edge is very strong and odds are safer
                                                 let max_s = edge.score1.max(edge.score2);
                                                 if max_s <= 3 {
-                                                    info!("🛡️ ESPORTS GUARD: {} score {}-{} is MAP-LEVEL — blocking match_winner auto-bet (use map_winner instead)",
-                                                        edge.match_key, edge.score1, edge.score2);
-                                                    false
+                                                    let allow_maplevel_match = edge.edge_pct >= ESPORTS_MAPLEVEL_MATCH_EDGE_MIN_PCT
+                                                        && azuro_odds <= ESPORTS_MAPLEVEL_MATCH_MAX_ODDS;
+                                                    if !allow_maplevel_match {
+                                                        info!("🛡️ ESPORTS GUARD: {} score {}-{} is MAP-LEVEL — blocking match_winner (needs edge≥{:.0}% and odds≤{:.2})",
+                                                            edge.match_key, edge.score1, edge.score2,
+                                                            ESPORTS_MAPLEVEL_MATCH_EDGE_MIN_PCT,
+                                                            ESPORTS_MAPLEVEL_MATCH_MAX_ODDS);
+                                                    } else {
+                                                        info!("✅ ESPORTS MAP-LEVEL OVERRIDE: {} edge={:.1}% odds={:.2} — allowing match_winner auto-bet",
+                                                            edge.match_key, edge.edge_pct, azuro_odds);
+                                                    }
+                                                    allow_maplevel_match
                                                 } else {
                                                     true // round-level scores (e.g. 10-4) → OK for match_winner
                                                 }
@@ -4122,7 +4313,7 @@ async fn main() -> Result<()> {
                                     }
                                     // DEBUG: log ALL reasons when auto-bet is blocked but edge is high
                                     if !should_auto_bet && edge.confidence == "HIGH" && edge.edge_pct >= 10.0 {
-                                        info!("🔍 AUTO-BET BLOCKED for {} edge={:.1}%: enabled={} sport_ok={} market_ok={} guard_ok={} daily_ok={} safe={} conf={} min_edge={:.1} odds={:.2} min={:.2} max={:.2} cond={} out={} dedup={} esports_block={}",
+                                        info!("🔍 AUTO-BET BLOCKED for {} edge={:.1}%: enabled={} sport_ok={} market_ok={} guard_ok={} daily_ok={} safe_mode={} conf={} min_edge={:.1} odds={:.2} min={:.2} max={:.2} cond={} out={} dedup={} esports_block={}",
                                             edge.match_key, edge.edge_pct,
                                             AUTO_BET_ENABLED, sport_auto_allowed, is_preferred_market, sport_guard_ok,
                                             within_daily_limit, safe_mode, edge.confidence, sport_min_edge,
@@ -4937,7 +5128,11 @@ async fn main() -> Result<()> {
                                     let anomaly_sport = match_key_for_bet.split("::").next().unwrap_or("?");
                                     let anomaly_sport_exp = sport_exposure.get(anomaly_sport).copied().unwrap_or(0.0);
                                     let anomaly_daily_loss = (daily_wagered - daily_returned).max(0.0);
-                                    let anomaly_raw_stake = AUTO_BET_ODDS_ANOMALY_STAKE_USD;
+                                    let anomaly_raw_stake = anomaly_stake_for_odds(azuro_odds);
+                                    info!("📐 ODDS-PROP STAKE: {} odds={:.2} → raw_stake=${:.2} (base={:.1} ref={:.2} scale={:.3})",
+                                        anomaly.match_key, azuro_odds, anomaly_raw_stake,
+                                        AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD, AUTO_BET_ODDS_ANOMALY_REF_ODDS,
+                                        (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5));
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
                                         inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll);
 
@@ -6381,6 +6576,10 @@ async fn main() -> Result<()> {
                 // Remove settled bets from active list
                 active_bets.retain(|b| !bets_to_remove.contains(&b.bet_id));
 
+                // Keep inflight cap grounded in reality: total USD currently locked
+                // in pending/claimable/on-chain + in-flight bets (NOT cumulative daily wagered).
+                inflight_wagered_total = active_bets.iter().map(|b| b.amount_usd).sum();
+
                 // Rewrite pending_claims file when bets removed OR tokenIds discovered
                 if !bets_to_remove.is_empty() || needs_pending_rewrite {
                     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -6658,6 +6857,9 @@ async fn main() -> Result<()> {
                             warn!("⚠️ INVARIANT MISMATCH: local on-chain verified={} vs on-chain pending+claimable={} — investigate!",
                                 local_onchain_count, onchain_count);
                         }
+
+                        // Sync inflight cap total after reconcile changes
+                        inflight_wagered_total = active_bets.iter().map(|b| b.amount_usd).sum();
                     }
                 }
 
