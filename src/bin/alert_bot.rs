@@ -89,6 +89,9 @@ const DEDUP_HISTORY_LOOKBACK_HOURS: i64 = 8;
 /// If condition_age_ms > this, DROP before sending to executor
 /// ROLLBACK: set to 999_999 to effectively disable pre-flight gate
 const CONDITION_MAX_AGE_MS: u64 = 2000;
+/// Base chain poll cadence is much slower than Polygon WS/GQL cadence.
+/// Without a separate threshold, Base opportunities are always dropped as stale.
+const CONDITION_MAX_AGE_MS_BASE: u64 = 120_000;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
 /// ROLLBACK: set to 999_999 to effectively disable pipeline budget
 const PIPELINE_BUDGET_MS: u64 = 1200;
@@ -118,6 +121,16 @@ const LOSS_STREAK_PAUSE_THRESHOLD: usize = 3;
 const LOSS_STREAK_PAUSE_SECS: u64 = 300;
 /// Minimum bankroll to allow auto-bet (skip if below)
 const MIN_BANKROLL_USD: f64 = 20.0;
+
+fn condition_max_age_limit_ms(chain: Option<&str>, azuro_bookmaker: &str) -> u64 {
+    let chain_l = chain.unwrap_or("").to_lowercase();
+    let bookmaker_l = azuro_bookmaker.to_lowercase();
+    if chain_l == "base" || bookmaker_l.contains("azuro_base") {
+        CONDITION_MAX_AGE_MS_BASE
+    } else {
+        CONDITION_MAX_AGE_MS
+    }
+}
 /// === RISK MANAGEMENT ===
 /// Daily settled-loss limit HARD ceiling — min(this, tier_daily_cap) is effective limit
 const DAILY_LOSS_LIMIT_USD: f64 = 30.0;
@@ -4129,6 +4142,10 @@ async fn main() -> Result<()> {
                                         let condition_age_ms = condition_last_seen.get(&condition_id)
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
+                                        let condition_max_age_ms = condition_max_age_limit_ms(
+                                            anomaly.chain.as_deref(),
+                                            &edge.azuro_bookmaker,
+                                        );
 
                                         // === PRE-FLIGHT GATE: WS-first with GQL fallback ===
                                         // Priority: WS real-time state > GQL poll staleness
@@ -4145,7 +4162,7 @@ async fn main() -> Result<()> {
                                                 let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
                                                 // SPEED-FIRST: pokud je GQL fresh, nečekáme vůbec (minimalizace odds slippage).
                                                 // Pokud je GQL stale, dáme krátký probe, ať WS stihne dorazit.
-                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms > condition_max_age_ms {
                                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                                     ws_result = {
                                                         let cache_r = ws_condition_cache.read().await;
@@ -4189,7 +4206,7 @@ async fn main() -> Result<()> {
                                             WsGateResult::Stale { age_ms } => {
                                                 ws_gate_stale_fallback_count += 1;
                                                 // WS data stale → fallback to GQL age check
-                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms > condition_max_age_ms {
                                                     warn!("🚫 PRE-FLIGHT #{}: WsStale({}ms)+GqlStale({}ms) — dropping",
                                                         aid, age_ms, condition_age_ms);
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
@@ -4214,7 +4231,7 @@ async fn main() -> Result<()> {
                                             WsGateResult::NoData => {
                                                 ws_gate_nodata_fallback_count += 1;
                                                 // No WS data → fallback to GQL age check
-                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms > condition_max_age_ms {
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": match_key_for_bet,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
@@ -4235,9 +4252,9 @@ async fn main() -> Result<()> {
                                             }
                                             WsGateResult::Disabled => {
                                                 // WS gate disabled → fallback to GQL gate
-                                                if condition_age_ms > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms > condition_max_age_ms {
                                                     warn!("🚫 PRE-FLIGHT GATE #{}: condition {} [WsDisabled->GqlStale] gql_age={}ms > {}ms — dropping",
-                                                        aid, &condition_id, condition_age_ms, CONDITION_MAX_AGE_MS);
+                                                        aid, &condition_id, condition_age_ms, condition_max_age_ms);
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": match_key_for_bet,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
@@ -4509,7 +4526,7 @@ async fn main() -> Result<()> {
                                                             break; // exit retry loop
                                                         } else {
                                                             auto_bet_count += 1;
-                                                            // daily_wagered += stake; // REMOVED: Only count settled losses
+                                                            daily_wagered += stake;
                                                             // Persist daily P&L
                                                             {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -5070,6 +5087,10 @@ async fn main() -> Result<()> {
                                         let condition_age_ms_b = condition_last_seen.get(&condition_id)
                                             .map(|ts| ts.elapsed().as_millis() as u64)
                                             .unwrap_or(999999);
+                                        let condition_max_age_ms_b = condition_max_age_limit_ms(
+                                            anomaly.chain.as_deref(),
+                                            &anomaly.azuro_bookmaker,
+                                        );
 
                                         // === PRE-FLIGHT GATE (Path B): WS-first with GQL fallback ===
                                         let mut ws_result_b = {
@@ -5082,7 +5103,7 @@ async fn main() -> Result<()> {
                                             if matches!(ws_result_b, WsGateResult::NoData | WsGateResult::Stale { .. }) {
                                                 let _ = ws_sub_tx.try_send(vec![condition_id.clone()]);
                                                 // SPEED-FIRST: při GQL fresh nečekat; při GQL stale krátký probe pro WS.
-                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms_b > condition_max_age_ms_b {
                                                     tokio::time::sleep(Duration::from_millis(50)).await;
                                                     ws_result_b = {
                                                         let cache_r = ws_condition_cache.read().await;
@@ -5126,7 +5147,7 @@ async fn main() -> Result<()> {
                                             WsGateResult::Stale { age_ms } => {
                                                 ws_gate_stale_fallback_count += 1;
                                                 // WS data stale → fallback to GQL age check
-                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms_b > condition_max_age_ms_b {
                                                     warn!("🚫 PRE-FLIGHT ODDS #{}: WsStale({}ms)+GqlStale({}ms) — dropping",
                                                         aid, age_ms, condition_age_ms_b);
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
@@ -5151,7 +5172,7 @@ async fn main() -> Result<()> {
                                             WsGateResult::NoData => {
                                                 ws_gate_nodata_fallback_count += 1;
                                                 // No WS data → fallback to GQL age check
-                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms_b > condition_max_age_ms_b {
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": anomaly.match_key,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
@@ -5172,9 +5193,9 @@ async fn main() -> Result<()> {
                                             }
                                             WsGateResult::Disabled => {
                                                 // WS gate disabled → fallback to GQL gate
-                                                if condition_age_ms_b > CONDITION_MAX_AGE_MS {
+                                                if condition_age_ms_b > condition_max_age_ms_b {
                                                     warn!("🚫 PRE-FLIGHT GATE ODDS #{}: condition {} [WsDisabled->GqlStale] gql_age={}ms > {}ms — dropping",
-                                                        aid, &condition_id, condition_age_ms_b, CONDITION_MAX_AGE_MS);
+                                                        aid, &condition_id, condition_age_ms_b, condition_max_age_ms_b);
                                                     ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                         "alert_id": aid, "match_key": anomaly.match_key,
                                                         "condition_id": condition_id, "outcome_id": outcome_id,
@@ -5421,7 +5442,7 @@ async fn main() -> Result<()> {
                                                             break;
                                                         } else {
                                                             auto_bet_count += 1;
-                                                            // daily_wagered += stake; // REMOVED: Only count settled losses
+                                                            daily_wagered += stake;
                                                             // Persist daily P&L
                                                             {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();

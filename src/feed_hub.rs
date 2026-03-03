@@ -24,7 +24,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -197,6 +197,7 @@ struct FeedHubState {
     odds: Arc<RwLock<HashMap<OddsKey, OddsState>>>,
     connections: Arc<RwLock<usize>>,
     alias_cache: AliasCache,
+    ingest_lock: Arc<Mutex<()>>,
 }
 
 impl FeedHubState {
@@ -206,6 +207,7 @@ impl FeedHubState {
             odds: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(0)),
             alias_cache: new_alias_cache(),
+            ingest_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -273,6 +275,71 @@ fn normalize_sport(sport: &str) -> String {
         "házenou" | "handbal" => "handball".to_string(),
         _ => s,
     }
+}
+
+fn has_virtual_gamertag(team: &str) -> bool {
+    let start = match team.find('(') {
+        Some(v) => v,
+        None => return false,
+    };
+    let end = match team[start + 1..].find(')') {
+        Some(v) => start + 1 + v,
+        None => return false,
+    };
+    if end <= start + 1 {
+        return false;
+    }
+    let inside = team[start + 1..end].trim().to_lowercase();
+    if inside.is_empty() {
+        return false;
+    }
+
+    let safe_tags = ["w", "women", "u19", "u20", "u21", "u23"];
+    if safe_tags.contains(&inside.as_str()) {
+        return false;
+    }
+
+    inside.chars().any(|c| c.is_ascii_digit())
+        || (inside.len() >= 4 && inside.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
+}
+
+fn alpha_name_probe(name: &str) -> String {
+    strip_diacritics(name)
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphabetic())
+        .collect()
+}
+
+fn looks_virtual_football_z_wrapper(team1: &str, team2: &str) -> bool {
+    let t1 = alpha_name_probe(team1);
+    let t2 = alpha_name_probe(team2);
+    if t1.len() < 5 || t2.len() < 5 {
+        return false;
+    }
+    let both_end_z = t1.ends_with('z') && t2.ends_with('z');
+    let any_start_z = t1.starts_with('z') || t2.starts_with('z');
+    both_end_z && any_start_z
+}
+
+fn is_virtual_match(sport: &str, team1: &str, team2: &str) -> bool {
+    let s = normalize_sport(sport);
+
+    if matches!(s.as_str(), "efootball" | "ebasketball" | "etennis" | "eicehockey" | "esoccer" | "virtual") {
+        return true;
+    }
+
+    if matches!(s.as_str(), "football" | "basketball" | "tennis" | "ice-hockey") {
+        if has_virtual_gamertag(team1) || has_virtual_gamertag(team2) {
+            return true;
+        }
+    }
+
+    if s == "football" && looks_virtual_football_z_wrapper(team1, team2) {
+        return true;
+    }
+
+    false
 }
 
 /// Translate Czech country/team names to English equivalents.
@@ -1362,11 +1429,60 @@ fn team_name_equivalent(a: &str, b: &str) -> bool {
         return true;
     }
 
+    if one_edit_apart(a, b) {
+        return true;
+    }
+
     let sim = bigram_jaccard_similarity(a, b);
     let common_prefix = common_prefix_len(a, b);
 
     // Strict threshold, with fallback when strong common prefix exists.
     sim >= 0.70 || (sim >= 0.55 && common_prefix >= 4)
+}
+
+fn one_edit_apart(a: &str, b: &str) -> bool {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    let al = ab.len();
+    let bl = bb.len();
+
+    if al == 0 || bl == 0 {
+        return false;
+    }
+    if al.abs_diff(bl) > 1 {
+        return false;
+    }
+
+    if al == bl {
+        let mut diffs = 0usize;
+        for i in 0..al {
+            if ab[i] != bb[i] {
+                diffs += 1;
+                if diffs > 1 {
+                    return false;
+                }
+            }
+        }
+        return diffs == 1;
+    }
+
+    let (shorter, longer) = if al < bl { (ab, bb) } else { (bb, ab) };
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut edits = 0usize;
+    while i < shorter.len() && j < longer.len() {
+        if shorter[i] == longer[j] {
+            i += 1;
+            j += 1;
+        } else {
+            edits += 1;
+            if edits > 1 {
+                return false;
+            }
+            j += 1;
+        }
+    }
+    true
 }
 
 fn common_prefix_len(a: &str, b: &str) -> usize {
@@ -1804,6 +1920,15 @@ async fn handle_fortuna_post(state: &FeedHubState, body_str: &str) -> (bool, Str
 
     for m in &inbound.matches {
         let sport = &m.sport;
+        if is_virtual_match(sport, &m.team1, &m.team2) {
+            debug!(
+                "[FORTUNA] virtual match filtered sport={} team1={} team2={}",
+                sport, m.team1, m.team2
+            );
+            continue;
+        }
+
+        let _ingest_guard = state.ingest_lock.lock().await;
         let raw_key = match_key(sport, &m.team1, &m.team2);
         let key = canonicalize_match_key_ingest(state, &raw_key).await;
 
@@ -2105,8 +2230,18 @@ async fn handle_socket(
                             let env_source = env.source.clone();
                             match env.msg_type {
                                 FeedMessageType::LiveMatch => {
-                                    let payload: LiveMatchPayload = serde_json::from_value(env.payload)
-                                        .context("invalid live_match payload")?;
+                                    match serde_json::from_value::<LiveMatchPayload>(env.payload)
+                                        .context("invalid live_match payload")
+                                    {
+                                        Err(e) => {
+                                            warn!("live_match payload parse error from {}: {}", env_source, e);
+                                            (false, format!("payload_parse_error:{}", e))
+                                        }
+                                        Ok(payload) => {
+                                    if is_virtual_match(&payload.sport, &payload.team1, &payload.team2) {
+                                        (true, "live_match_filtered_virtual".to_string())
+                                    } else {
+                                    let _ingest_guard = state.ingest_lock.lock().await;
                                     let seen_at = parse_ts(&env.ts);
                                     let raw_key = match_key(&payload.sport, &payload.team1, &payload.team2);
                                     let key = canonicalize_match_key_ingest(&state, &raw_key).await;
@@ -2140,10 +2275,23 @@ async fn handle_socket(
                                     }));
 
                                     (true, "live_match_ingested".to_string())
+                                    }
+                                        }
+                                    }
                                 }
                                 FeedMessageType::Odds => {
-                                    let payload: OddsPayload = serde_json::from_value(env.payload)
-                                        .context("invalid odds payload")?;
+                                    match serde_json::from_value::<OddsPayload>(env.payload)
+                                        .context("invalid odds payload")
+                                    {
+                                        Err(e) => {
+                                            warn!("odds payload parse error from {}: {}", env_source, e);
+                                            (false, format!("payload_parse_error:{}", e))
+                                        }
+                                        Ok(payload) => {
+                                    if is_virtual_match(&payload.sport, &payload.team1, &payload.team2) {
+                                        (true, "odds_filtered_virtual".to_string())
+                                    } else {
+                                    let _ingest_guard = state.ingest_lock.lock().await;
                                     let seen_at = parse_ts(&env.ts);
                                     let raw_key = match_key(&payload.sport, &payload.team1, &payload.team2);
                                     let key = canonicalize_match_key_ingest(&state, &raw_key).await;
@@ -2224,6 +2372,9 @@ async fn handle_socket(
                                         (true, format!("odds_ingested_gated:{}", why))
                                     } else {
                                         (true, format!("odds_ingested_rejected:{}", why))
+                                    }
+                                    }
+                                        }
                                     }
                                 }
                                 FeedMessageType::Heartbeat => (true, "heartbeat".to_string()),
