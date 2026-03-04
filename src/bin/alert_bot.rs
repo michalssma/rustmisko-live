@@ -14,6 +14,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
@@ -1090,6 +1091,8 @@ impl ScoreTracker {
 /// Score edge alert — Azuro odds haven't adjusted to live score
 struct ScoreEdge {
     match_key: String,
+    /// Sport prefix used for Azuro odds lookup (may differ from match_key prefix for generic esports:: keys)
+    resolved_sport: Option<String>,
     team1: String,
     team2: String,
     /// Current live score
@@ -2209,6 +2212,7 @@ fn find_score_edges(
             None
         };
         let odds_lookup_key: &str = resolved_alt_key.as_deref().unwrap_or(match_key);
+        let resolved_sport_for_odds: &str = odds_lookup_key.split("::").next().unwrap_or("");
         if resolved_alt_key.is_some() {
             info!("  🔗 {} → esports→Azuro resolved: {}", match_key, odds_lookup_key);
         }
@@ -2307,6 +2311,7 @@ fn find_score_edges(
 
                     edges.push(ScoreEdge {
                         match_key: format!("{}::{}", match_key, mw.market),
+                        resolved_sport: Some(resolved_sport_for_odds.to_string()),
                         team1: live.payload.team1.clone(),
                         team2: live.payload.team2.clone(),
                         score1: s1,
@@ -2452,6 +2457,7 @@ fn find_score_edges(
 
         edges.push(ScoreEdge {
             match_key: match_key.to_string(),
+            resolved_sport: Some(resolved_sport_for_odds.to_string()),
             team1: live.payload.team1.clone(),
             team2: live.payload.team2.clone(),
             score1: s1,
@@ -3487,6 +3493,9 @@ async fn main() -> Result<()> {
     // Manual alert throttle per match_key (anti-spam)
     let mut manual_offer_last_sent: HashMap<String, DateTime<Utc>> = HashMap::new();
     let mut active_bets: Vec<ActiveBet> = Vec::new();
+    // Tokens that are already settled in subgraph but not yet claimable on-chain.
+    // These should NOT block new bets via MAX_CONCURRENT_PENDING (no longer risk exposure).
+    let mut deferred_claim_tokens: HashSet<String> = HashSet::new();
     let mut score_tracker = ScoreTracker::new();
     // In-flight dedup: condition IDs currently being sent to executor (prevents race condition
     // where two score edges for same match arrive in same poll tick before executor responds)
@@ -3603,6 +3612,192 @@ async fn main() -> Result<()> {
         }
     };
 
+    // === SQLITE LEDGER MIRROR (optional) ===
+    // Goal: hard, queryable 48h dataset: edge %, source count, fill result, P&L.
+    // Keeps existing JSONL ledger as the source-of-truth.
+    fn env_bool(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(v) => {
+                let s = v.trim().to_ascii_lowercase();
+                !(s == "0" || s == "false" || s == "off" || s == "no")
+            }
+            Err(_) => default,
+        }
+    }
+
+    let sqlite_ledger_tx: Option<mpsc::UnboundedSender<serde_json::Value>> = if env_bool("BET_SQLITE", true) {
+        let db_path = std::env::var("BET_SQLITE_PATH").unwrap_or_else(|_| "data/bets.sqlite".to_string());
+        let db_path_for_thread = db_path.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        std::thread::spawn(move || {
+            let conn = match Connection::open(&db_path_for_thread) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[sqlite] open failed: {} err={}", db_path_for_thread, e);
+                    return;
+                }
+            };
+
+            let _ = conn.pragma_update(None, "journal_mode", "WAL");
+            let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+            let _ = conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS bet_events(\
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,\
+                    ts TEXT,\
+                    event TEXT,\
+                    bet_id TEXT,\
+                    alert_id INTEGER,\
+                    match_key TEXT,\
+                    path TEXT,\
+                    odds REAL,\
+                    stake_usd REAL,\
+                    edge_pct REAL,\
+                    source_count INTEGER,\
+                    on_chain_state TEXT,\
+                    payout_usd REAL,\
+                    amount_usd REAL,\
+                    error TEXT,\
+                    raw_json TEXT NOT NULL\
+                );\
+                CREATE INDEX IF NOT EXISTS idx_bet_events_bet_id ON bet_events(bet_id);\
+                CREATE INDEX IF NOT EXISTS idx_bet_events_ts ON bet_events(ts);\
+                CREATE TABLE IF NOT EXISTS bets(\
+                    bet_id TEXT PRIMARY KEY,\
+                    first_ts TEXT,\
+                    last_ts TEXT,\
+                    match_key TEXT,\
+                    path TEXT,\
+                    odds REAL,\
+                    stake_usd REAL,\
+                    edge_pct REAL,\
+                    source_count INTEGER,\
+                    on_chain_state TEXT,\
+                    result TEXT,\
+                    payout_usd REAL,\
+                    pnl_usd REAL\
+                );"
+            );
+
+            while let Some(entry) = rx.blocking_recv() {
+                let raw_json = entry.to_string();
+                let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+                let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+                let bet_id = entry.get("bet_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let alert_id = entry.get("alert_id").and_then(|v| v.as_i64());
+                let match_key = entry.get("match_key").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let path = entry.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let odds = entry.get("odds").and_then(|v| v.as_f64());
+                let stake_usd = entry
+                    .get("amount_usd").and_then(|v| v.as_f64())
+                    .or_else(|| entry.get("stake").and_then(|v| v.as_f64()));
+                let edge_pct = entry.get("edge_pct").and_then(|v| v.as_f64());
+                let source_count = entry
+                    .get("anomaly_market_source_count").and_then(|v| v.as_i64())
+                    .or_else(|| entry.get("market_source_count").and_then(|v| v.as_i64()))
+                    .or_else(|| entry.get("source_count").and_then(|v| v.as_i64()));
+                let on_chain_state = entry.get("on_chain_state").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let payout_usd = entry.get("payout_usd").and_then(|v| v.as_f64());
+                let amount_usd = entry.get("amount_usd").and_then(|v| v.as_f64());
+                let err = entry
+                    .get("error").and_then(|v| v.as_str())
+                    .or_else(|| entry.get("reason").and_then(|v| v.as_str()))
+                    .map(|s| s.to_string());
+
+                let _ = conn.execute(
+                    "INSERT INTO bet_events(\
+                        ts,event,bet_id,alert_id,match_key,path,odds,stake_usd,edge_pct,source_count,on_chain_state,payout_usd,amount_usd,error,raw_json\
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                    rusqlite::params![
+                        ts,
+                        event,
+                        bet_id.as_deref(),
+                        alert_id,
+                        match_key.as_deref(),
+                        path.as_deref(),
+                        odds,
+                        stake_usd,
+                        edge_pct,
+                        source_count,
+                        on_chain_state.as_deref(),
+                        payout_usd,
+                        amount_usd,
+                        err.as_deref(),
+                        raw_json,
+                    ],
+                );
+
+                if let Some(bid) = bet_id.as_deref() {
+                    // Ensure summary row exists + bump last_ts.
+                    let _ = conn.execute(
+                        "INSERT INTO bets(bet_id, first_ts, last_ts) VALUES (?1, ?2, ?2)\
+                         ON CONFLICT(bet_id) DO UPDATE SET last_ts=excluded.last_ts",
+                        rusqlite::params![bid, ts],
+                    );
+
+                    // Event-specific enrichment.
+                    match event {
+                        "PLACED" => {
+                            let _ = conn.execute(
+                                "UPDATE bets SET \
+                                    match_key=COALESCE(match_key, ?2),\
+                                    path=COALESCE(path, ?3),\
+                                    odds=COALESCE(odds, ?4),\
+                                    stake_usd=COALESCE(stake_usd, ?5),\
+                                    edge_pct=COALESCE(edge_pct, ?6),\
+                                    source_count=COALESCE(source_count, ?7),\
+                                    on_chain_state=COALESCE(on_chain_state, ?8),\
+                                    result='PLACED'\
+                                 WHERE bet_id=?1",
+                                rusqlite::params![
+                                    bid,
+                                    match_key.as_deref(),
+                                    path.as_deref(),
+                                    odds,
+                                    stake_usd,
+                                    edge_pct,
+                                    source_count,
+                                    on_chain_state.as_deref(),
+                                ],
+                            );
+                        }
+                        "ON_CHAIN_ACCEPTED" | "ON_CHAIN_REJECTED" | "REJECTED" | "BET_FAILED" => {
+                            let _ = conn.execute(
+                                "UPDATE bets SET \
+                                    on_chain_state=COALESCE(on_chain_state, ?2),\
+                                    result=?3\
+                                 WHERE bet_id=?1",
+                                rusqlite::params![bid, on_chain_state.as_deref(), event],
+                            );
+                        }
+                        "WON" | "LOST" | "CANCELED" => {
+                            let stake_for_pnl = amount_usd.or(stake_usd).unwrap_or(0.0);
+                            let payout_for_pnl = payout_usd.unwrap_or(0.0);
+                            let pnl = match event {
+                                "WON" => payout_for_pnl - stake_for_pnl,
+                                "CANCELED" => payout_for_pnl - stake_for_pnl,
+                                "LOST" => -stake_for_pnl,
+                                _ => 0.0,
+                            };
+                            let _ = conn.execute(
+                                "UPDATE bets SET \
+                                    result=?2,\
+                                    payout_usd=COALESCE(payout_usd, ?3),\
+                                    pnl_usd=?4\
+                                 WHERE bet_id=?1",
+                                rusqlite::params![bid, event, payout_usd, pnl],
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        info!("🗄️ SQLite ledger enabled: {} (set BET_SQLITE=0 to disable)", db_path);
+        Some(tx)
+    } else {
+        None
+    };
+
     // === PERMANENT BET LEDGER (append-only, NEVER deleted) ===
     let ledger_path = "data/ledger.jsonl";
     let ledger_write = |event: &str, data: &serde_json::Value| {
@@ -3611,9 +3806,13 @@ async fn main() -> Result<()> {
             obj.insert("ts".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
             obj.insert("event".to_string(), serde_json::json!(event));
         }
+        let entry_for_sqlite = entry.clone();
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(ledger_path) {
             use std::io::Write;
             let _ = writeln!(f, "{}", entry);
+        }
+        if let Some(tx) = &sqlite_ledger_tx {
+            let _ = tx.send(entry_for_sqlite);
         }
     };
 
@@ -4110,7 +4309,16 @@ async fn main() -> Result<()> {
                                     }
 
                                     // === SPORT-SPECIFIC AUTO-BET CONFIG ===
-                                    let sport = edge.match_key.split("::").next().unwrap_or("?");
+                                    let sport_raw = edge.match_key.split("::").next().unwrap_or("?");
+                                    let sport_resolved = edge.resolved_sport.as_deref().unwrap_or(sport_raw);
+                                    let sport = if sport_raw == "esports" {
+                                        match sport_resolved {
+                                            "cs2" | "dota-2" | "league-of-legends" | "valorant" => sport_resolved,
+                                            _ => sport_raw,
+                                        }
+                                    } else {
+                                        sport_raw
+                                    };
                                     let (sport_auto_allowed, sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
                                     let base_stake = dynamic_base_stake(current_bankroll, sport);
@@ -4132,7 +4340,9 @@ async fn main() -> Result<()> {
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
                                     }
 
-                                    let generic_esports_blocked = BLOCK_GENERIC_ESPORTS_BETS && edge.match_key.starts_with("esports::");
+                                    let generic_esports_blocked = BLOCK_GENERIC_ESPORTS_BETS
+                                        && edge.match_key.starts_with("esports::")
+                                        && !matches!(sport, "cs2" | "dota-2" | "league-of-legends" | "valorant");
                                     let is_preferred_market = match preferred_market {
                                         "map_winner" => edge.match_key.contains("::map"),
                                         "set_winner" => edge.match_key.contains("::set"),
@@ -4236,7 +4446,12 @@ async fn main() -> Result<()> {
 
                                     // New guards: bankroll floor, pending cap, loss streak
                                     let bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let pending_count = active_bets.len();
+                                    let pending_count = active_bets.iter().filter(|b| {
+                                        match b.token_id.as_deref() {
+                                            Some(tid) => !deferred_claim_tokens.contains(tid),
+                                            None => true,
+                                        }
+                                    }).count();
                                     let pending_ok = pending_count < MAX_CONCURRENT_PENDING;
                                     let streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
@@ -4819,6 +5034,7 @@ async fn main() -> Result<()> {
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
+                                                                    "on_chain_state": bet_state,
                                                                     "path": "edge",
                                                                     "edge_pct": edge.edge_pct,
                                                                     "cv_stake_mult": cv_sm,
@@ -5219,7 +5435,13 @@ async fn main() -> Result<()> {
 
                                     // New guards for anomaly path too
                                     let anomaly_bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let anomaly_pending_ok = active_bets.len() < MAX_CONCURRENT_PENDING;
+                                    let anomaly_pending_count = active_bets.iter().filter(|b| {
+                                        match b.token_id.as_deref() {
+                                            Some(tid) => !deferred_claim_tokens.contains(tid),
+                                            None => true,
+                                        }
+                                    }).count();
+                                    let anomaly_pending_ok = anomaly_pending_count < MAX_CONCURRENT_PENDING;
                                     let anomaly_streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
                                     // CONDITION BLACKLIST: skip conditions that previously failed
@@ -5719,6 +5941,7 @@ async fn main() -> Result<()> {
                                                                     "outcome_id": outcome_id,
                                                                     "token_id": token_id_opt,
                                                                     "graph_bet_id": graph_bet_id_opt,
+                                                                    "on_chain_state": bet_state,
                                                                     "path": "anomaly_odds",
                                                                     "condition_age_ms": condition_age_ms_b,
                                                                     // Anomaly audit data — enables post-hoc signal validation
@@ -6473,6 +6696,7 @@ async fn main() -> Result<()> {
 
                         if is_chain_ready {
                             verified_tokens.push(tid.clone());
+                            deferred_claim_tokens.remove(tid);
                             if i < claim_details.len() {
                                 verified_details.push(claim_details[i].clone());
                             }
@@ -6482,10 +6706,13 @@ async fn main() -> Result<()> {
                                 .unwrap_or("unknown");
                             info!("⏳ Token {} not ready on-chain yet ({}), deferring claim", tid, reason);
                             deferred_bets.push(tid.clone());
+                            deferred_claim_tokens.insert(tid.clone());
                         }
                     }
 
-                    // Remove deferred bets from the "settled" and "remove" lists — they need to stay active
+                    // Remove deferred bets from the "remove" list — they need to stay active.
+                    // IMPORTANT: also remove them from settled_bet_ids, otherwise they become zombies
+                    // (skipped forever) and block new auto-bets via MAX_CONCURRENT_PENDING.
                     if !deferred_bets.is_empty() {
                         info!("⏳ {} bets deferred (chain not ready): {:?}", deferred_bets.len(), deferred_bets);
                         // Find bet_ids that match deferred tokens and remove from bets_to_remove
@@ -6494,6 +6721,15 @@ async fn main() -> Result<()> {
                             let bet_token = active_bets.iter().find(|b| b.bet_id == *bid).and_then(|b| b.token_id.as_deref());
                             !bet_token.map(|t| deferred_set.contains(t)).unwrap_or(false)
                         });
+
+                        // Unmark as settled so next tick will retry the claim.
+                        for b in active_bets.iter() {
+                            if let Some(tid) = b.token_id.as_deref() {
+                                if deferred_set.contains(tid) {
+                                    settled_bet_ids.remove(&b.bet_id);
+                                }
+                            }
+                        }
                     }
 
                     if verified_tokens.is_empty() {
@@ -6915,8 +7151,12 @@ async fn main() -> Result<()> {
                 let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
                 msg.push_str(&format!("\n{} Daily P/L: <b>{}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
                 msg.push_str(&format!("   Vsazeno: ${:.2} | Vráceno: ${:.2}\n", daily_wagered, daily_returned));
-                let daily_loss = daily_wagered - daily_returned;
-                msg.push_str(&format!("   Loss limit: ${:.2} / ${:.0}\n", if daily_loss > 0.0 { daily_loss } else { 0.0 }, DAILY_LOSS_LIMIT_USD));
+                let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
+                let effective_daily_limit = {
+                    let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
+                    DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
+                };
+                msg.push_str(&format!("   Loss limit: ${:.2} / ${:.2}\n", daily_net_loss, effective_daily_limit));
                 msg.push_str(&format!("   Auto-bets dnes: {}\n", auto_bet_count));
 
                 // WS gate diagnostics
@@ -7483,8 +7723,12 @@ async fn main() -> Result<()> {
                                     let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
                                     msg.push_str(&format!("\n{} <b>Daily P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
                                     msg.push_str(&format!("Vsazeno: ${:.2} | Vráceno: ${:.2}\n", daily_wagered, daily_returned));
-                                    let daily_loss = daily_wagered - daily_returned;
-                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.0}\n", if daily_loss > 0.0 { daily_loss } else { 0.0 }, DAILY_LOSS_LIMIT_USD));
+                                    let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
+                                    let effective_daily_limit = {
+                                        let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
+                                        DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
+                                    };
+                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.2}\n", daily_net_loss, effective_daily_limit));
                                     msg.push_str(&format!("Auto-bets dnes: {}\n", auto_bet_count));
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;

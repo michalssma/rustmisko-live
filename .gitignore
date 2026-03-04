@@ -5,6 +5,8 @@
 logs/
 data/*.db
 data/*.db*
+data/*.sqlite
+data/*.sqlite*
 data/pending_claims.txt
 data/active_bets.json
 data/bet_count_daily.txt
