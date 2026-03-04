@@ -2781,6 +2781,8 @@ struct ActiveBet {
     outcome_id: String,
     graph_bet_id: Option<String>,
     token_id: Option<String>,
+    /// Strategy path that originated this bet: "score_edge", "anomaly_odds", "bet_command"
+    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4106,6 +4108,7 @@ async fn main() -> Result<()> {
                         outcome_id: String::new(),
                         graph_bet_id: None,
                         token_id,
+                        path: "loaded".to_string(),
                     });
                 }
             }
@@ -4258,6 +4261,9 @@ async fn main() -> Result<()> {
     let mut tg_ticker = tokio::time::interval(Duration::from_secs(3));
     // Bets that have been settled and claimed (to avoid re-processing)
     let mut settled_bet_ids: HashSet<String> = HashSet::new();
+    // Ledger-dedup: once WON/LOST/CANCELED is written, NEVER write again
+    // (separate from settled_bet_ids which can be un-settled by deferred_bets logic)
+    let mut ledger_settled_ids: HashSet<String> = HashSet::new();
     // Running profit/loss tracker
     let mut total_wagered: f64 = 0.0;
     let mut total_returned: f64 = 0.0;
@@ -5219,6 +5225,7 @@ async fn main() -> Result<()> {
                                                                     outcome_id: outcome_id.clone(),
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
+                                                                    path: "score_edge".to_string(),
                                                                 });
                                                                 // Persist pending claim (prefer real tokenId from executor)
                                                                 let token_to_write = token_id_opt.as_deref().unwrap_or("?");
@@ -6236,6 +6243,7 @@ async fn main() -> Result<()> {
                                                                     outcome_id: outcome_id.clone(),
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
+                                                                    path: "anomaly_odds".to_string(),
                                                                 });
                                                                 let token_to_write = token_id_opt.as_deref().unwrap_or("?");
                                                                 if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -6763,15 +6771,18 @@ async fn main() -> Result<()> {
                                     consecutive_losses = 0;
                                     loss_streak_pause_until = None;
                                 }
-                                // === LEDGER: WON/CANCELED detected (PATH A) ===
-                                ledger_write(if result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
-                                    "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                    "match_key": bet.match_key,
-                                    "value_team": bet.value_team,
-                                    "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                    "payout_usd": payout_usd,
-                                    "token_id": bet.token_id, "path": "A"
-                                }));
+                                // === LEDGER: WON/CANCELED detected (check_payout) ===
+                                if !ledger_settled_ids.contains(&bet.bet_id) {
+                                    ledger_write(if result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
+                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet.match_key,
+                                        "value_team": bet.value_team,
+                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
+                                        "payout_usd": payout_usd,
+                                        "token_id": bet.token_id, "path": &bet.path, "settle": "check_payout"
+                                    }));
+                                    ledger_settled_ids.insert(bet.bet_id.clone());
+                                }
                                 tokens_to_claim.push(tid.clone());
                                 claim_details.push((
                                     bet.alert_id,
@@ -6843,14 +6854,17 @@ async fn main() -> Result<()> {
                                         bet.amount_usd
                                     );
                                     let _ = tg_send_message(&client, &token, chat_id, &loss_msg).await;
-                                    // === LEDGER: LOST (PATH A) ===
-                                    ledger_write("LOST", &serde_json::json!({
-                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                        "match_key": bet.match_key,
-                                        "value_team": bet.value_team,
-                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                        "token_id": bet.token_id, "path": "A"
-                                    }));
+                                    // === LEDGER: LOST (check_payout) ===
+                                    if !ledger_settled_ids.contains(&bet.bet_id) {
+                                        ledger_write("LOST", &serde_json::json!({
+                                            "alert_id": bet.alert_id, "bet_id": bet.bet_id,
+                                            "match_key": bet.match_key,
+                                            "value_team": bet.value_team,
+                                            "amount_usd": bet.amount_usd, "odds": bet.odds,
+                                            "token_id": bet.token_id, "path": &bet.path, "settle": "check_payout"
+                                        }));
+                                        ledger_settled_ids.insert(bet.bet_id.clone());
+                                    }
                                     settled_bet_ids.insert(bet.bet_id.clone());
                                     bets_to_remove.push(bet.bet_id.clone());
                                 } else if result == "Won" || result == "Canceled" || state == "Canceled" {
@@ -6925,14 +6939,17 @@ async fn main() -> Result<()> {
                     if let Some(tid) = &bet.token_id {
                         match effective_result.as_str() {
                             "Won" | "Canceled" => {
-                                // === LEDGER: WON/CANCELED (PATH B) ===
-                                ledger_write(if effective_result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
-                                    "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                    "match_key": bet.match_key,
-                                    "value_team": bet.value_team,
-                                    "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                    "token_id": bet.token_id, "path": "B"
-                                }));
+                                // === LEDGER: WON/CANCELED (bet_status) ===
+                                if !ledger_settled_ids.contains(&bet.bet_id) {
+                                    ledger_write(if effective_result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
+                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet.match_key,
+                                        "value_team": bet.value_team,
+                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
+                                        "token_id": bet.token_id, "path": &bet.path, "settle": "bet_status"
+                                    }));
+                                    ledger_settled_ids.insert(bet.bet_id.clone());
+                                }
                                 tokens_to_claim.push(tid.clone());
                                 claim_details.push((
                                     bet.alert_id,
@@ -6945,14 +6962,17 @@ async fn main() -> Result<()> {
                                 ));
                             }
                             "Lost" => {
-                                // === LEDGER: LOST (PATH B) ===
-                                ledger_write("LOST", &serde_json::json!({
-                                    "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                    "match_key": bet.match_key,
-                                    "value_team": bet.value_team,
-                                    "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                    "token_id": bet.token_id, "path": "B"
-                                }));
+                                // === LEDGER: LOST (bet_status) ===
+                                if !ledger_settled_ids.contains(&bet.bet_id) {
+                                    ledger_write("LOST", &serde_json::json!({
+                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet.match_key,
+                                        "value_team": bet.value_team,
+                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
+                                        "token_id": bet.token_id, "path": &bet.path, "settle": "bet_status"
+                                    }));
+                                    ledger_settled_ids.insert(bet.bet_id.clone());
+                                }
                                 daily_wagered += bet.amount_usd;
                                 {
                                     let today = Utc::now().format("%Y-%m-%d").to_string();
@@ -7364,6 +7384,7 @@ async fn main() -> Result<()> {
                                     outcome_id: String::new(),
                                     graph_bet_id: None,
                                     token_id: Some(tid.clone()),
+                                    path: "onchain".to_string(),
                                 });
                             }
                         }
@@ -8230,6 +8251,7 @@ async fn main() -> Result<()> {
                                                                     outcome_id: outcome_id.clone(),
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
+                                                                    path: "bet_command".to_string(),
                                                                 });
 
                                                                 let token_to_write = token_id_opt.as_deref().unwrap_or("?");
