@@ -30,6 +30,7 @@ RustMiskoLive je lokální automatizační stack pro sběr live kurzů/skóre, d
 ## Auto-bet strategie (v6.0 — 2026-03-01)
 
 ### Path A: LIVE Score Edge → auto-bet
+
 - **Esports / CS2**: `match_or_map` (map_winner preferred), min edge **12%**, stake **$3**
 - **Football**: `match_winner`, min edge **18%**, stake **$3**
 - **Tennis**: `match_winner`, min edge **12%**, stake **$1** (data-collection)
@@ -37,22 +38,26 @@ RustMiskoLive je lokální automatizační stack pro sběr live kurzů/skóre, d
 - **Volleyball/Hockey/Baseball/Cricket/Boxing**: `match_winner`, min edge **15%**, stake **$1**
 
 ### Path B: Odds Anomaly → auto-bet
+
 - **Trigger**: HIGH confidence, 2+ market sources, bounded discrepancy
 - **Stake**: **$2** (`AUTO_BET_ODDS_ANOMALY_STAKE_USD`)
 - **Sporty**: ALL (football + basketball anomaly ON od 2026-03-01)
 - **Guards**: `!azuro_odds_identical` + MIN_ODDS check
 
 ### Odds caps (HARD limity)
+
 - Vše: **max 2.50** (`AUTO_BET_MAX_ODDS`) — zvýšeno z 2.00
 - **CS2 map_winner výjimka**: max **3.00** (`AUTO_BET_MAX_ODDS_CS2_MAP`)
 - Minimum: **1.15** (`AUTO_BET_MIN_ODDS`)
 
 ### NFT Real-Data model (119 betů: 70 won + 49 lost)
+
 - Profitable buckety: odds **1.5–2.0** (+18.9%) a **2.0–3.0** (+29.6%)
 - Ztrátové buckety: **<1.5** (-14.9%), **>=3.0** (-45.4%) → nikdy auto-bet
 - Výstup: `data/nft_model.json`, skript: `executor/nft_model.mjs`
 
 ### Safety vrstvy
+
 - **Per-condition dedup** — nikdy dva bety na stejnou condition (bez re-bet upgrade)
 - **Inflight lock** — race condition ochrana + MAX_CONCURRENT_PENDING=8
 - **Daily loss limit** — stop při NET P&L < -$30 (hard) NEBO tier % bankrollu
@@ -64,11 +69,11 @@ RustMiskoLive je lokální automatizační stack pro sběr live kurzů/skóre, d
 
 ## Sport modely (feed-hub)
 
-| Sport      | Model              | Data parsed z detailed_score         |
-| ---------- | ------------------ | ------------------------------------ |
-| Tennis     | `tennis_model`     | Sety, gamy, podání (\*), tiebreak    |
-| Football   | `football_model`   | Minuta, poločas, skóre po poločasech |
-| Basketball | `basketball_model` | Bodový rozdíl, čtvrtiny              |
+| Sport      | Model              | Data parsed z detailed_score                      |
+| ---------- | ------------------ | ------------------------------------------------- |
+| Tennis     | `tennis_model`     | Sety, gamy, podání (\*), tiebreak                 |
+| Football   | `football_model`   | Minuta, poločas, skóre po poločasech              |
+| Basketball | `basketball_model` | Bodový rozdíl, čtvrtiny                           |
 | Esports    | `esport_map_model` | Map score (z HLTV + Tipsport + Chance round data) |
 
 ## Klíčové konstanty (alert_bot.rs)
@@ -94,17 +99,17 @@ SCORE_EDGE_COOLDOWN_SECS = 60
 
 ## Feature Flags (alert_bot.rs)
 
-| Flag | Stav | Popis |
-|------|------|-------|
-| `FF_CHANCE_ROUND_PARSER` | ✅ ON | CS2 round parsing z Chance |
-| `FF_CROSS_VALIDATION` | ✅ ON | HLTV vs Chance score check |
-| `FF_EXPOSURE_CAPS` | ✅ ON | Dynamic bankroll caps |
-| `FF_REBET_ENABLED` | ✅ ON | Re-bet on growing edge |
-| `FF_CROSS_MAP_MOMENTUM` | ✅ ON | +3% for dominant previous map |
-| `FF_INFLIGHT_CAP` | ✅ ON | Max % bankrollu v pending betech |
-| `FF_PER_SPORT_CAP` | ✅ ON | Per-sport exposure caps |
-| `FF_RESYNC_FREEZE` | ✅ ON | Freeze on cross-validation mismatch |
-| `FF_CASHOUT_ENABLED` | ❌ OFF | Cashout disabled (no EV calc yet) |
+| Flag                     | Stav   | Popis                               |
+| ------------------------ | ------ | ----------------------------------- |
+| `FF_CHANCE_ROUND_PARSER` | ✅ ON  | CS2 round parsing z Chance          |
+| `FF_CROSS_VALIDATION`    | ✅ ON  | HLTV vs Chance score check          |
+| `FF_EXPOSURE_CAPS`       | ✅ ON  | Dynamic bankroll caps               |
+| `FF_REBET_ENABLED`       | ✅ ON  | Re-bet on growing edge              |
+| `FF_CROSS_MAP_MOMENTUM`  | ✅ ON  | +3% for dominant previous map       |
+| `FF_INFLIGHT_CAP`        | ✅ ON  | Max % bankrollu v pending betech    |
+| `FF_PER_SPORT_CAP`       | ✅ ON  | Per-sport exposure caps             |
+| `FF_RESYNC_FREEZE`       | ✅ ON  | Freeze on cross-validation mismatch |
+| `FF_CASHOUT_ENABLED`     | ❌ OFF | Cashout disabled (no EV calc yet)   |
 
 ## Ověřené prostředí
 
@@ -158,19 +163,19 @@ SCORE_EDGE_COOLDOWN_SECS = 60
 
 ### Interpretace výsledků
 
-| isPaid | condition state | viewPayout | Význam |
-|--------|----------------|------------|--------|
-| false  | Resolved       | > 0        | **WON — čeká na claim** (relayer ještě nezavolal) |
-| false  | Resolved       | 0          | LOST — nic k claimu |
-| false  | Canceled       | > 0        | CANCELED — čeká na refund |
-| false  | Created        | revert     | PENDING — match ještě neskončil |
-| true   | Resolved       | revert     | **JIŽ VYPLACENO relayerem** (WON i LOST) |
-| true   | Canceled       | revert     | **JIŽ REFUNDOVÁNO relayerem** |
+| isPaid | condition state | viewPayout | Význam                                            |
+| ------ | --------------- | ---------- | ------------------------------------------------- |
+| false  | Resolved        | > 0        | **WON — čeká na claim** (relayer ještě nezavolal) |
+| false  | Resolved        | 0          | LOST — nic k claimu                               |
+| false  | Canceled        | > 0        | CANCELED — čeká na refund                         |
+| false  | Created         | revert     | PENDING — match ještě neskončil                   |
+| true   | Resolved        | revert     | **JIŽ VYPLACENO relayerem** (WON i LOST)          |
+| true   | Canceled        | revert     | **JIŽ REFUNDOVÁNO relayerem**                     |
 
 ### Správné ABI (z `@azuro-org/toolkit`)
 
 ```js
-import * as t from '@azuro-org/toolkit';
+import * as t from "@azuro-org/toolkit";
 // t.coreAbi — LiveCore ABI (bets, conditions, viewPayout, isOutcomeWinning, resolvePayout)
 // t.lpAbi   — LP ABI (viewPayout, withdrawPayout, withdrawPayouts, relayer, claimTimeout)
 ```
@@ -195,6 +200,7 @@ import * as t from '@azuro-org/toolkit';
 ## Azuro Relayer Bet Flow — DŮLEŽITÉ
 
 ### Jak funguje placeBet
+
 1. Alert-bot volá executor `/bet` → executor volá Azuro relayer `placeBet()`
 2. Relayer vrátí **State: Created** = pouze ACK (přijal order)
 3. Relayer submitne on-chain transakci (10-30s delay)
@@ -202,12 +208,14 @@ import * as t from '@azuro-org/toolkit';
 5. Nebo on-chain tx reverted → **State: Rejected** (žádný NFT, žádná ztráta peněz)
 
 ### Created→follow-up polling (fix 2026-03-01)
+
 - Po každém betu s State: Created se spawne async tokio task
 - Wait 20s → GET `/bet/:id` → check final state
 - Pokud Rejected/Failed/Cancelled → Telegram alert "⚠️ BET REVERTED"
 - Implementováno na VŠECH 3 bet paths (auto-edge, auto-anomaly, manual)
 
 ### Won vs alreadyPaid (fix 2026-03-01)
+
 - Executor `/my-bets` vrací top-level field `alreadyPaid` (NE `won`!)
 - Alert-bot čte `alreadyPaid` pro portfolio display (dříve četl neexistující `won` → vždy 0)
 

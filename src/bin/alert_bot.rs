@@ -42,20 +42,22 @@ const CASHOUT_CHECK_SECS: u64 = 30;
 /// Minimum profit % to auto-cashout
 const CASHOUT_MIN_PROFIT_PCT: f64 = 3.0;
 /// Minimum score-edge % to trigger alert
-/// Relaxed 8% -> 6% to increase opportunity throughput (still requires edge)
-const MIN_SCORE_EDGE_PCT: f64 = 6.0;
+/// Relaxed 6% → 5%: score is fact-based evidence, safe to lower threshold
+const MIN_SCORE_EDGE_PCT: f64 = 5.0;
 /// Score edge cooldown per match (seconds)
 const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches score changes
 /// === AUTO-BET CONFIG ===
 const AUTO_BET_ENABLED: bool = true;
 /// Base stake per auto-bet in USD
 const AUTO_BET_STAKE_USD: f64 = 3.0;
-/// Reduced stake for data-collection sports (tennis, basketball) — capped at $1 for small sample gathering
-const AUTO_BET_STAKE_LOW_USD: f64 = 1.0;
-/// Minimum Azuro odds to auto-bet (skip heavy favorites)
-const AUTO_BET_MIN_ODDS: f64 = 1.15;
+/// Paper-trading for data-collection sports (tennis, basketball) — ZERO USD risk, logs only!
+const AUTO_BET_STAKE_LOW_USD: f64 = 0.0;
+/// Minimum Azuro odds to auto-bet (skip heavy favorites, prevents massive risk/reward leakage)
+/// Relaxed 1.50→1.40: slightly broader range for score-edge bets (no anomaly path anymore)
+const AUTO_BET_MIN_ODDS: f64 = 1.40;
 /// Maximum odds for auto-bet (skip extreme underdogs)
-const AUTO_BET_MAX_ODDS: f64 = 2.50;
+/// Relaxed 2.50→3.00: score-edge is fact-based, safe to bet slightly wider
+const AUTO_BET_MAX_ODDS: f64 = 3.00;
 /// CS2 map_winner exception: allow higher odds (score-based edge is more reliable on maps)
 const AUTO_BET_MAX_ODDS_CS2_MAP: f64 = 3.00;
 const SCORE_EDGE_STAKE_MAX_MULT: f64 = 2.5;
@@ -95,8 +97,8 @@ const DEDUP_HISTORY_LOOKBACK_HOURS: i64 = 8;
 /// ROLLBACK: set to 999_999 to effectively disable pre-flight gate
 const CONDITION_MAX_AGE_MS: u64 = 2000;
 /// Base chain poll cadence is much slower than Polygon WS/GQL cadence.
-/// Without a separate threshold, Base opportunities are always dropped as stale.
-const CONDITION_MAX_AGE_MS_BASE: u64 = 120_000;
+/// Tightened 120s→30s: still allows Base bets, but cuts truly stale conditions.
+const CONDITION_MAX_AGE_MS_BASE: u64 = 30_000;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
 /// ROLLBACK: set to 999_999 to effectively disable pipeline budget
 const PIPELINE_BUDGET_MS: u64 = 1200;
@@ -114,8 +116,8 @@ const MIN_ODDS_FACTOR_TENNIS: f64 = 0.82;
 /// Basketball live also has fast score swings; use intermediate factor.
 const MIN_ODDS_FACTOR_BASKETBALL: f64 = 0.83;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
-/// Was 3 — practically unreachable (HLTV typically has 1-2 bookmakers per match)
-const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
+/// Relaxed 2→1: with 2+ devices online, single source is safe with other guards
+const AUTO_BET_MIN_MARKET_SOURCES: usize = 1;
 /// Ignore stale odds snapshots older than this threshold
 const MAX_ODDS_AGE_SECS: i64 = 20;
 /// Maximum concurrent pending bets (inflight guard)
@@ -433,35 +435,104 @@ const FF_INFLIGHT_CAP: bool = true;
 const FF_PER_SPORT_CAP: bool = true;
 /// Resync freeze: on cross-validation mismatch, block match 60s, require 2 agreements
 const FF_RESYNC_FREEZE: bool = true;
+/// Phase 1: CS2 match_winner from round scores (maps 1-0 / 1-1 + round lead)
+const FF_CS2_MATCH_FROM_ROUNDS: bool = true;
+/// Phase 1: Football anomaly enabled for goal_diff ≥ 2
+const FF_FOOTBALL_ANOMALY_GOALDIFF2: bool = true;
+/// Phase 2: Tennis game-level model (paper trade only until 50+ bets)
+const FF_TENNIS_GAME_MODEL: bool = false;
+/// Phase 4: Basketball live bets (OFF until live_score kalibrace)
+const FF_BASKETBALL_LIVE: bool = false;
+/// Regime-based stake sizing (Kelly/3 for StrongEdge, $0.50 for FalseFavorite)
+const FF_REGIME_STAKE: bool = true;
+/// StrongEdge Kelly/3 stake floor
+const STRONG_EDGE_STAKE_MIN: f64 = 1.50;
+/// StrongEdge Kelly/3 stake cap
+const STRONG_EDGE_STAKE_MAX: f64 = 5.00;
+/// FalseFavorite test stake
+const FALSE_FAVORITE_STAKE: f64 = 0.50;
 
-/// Sport-specific auto-bet configuration (v2 — with sport models)
+/// Sport-specific auto-bet configuration (v3 — relaxed thresholds for score-edge)
 /// Returns: (auto_bet_allowed, min_edge_pct, stake_multiplier, preferred_market)
 /// preferred_market: "map_winner" | "match_winner"
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol" | "esports"
-            => (true, 12.0, 1.0, "match_or_map"),
+            => (true, 10.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
-        // Safety: auto-bet only allowed when set_diff >= 1 (checked in sport guard)
-        // min_edge 15→12: at 15% + MAX_ODDS 2.00 it was mathematically impossible to auto-bet tennis
+        // Relaxed 12→10%: score evidence is strong (sets are fact)
         "tennis"
-            => (true, 12.0, 1.0, "match_winner"),
+            => (true, 10.0, 1.0, "match_winner"),
         // Basketball: match_winner — point spread model
+        // Relaxed 12→11%
         "basketball"
-            => (true, 12.0, 1.0, "match_winner"),
-        // Football: NOW ENABLED with strict guards
-        // Our football_model uses minute + goal difference
-        // Safety: auto-bet only when goal_diff >= 2 (checked in sport guard)
+            => (true, 11.0, 1.0, "match_winner"),
+        // Football: DYNAMIC by minute — late game has stronger signal
+        // Base threshold here; dynamic_football_min_edge() overrides for late game
         "football"
-            => (true, 18.0, 1.0, "match_winner"),
+            => (true, 14.0, 1.0, "match_winner"),
         // New sports: alerts enabled, conservative edge thresholds
         "volleyball" | "ice-hockey" | "baseball" | "cricket" | "boxing"
-            => (true, 15.0, 1.0, "match_winner"),
+            => (true, 14.0, 1.0, "match_winner"),
         // Unknown sport: alerts only
         _
             => (false, 0.0, 0.0, "none"),
     }
+}
+
+/// Dynamic football edge threshold based on match minute.
+/// Late game: odds adjust slowly → lower threshold is safe.
+/// Returns adjusted min_edge_pct for football specifically.
+fn dynamic_football_min_edge(detailed_score: Option<&str>) -> f64 {
+    let ds = detailed_score.unwrap_or("");
+    if let Some(minute) = parse_football_minute_static(ds) {
+        match minute {
+            0..=30 => 18.0,    // Early: conservative (Oracle still fast)
+            31..=60 => 15.0,   // Mid: loosening
+            61..=75 => 12.0,   // Late: aggressive (Oracle slow to adjust)
+            76..=85 => 10.0,   // Very late: clear score signal
+            _ => 9.0,          // 86+: last minutes, strong signal
+        }
+    } else {
+        14.0 // No minute info: use base
+    }
+}
+
+/// Static version of parse_football_minute for use in dynamic_football_min_edge
+fn parse_football_minute_static(detailed: &str) -> Option<i64> {
+    // Pattern 1: "NN.min"
+    if let Some(min_idx) = detailed.find(".min") {
+        let before = &detailed[..min_idx];
+        let digits: String = before.chars().rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .chars().rev().collect();
+        if let Ok(min) = digits.parse::<i64>() {
+            return Some(min);
+        }
+    }
+    // Pattern 2: "<Nmin"
+    if let Some(lt_idx) = detailed.find('<') {
+        let after = &detailed[lt_idx + 1..];
+        let digits: String = after.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(min) = digits.parse::<i64>() {
+            return Some(min);
+        }
+    }
+    // Pattern 3: "N.pol" half markers
+    for (half, minute_est) in [("1.pol", 25i64), ("2.pol", 65i64)] {
+        if let Some(idx) = detailed.find(half) {
+            if idx == 0 { return Some(minute_est); }
+            let prev_char = detailed.as_bytes()[idx - 1];
+            if prev_char != b':' && !prev_char.is_ascii_digit() {
+                return Some(minute_est);
+            }
+        }
+    }
+    None
 }
 
 fn min_odds_factor_for_match(match_key: &str) -> f64 {
@@ -509,13 +580,17 @@ fn sport_auto_bet_guard(sport: &str, opp: &Opportunity) -> bool {
     }
 }
 
-/// Prematch odds anomaly auto-bet: ENABLED for LIVE as well
+/// Prematch odds anomaly auto-bet: RE-ENABLED with SCORE-CONFIRMED gate
+/// Only bets when live score supports the anomaly direction (leading team = value side)
 const AUTO_BET_ODDS_ANOMALY_ENABLED: bool = true;
-const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 1.5;
+const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_REF_ODDS: f64 = 1.25;
 const AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR: f64 = 0.50;
-const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 2.50;
-const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.80;
+const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 1.00;
+/// Anomaly gets only 30% of daily budget (score-edge gets the rest)
+const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.30;
+/// Minimum discrepancy for anomaly AUTO-BET (higher than alert threshold MIN_EDGE_PCT=8%)
+const ANOMALY_MIN_DISC_AUTOBET: f64 = 15.0;
 
 /// Odds-proportional anomaly stake: safe low odds → higher stake, risky high odds → lower
 /// Formula: base × (ref_odds / azuro_odds)^1.5
@@ -588,6 +663,7 @@ fn trim_stake(
     cross_val_multiplier: f64, // 1.0 or 1.25 — boosted stake for cross-validated bets
     sod_bankroll: f64,        // start-of-day bankroll for daily loss limit (prevents shrinking box)
     stake_path: &str,         // "score_edge" | "anomaly" (path-aware daily budget)
+    azuro_odds: f64,          // REAL EDGE GUARD: odds check pro exponenciální sizing
 ) -> f64 {
     // Effective daily limit: min(hard_limit, tier-based cap)
     // Uses SOD bankroll so the limit doesn't shrink as you lose bets during the day
@@ -633,8 +709,16 @@ fn trim_stake(
         f64::MAX
     };
 
-    // Apply cross-validation multiplier to stake (NOT to edge threshold)
-    let boosted_stake = calculated_stake * cross_val_multiplier;
+    // Apply REAL EDGE multiplier k base stake pokud jsou kurzy v sweet-spotu (1.80+) a máme cross match.
+    // Base stake je násoben exponenciálně s tím, jak je kurz zajímavější, až do 1.75x
+    let mut real_edge_multiplier = cross_val_multiplier;
+    if cross_val_multiplier > 1.0 && azuro_odds >= 1.80 {
+        // Exponenciální škálování od 1.80 do 2.50
+        // max bonus u 2.50 je +75% ke staku (1.25 -> 2.18x) nebo jen fix +50%:
+        real_edge_multiplier *= 1.5;
+    }
+    
+    let boosted_stake = calculated_stake * real_edge_multiplier;
 
     let final_stake = boosted_stake
         .min(per_bet_cap)
@@ -687,8 +771,8 @@ fn trim_stake(
 
 /// Cross-validation result for HLTV vs Chance score comparison.
 /// Returns (skip: bool, stake_multiplier: f64)
-///   skip=true → HARD SKIP (mismatch = invalid input)
-///   stake_multiplier: 1.25 (agree) or 1.0 (single source or non-CS2)
+///   skip=false always — NEVER hard-skip, use reduced stake instead
+///   stake_multiplier: 1.25 (agree), 0.5 (mismatch=hedged), 1.0 (single source)
 /// IMPORTANT: multiplier is for STAKE/PRIORITY only, NOT for edge threshold!
 fn cross_validation_check(
     hltv_score: Option<(i32, i32)>,
@@ -699,7 +783,10 @@ fn cross_validation_check(
             if h.0 == c.0 && h.1 == c.1 {
                 (false, 1.25)  // Both agree → higher stake/priority
             } else {
-                (true, 0.0)    // Mismatch → HARD SKIP (stale data risk)
+                // Mismatch → HEDGED bet at 0.5x stake (not hard skip)
+                // Scraper fluke is common; full skip leaves money on table
+                info!("CROSS-VAL mismatch: HLTV={:?} vs Chance={:?} → 0.5x stake (was: HARD SKIP)", h, c);
+                (false, 0.5)
             }
         }
         _ => (false, 1.0),  // Only one source → neutral
@@ -1486,6 +1573,78 @@ fn cs2_map_win_prob(diff: i32, total_rounds: i32) -> f64 {
     }
 }
 
+/// CS2 round score → MATCH win probability (Bo3).
+/// Combines: P(win current map) × Bo3 transition probabilities.
+///
+/// Bo3 transitions (team that wins next map → match result):
+///   maps 0-0: win → 1-0 (P_match=0.58) / lose → 0-1 (P_match=0.42)
+///   maps 1-0: win → 2-0 (P_match=1.00) / lose → 1-1 (P_match=0.50)
+///   maps 0-1: win → 1-1 (P_match=0.50) / lose → 0-2 (P_match=0.00)
+///   maps 1-1: win → 2-1 (P_match=1.00) / lose → 1-2 (P_match=0.00)
+///
+/// Source: HLTV Bo3 first-map-winner stats → 58-62%, using 0.58 conservative.
+fn cs2_round_to_match_prob(
+    map_lead: i32,    // maps won by the round-leading team
+    map_lose: i32,    // maps won by the opponent
+    round_lead: i32,  // rounds won by leading team (current map)
+    round_lose: i32,  // rounds won by opponent (current map)
+) -> Option<f64> {
+    let diff = round_lead - round_lose;
+    let total = round_lead + round_lose;
+    if diff <= 0 { return None; }
+
+    let map_prob = cs2_map_win_prob(diff, total);
+
+    // Bo3 transition: P(match) given current map outcome
+    let (p_after_win, p_after_lose) = match (map_lead, map_lose) {
+        (0, 0) => (0.58, 0.42),  // → 1-0 or 0-1
+        (1, 0) => (1.00, 0.50),  // → 2-0 WIN or 1-1
+        (0, 1) => (0.50, 0.00),  // → 1-1 or 0-2 LOSS
+        (1, 1) => (1.00, 0.00),  // → 2-1 WIN or 1-2 LOSS
+        _      => return None,   // match already decided
+    };
+
+    let match_prob = map_prob * p_after_win + (1.0 - map_prob) * p_after_lose;
+
+    // Minimum useful threshold: 55% (below = NoBet / prefer map_winner)
+    if match_prob < 0.55 { return None; }
+    Some(match_prob)
+}
+
+/// Regime classification based on true_p.
+/// Returns: ("StrongEdge" | "FalseFavorite" | "NoBet", true_p)
+fn classify_regime(true_p: f64, azuro_odds: f64) -> &'static str {
+    // Quarantine: odds ≥ 2.0 with low true_p is steam-roller territory
+    if azuro_odds >= 2.0 && true_p < 0.75 {
+        return "NoBet";
+    }
+    if true_p >= 0.70 {
+        "StrongEdge"
+    } else if true_p >= 0.55 {
+        "FalseFavorite"
+    } else {
+        "NoBet"
+    }
+}
+
+/// Kelly/3 stake sizing for regime-based betting.
+/// f = (true_p × odds - 1) / (odds - 1)   (Kelly criterion)
+/// stake = bankroll × f / 3                (fractional Kelly for safety)
+/// Guardrails: FLOOR $1.50, CAP $5.00 for StrongEdge; $0.50 for FalseFavorite.
+fn compute_regime_stake(true_p: f64, azuro_odds: f64, bankroll: f64) -> f64 {
+    let regime = classify_regime(true_p, azuro_odds);
+    match regime {
+        "StrongEdge" => {
+            let kelly_f = (true_p * azuro_odds - 1.0) / (azuro_odds - 1.0);
+            if kelly_f <= 0.0 { return FALSE_FAVORITE_STAKE; } // edge evaporated
+            let stake = bankroll * kelly_f / 3.0;
+            stake.max(STRONG_EDGE_STAKE_MIN).min(STRONG_EDGE_STAKE_MAX)
+        }
+        "FalseFavorite" => FALSE_FAVORITE_STAKE,
+        _ => 0.0, // NoBet
+    }
+}
+
 /// Confidence tier for dynamic odds cap:
 ///   "ULTRA"  → prob ≥ 90% AND late game → max odds 5.00
 ///   "HIGH"   → prob ≥ 80% AND mid+ game → max odds 3.00
@@ -2096,20 +2255,53 @@ fn find_score_edges(
                 info!("  ⚠️  {} is generic esports:: key (not confirmed cs2::) — team names may not be CS2. Score {}-{}",
                     match_key, s1, s2);
             }
-            match score_to_win_prob(leading_maps, losing_maps) {
-                Some(p) => p,
-                None => {
-                    info!("  ⏭️ {} {}-{}: score not actionable (diff={}, max={})",
-                        match_key, s1, s2, leading_maps - losing_maps,
-                        leading_maps.max(losing_maps));
-                    continue;
+            // Phase 1: CS2 match_winner from round scores
+            // When live_score is round-level (max > 3), try to compute
+            // match win probability using round + map context.
+            if FF_CS2_MATCH_FROM_ROUNDS && leading_maps.max(losing_maps) > 3 {
+                // Parse map context from detailed_score
+                let ds = live.payload.detailed_score.as_deref().unwrap_or("");
+                let (ml, mm) = parse_esports_map_score(ds, s1, s2);
+                // ml/mm are map scores; s1/s2 are round scores
+                // For Dust2 format "R:9-4 M:1-0": ml=1, mm=0
+                // For Chance format: map score from live_score parent or parse
+                let (map_leader, map_loser) = if ml > mm { (ml, mm) } else if mm > ml { (mm, ml) } else {
+                    // If map scores are equal/unknown, try parse from detailed_score Dust2 M:X-Y
+                    if let Some(ms) = parse_dust2_map_score(ds) {
+                        if ms.0 > ms.1 { (ms.0, ms.1) } else { (ms.1, ms.0) }
+                    } else {
+                        (0, 0) // maps 0-0
+                    }
+                };
+                match cs2_round_to_match_prob(map_leader, map_loser, leading_maps, losing_maps) {
+                    Some(p) => {
+                        let regime = classify_regime(p, 1.50); // placeholder odds for logging
+                        info!("  🎯 {} CS2 MATCH FROM ROUNDS: maps {}-{}, rounds {}-{} → match_prob={:.1}% regime={}",
+                            match_key, map_leader, map_loser, leading_maps, losing_maps, p * 100.0, regime);
+                        p
+                    }
+                    None => {
+                        info!("  ⏭️ {} {}-{}: CS2 round score → match_prob below threshold (maps={}-{})",
+                            match_key, s1, s2, map_leader, map_loser);
+                        continue;
+                    }
+                }
+            } else {
+                match score_to_win_prob(leading_maps, losing_maps) {
+                    Some(p) => p,
+                    None => {
+                        info!("  ⏭️ {} {}-{}: score not actionable (diff={}, max={})",
+                            match_key, s1, s2, leading_maps - losing_maps,
+                            leading_maps.max(losing_maps));
+                        continue;
+                    }
                 }
             }
         };
 
         // ================================================================
         // CROSS-VALIDATION: Compare HLTV score vs Chance detailed_score
-        // Mismatch → HARD SKIP + resync freeze (60s + 2 agreements)
+        // Mismatch → 0.5x stake (hedged, NOT hard skip)
         // Agreement → stake multiplier 1.25 (NOT applied to edge threshold!)
         // Only one source → neutral (no skip, multiplier 1.0)
         // ================================================================
@@ -2126,39 +2318,20 @@ fn find_score_edges(
             (false, 1.0) // non-CS2 or non-round-level → skip validation
         };
 
-        // RESYNC FREEZE: if this match was previously mismatched, check freeze status
-        if FF_RESYNC_FREEZE && is_cs2_like {
-            if cv_skip {
-                // Mismatch detected → start or extend freeze
-                let rs = resync_freeze.entry(match_key.to_string()).or_insert_with(ResyncState::new);
-                rs.record_mismatch();
-                info!("  🛑 {} CROSS-VALIDATION MISMATCH + FREEZE: HLTV={}-{} vs Chance={:?} detailed='{}' — frozen 60s",
-                    match_key, s1, s2, chance_round, detailed);
-                continue;
-            } else if let Some(rs) = resync_freeze.get_mut(&match_key.to_string()) {
-                if cv_stake_mult > 1.0 {
-                    // Agreement after previous mismatch — check if resync complete
-                    if rs.record_agreement() {
-                        info!("  ✅ {} RESYNC COMPLETE: 2 consecutive agreements after freeze — unfreezing",
-                            match_key);
-                        resync_freeze.remove(&match_key.to_string());
-                    } else if rs.is_frozen() {
-                        info!("  🧊 {} STILL FROZEN: agreement #{} but need 2 + 60s elapsed",
-                            match_key, rs.consecutive_agreements);
-                        continue;
-                    }
-                } else if rs.is_frozen() {
-                    // Single source during freeze → still frozen
-                    info!("  🧊 {} FROZEN (single source): waiting for 2 cross-validated agreements",
-                        match_key);
-                    continue;
-                }
-            }
-        } else if cv_skip {
-            // Non-freeze mode: simple skip on mismatch
-            info!("  🛑 {} CROSS-VALIDATION MISMATCH: HLTV={}-{} vs Chance={:?} detailed='{}' — SKIPPING",
+        // RESYNC OBSERVABILITY: log mismatches but NO hard skip/freeze
+        // cv_skip is always false now — mismatch just reduces stake to 0.5x
+        if FF_RESYNC_FREEZE && is_cs2_like && cv_stake_mult < 1.0 {
+            // Record mismatch for tracking (no blocking)
+            let rs = resync_freeze.entry(match_key.to_string()).or_insert_with(ResyncState::new);
+            rs.record_mismatch();
+            info!("  ⚠️ {} CROSS-VAL MISMATCH (hedged 0.5x): HLTV={}-{} vs Chance={:?} detailed='{}'",
                 match_key, s1, s2, chance_round, detailed);
-            continue;
+        } else if FF_RESYNC_FREEZE && is_cs2_like && cv_stake_mult > 1.0 {
+            // Agreement — clear any previous mismatch state
+            if resync_freeze.contains_key(&match_key.to_string()) {
+                resync_freeze.remove(&match_key.to_string());
+                info!("  ✅ {} RESYNC CLEARED after agreement", match_key);
+            }
         }
 
         if cv_stake_mult > 1.0 {
@@ -2747,11 +2920,26 @@ fn align_teams(azuro: &OddsPayload, market: &OddsPayload) -> (f64, f64, bool, bo
     let m2 = norm_team(&market.team2);
 
     // Normal order: azuro.t1 ↔ market.t1
-    let normal_score = (if teams_match(&a1, &m1) { 1 } else { 0 })
+    let mut normal_score = (if teams_match(&a1, &m1) { 1 } else { 0 })
                      + (if teams_match(&a2, &m2) { 1 } else { 0 });
     // Swapped: azuro.t1 ↔ market.t2
-    let swap_score = (if teams_match(&a1, &m2) { 1 } else { 0 })
+    let mut swap_score = (if teams_match(&a1, &m2) { 1 } else { 0 })
                    + (if teams_match(&a2, &m1) { 1 } else { 0 });
+
+    let is_esports = matches!(
+        market.sport.as_deref().unwrap_or(""),
+        "cs2" | "dota-2" | "league-of-legends" | "valorant" | "esports"
+    );
+
+    if is_esports {
+        // Shared Opponent Loophole: If one team matches cleanly, we deduct it's the exact same match.
+        // E.g., "NAVI" == "Natus Vincere", but Faze matches perfectly -> normal_score=1. Give it 2!
+        if normal_score == 1 && swap_score == 0 {
+            normal_score = 2;
+        } else if normal_score == 0 && swap_score == 1 {
+            swap_score = 2;
+        }
+    }
 
     let ambiguous = normal_score == swap_score;
 
@@ -4319,13 +4507,34 @@ async fn main() -> Result<()> {
                                     } else {
                                         sport_raw
                                     };
-                                    let (sport_auto_allowed, sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
+                                    let (sport_auto_allowed, mut sport_min_edge, sport_multiplier, preferred_market) = get_sport_config(sport);
+                                    // Football: dynamic edge threshold by minute
+                                    if sport == "football" {
+                                        sport_min_edge = dynamic_football_min_edge(edge.detailed_score.as_deref());
+                                    }
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
                                     let base_stake = dynamic_base_stake(current_bankroll, sport);
                                     let score_stake_mult = score_edge_stake_multiplier(edge, sport, azuro_odds);
-                                    let raw_stake = base_stake * sport_multiplier * score_stake_mult;
-                                    info!("📈 SCORE STAKE MULT: {} edge={:.1}% sport={} odds={:.2} mult={:.2} raw=${:.2}",
-                                        edge.match_key, edge.edge_pct, sport, azuro_odds, score_stake_mult, raw_stake);
+
+                                    // Regime-based sizing (Phase 1): use Kelly/3 when true_p is known
+                                    let raw_stake = if FF_REGIME_STAKE {
+                                        let true_p = edge.score_implied_pct / 100.0;
+                                        let regime = classify_regime(true_p, azuro_odds);
+                                        let regime_stake = compute_regime_stake(true_p, azuro_odds, current_bankroll);
+                                        info!("📈 REGIME SCORE STAKE: {} true_p={:.1}% regime={} kelly_stake=${:.2} (old: base=${:.2}×{:.2}×{:.2}=${:.2})",
+                                            edge.match_key, true_p * 100.0, regime, regime_stake,
+                                            base_stake, sport_multiplier, score_stake_mult,
+                                            base_stake * sport_multiplier * score_stake_mult);
+                                        if regime_stake > 0.0 {
+                                            regime_stake
+                                        } else {
+                                            0.0 // NoBet regime
+                                        }
+                                    } else {
+                                        base_stake * sport_multiplier * score_stake_mult
+                                    };
+                                    info!("📈 SCORE STAKE: {} edge={:.1}% sport={} odds={:.2} raw=${:.2}",
+                                        edge.match_key, edge.edge_pct, sport, azuro_odds, raw_stake);
 
                                     // === EXPOSURE CAPS + STAKE TRIMMER ===
                                     let cond_exp = condition_exposure.get(&cond_id_str).copied().unwrap_or(0.0);
@@ -4334,7 +4543,7 @@ async fn main() -> Result<()> {
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
                                     let cv_sm = edge.cv_stake_mult;
                                     let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
-                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge");
+                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge", azuro_odds);
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -5190,6 +5399,7 @@ async fn main() -> Result<()> {
                                                                                         "path": "edge",
                                                                                         "odds": follow_odds,
                                                                                         "stake": follow_stake,
+                                                                                        "path": "edge",
                                                                                     });
                                                                                     if let Ok(mut f) = std::fs::OpenOptions::new()
                                                                                         .create(true).append(true).open("data/ledger.jsonl") {
@@ -5354,13 +5564,67 @@ async fn main() -> Result<()> {
                                     let anomaly_sport = match_key_for_bet.split("::").next().unwrap_or("?");
                                     let anomaly_sport_exp = sport_exposure.get(anomaly_sport).copied().unwrap_or(0.0);
                                     let anomaly_daily_loss = (daily_wagered - daily_returned).max(0.0);
-                                    let anomaly_raw_stake = anomaly_stake_for_odds(azuro_odds);
-                                    info!("📐 ODDS-PROP STAKE: {} odds={:.2} → raw_stake=${:.2} (base={:.1} ref={:.2} scale={:.3})",
-                                        anomaly.match_key, azuro_odds, anomaly_raw_stake,
-                                        AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD, AUTO_BET_ODDS_ANOMALY_REF_ODDS,
-                                        (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5));
+
+                                    // Regime-based stake: estimate true_p from anomaly score context
+                                    let anomaly_raw_stake = if FF_REGIME_STAKE {
+                                        // Try to estimate true_p from score data
+                                        let anomaly_true_p = {
+                                            let a_score = anomaly.live_score.as_deref().unwrap_or("?");
+                                            let a_detail = anomaly.detailed_score.as_deref().unwrap_or("");
+                                            let parts: Vec<&str> = a_score.split('-').collect();
+                                            let (as1, as2) = if parts.len() == 2 {
+                                                (parts[0].trim().parse::<i32>().unwrap_or(0),
+                                                 parts[1].trim().parse::<i32>().unwrap_or(0))
+                                            } else { (0, 0) };
+                                            let a_leading = as1.max(as2);
+                                            let a_losing = as1.min(as2);
+
+                                            match anomaly_sport {
+                                                "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => {
+                                                    // Try round→match prob with map context
+                                                    if a_leading > 3 && FF_CS2_MATCH_FROM_ROUNDS {
+                                                        let (ml, mm) = parse_esports_map_score(a_detail, as1, as2);
+                                                        let (map_l, map_lo) = if ml > mm { (ml, mm) } else if mm > ml { (mm, ml) } else {
+                                                            if let Some(ms) = parse_dust2_map_score(a_detail) {
+                                                                if ms.0 > ms.1 { (ms.0, ms.1) } else { (ms.1, ms.0) }
+                                                            } else { (0, 0) }
+                                                        };
+                                                        cs2_round_to_match_prob(map_l, map_lo, a_leading, a_losing)
+                                                    } else if a_leading <= 3 && a_leading > a_losing {
+                                                        // Map-level score
+                                                        score_to_win_prob(a_leading, a_losing)
+                                                    } else { None }
+                                                }
+                                                "football" => football_score_to_win_prob(a_leading, a_losing),
+                                                "tennis" => tennis_score_to_win_prob(a_leading, a_losing),
+                                                "basketball" => basketball_score_to_win_prob(a_leading, a_losing),
+                                                _ => None,
+                                            }
+                                        };
+
+                                        if let Some(tp) = anomaly_true_p {
+                                            let regime = classify_regime(tp, azuro_odds);
+                                            let stake = compute_regime_stake(tp, azuro_odds, current_bankroll);
+                                            info!("📐 REGIME STAKE: {} odds={:.2} true_p={:.1}% regime={} → ${:.2}",
+                                                anomaly.match_key, azuro_odds, tp * 100.0, regime, stake);
+                                            stake
+                                        } else {
+                                            // No true_p → fallback to FalseFavorite test stake
+                                            let fallback = anomaly_stake_for_odds(azuro_odds);
+                                            info!("📐 FALLBACK STAKE (no true_p): {} odds={:.2} → ${:.2}",
+                                                anomaly.match_key, azuro_odds, fallback);
+                                            fallback
+                                        }
+                                    } else {
+                                        let old_stake = anomaly_stake_for_odds(azuro_odds);
+                                        info!("📐 ODDS-PROP STAKE: {} odds={:.2} → raw_stake=${:.2} (base={:.1} ref={:.2} scale={:.3})",
+                                            anomaly.match_key, azuro_odds, old_stake,
+                                            AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD, AUTO_BET_ODDS_ANOMALY_REF_ODDS,
+                                            (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5));
+                                        old_stake
+                                    };
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
-                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly");
+                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds);
 
                                     // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
                                     let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;
@@ -5373,11 +5637,30 @@ async fn main() -> Result<()> {
                                     // Score-edge path has sport_auto_bet_guard + model validation;
                                     // anomaly path is purely odds-comparison → needs stricter sport rules.
                                     let anomaly_sport_allowed = match anomaly_sport {
-                                        // Football: DISABLED for anomaly path (2026-03-02)
-                                        // 0/2 football anomaly bets lost in 24h audit.
-                                        // Football odds discrepancy is noisy (league diversity, bookmaker lag).
-                                        // Football auto-bets still allowed via score-edge path (goal_diff model).
-                                        "football" => false,
+                                        // Football: ENABLED for anomaly path ONLY with goal_diff ≥ 2 (Phase 1, 2026-03-04)
+                                        // Rationale: 0/2 football anomaly lost → but those were game-start bets.
+                                        // With goal_diff ≥ 2, true_p is 0.85+ (very strong position).
+                                        "football" => {
+                                            if !FF_FOOTBALL_ANOMALY_GOALDIFF2 { false }
+                                            else if let Some(ref score) = anomaly.live_score {
+                                                let parts: Vec<&str> = score.split('-').collect();
+                                                if parts.len() == 2 {
+                                                    let (fs1, fs2) = (
+                                                        parts[0].trim().parse::<i32>().unwrap_or(0),
+                                                        parts[1].trim().parse::<i32>().unwrap_or(0),
+                                                    );
+                                                    let goal_diff = (fs1 - fs2).abs();
+                                                    let football_ok = goal_diff >= 2;
+                                                    if !football_ok {
+                                                        info!("⚽ ANOMALY SPORT GUARD: {} score={:?} — football needs goal_diff≥2 for anomaly",
+                                                            anomaly.match_key, anomaly.live_score);
+                                                    }
+                                                    football_ok
+                                                } else { false }
+                                            } else {
+                                                false // no score → skip
+                                            }
+                                        }
                                         // Basketball: ENABLED — anomaly odds comparison is valid for mainstream leagues
                                         // Score-edge path also lives with point-diff model.
                                         "basketball" => true,
@@ -5478,23 +5761,59 @@ async fn main() -> Result<()> {
                                         }
                                     };
 
+                                    // === SCORE-CONFIRMED GATE ===
+                                    // Anomaly auto-bet ONLY when live score confirms the value direction.
+                                    // Leading team must be the same as value_side. No score = no bet.
+                                    let anomaly_score_confirmed = if let Some(ref score) = anomaly.live_score {
+                                        let parts: Vec<&str> = score.split('-').collect();
+                                        if parts.len() == 2 {
+                                            if let (Ok(s1), Ok(s2)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
+                                                let score_diff = s1 - s2;
+                                                if score_diff == 0 {
+                                                    // Draw: no score confirmation → skip
+                                                    false
+                                                } else {
+                                                    let leading_side: u8 = if score_diff > 0 { 1 } else { 2 };
+                                                    let confirmed = leading_side == anomaly.value_side;
+                                                    if !confirmed {
+                                                        info!("🛡️ SCORE-CONFIRM GATE: {} score={} leading_side={} but value_side={} — score CONTRADICTS anomaly, blocking",
+                                                            anomaly.match_key, score, leading_side, anomaly.value_side);
+                                                    }
+                                                    confirmed
+                                                }
+                                            } else { false }
+                                        } else { false }
+                                    } else {
+                                        // No live score at all → cannot confirm → skip
+                                        false
+                                    };
+
+                                    // === DISCREPANCY MINIMUM for auto-bet ===
+                                    let anomaly_disc_ok = anomaly.discrepancy_pct >= ANOMALY_MIN_DISC_AUTOBET;
+                                    if !anomaly_disc_ok && anomaly.discrepancy_pct >= MIN_EDGE_PCT {
+                                        info!("📊 ANOMALY DISC TOO LOW for auto-bet: {} disc={:.1}% < {:.0}% (alert only)",
+                                            anomaly.match_key, anomaly.discrepancy_pct, ANOMALY_MIN_DISC_AUTOBET);
+                                    }
+
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
-                                        && anomaly.confidence == "HIGH" // BUG FIX: was missing! MEDIUM anomalies were auto-bet
+                                        && anomaly.confidence == "HIGH"
                                         && anomaly_odds_ok
-                                        && anomaly_sport_allowed // sport-specific anomaly guard
-                                        && anomaly_within_daily_limit // BUG FIX: anomaly path was missing explicit daily limit check
+                                        && anomaly_sport_allowed
+                                        && anomaly_score_confirmed // SCORE-CONFIRMED: leading team = value side
+                                        && anomaly_disc_ok         // DISC MINIMUM: ≥15% for auto-bet
+                                        && anomaly_within_daily_limit
                                         && azuro_odds >= AUTO_BET_MIN_ODDS
                                         && !azuro_odds_identical
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
-                                        && !anomaly_condition_blacklisted // CONDITION BLACKLIST: skip dead conditions
-                                        && !anomaly_match_blacklisted     // MATCH BLACKLIST: skip dead matches
+                                        && !anomaly_condition_blacklisted
+                                        && !anomaly_match_blacklisted
                                         && anomaly.condition_id.is_some()
                                         && anomaly.outcome_id.is_some()
-                                        && anomaly_stake >= 0.50 // EXPOSURE CAP
-                                        && anomaly_bankroll_ok   // MIN_BANKROLL guard
+                                        && anomaly_stake >= 0.50
+                                        && anomaly_bankroll_ok
                                         && anomaly_pending_ok    // MAX_CONCURRENT_PENDING guard
                                         && anomaly_streak_ok;    // LOSS_STREAK pause guard
 

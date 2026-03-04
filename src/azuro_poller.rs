@@ -513,14 +513,13 @@ async fn poll_subgraph(
 // WS Shadow Mode — daemon task
 // ====================================================================
 
-/// Run the WS shadow observer. Receives condition ID sets via watch channel,
-/// subscribes to Azuro WS stream, and logs all ConditionUpdated events
-/// with timing delta vs GQL polling for comparison.
-///
-/// This task does NOT modify FeedHubState — it's purely observational.
+/// Run the WS live updater. Receives condition ID sets via watch channel,
+/// subscribes to Azuro WS stream, and ACTIVELY updates FeedHubState odds
+/// when ConditionUpdated events arrive — making odds fresher than GQL polling.
 async fn run_shadow_ws(
     mut condition_rx: watch::Receiver<ConditionSets>,
     metrics: Arc<WsShadowMetrics>,
+    state: FeedHubState,
 ) {
     let mut backoff_idx: usize = 0;
 
@@ -633,29 +632,28 @@ async fn run_shadow_ws(
                             match event {
                                 "ConditionUpdated" => {
                                     metrics.updates_received.fetch_add(1, Ordering::Relaxed);
-                                    let cid = incoming.id.as_deref().unwrap_or("?");
+                                    let cid = incoming.id.as_deref().unwrap_or("?").to_string();
 
-                                    // Extract odds from data.outcomes
-                                    let odds_str = if let Some(data) = &incoming.data {
+                                    // Extract new odds from data.outcomes (sortOrder 0=team1, 1=team2)
+                                    let mut new_odds1: Option<f64> = None;
+                                    let mut new_odds2: Option<f64> = None;
+                                    if let Some(data) = &incoming.data {
                                         if let Some(outcomes) = data.get("outcomes").and_then(|v| v.as_array()) {
-                                            outcomes
-                                                .iter()
-                                                .filter_map(|o| {
-                                                    let oid = o.get("outcomeId").and_then(|v| v.as_u64());
-                                                    let odds = o.get("currentOdds").and_then(|v| v.as_str());
-                                                    match (oid, odds) {
-                                                        (Some(id), Some(o)) => Some(format!("{}={}", id, o)),
-                                                        _ => None,
+                                            for o in outcomes {
+                                                let sort = o.get("sortOrder").and_then(|v| v.as_u64());
+                                                let odds_raw = o.get("currentOdds").and_then(|v| v.as_str());
+                                                if let (Some(s), Some(raw)) = (sort, odds_raw) {
+                                                    if let Some(parsed) = parse_decimal_odds(raw) {
+                                                        match s {
+                                                            0 => new_odds1 = Some(parsed),
+                                                            1 => new_odds2 = Some(parsed),
+                                                            _ => {}
+                                                        }
                                                     }
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(", ")
-                                        } else {
-                                            "no-outcomes".to_string()
+                                                }
+                                            }
                                         }
-                                    } else {
-                                        "no-data".to_string()
-                                    };
+                                    }
 
                                     let state_str = incoming.data
                                         .as_ref()
@@ -663,12 +661,41 @@ async fn run_shadow_ws(
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("?");
 
+                                    // ACTIVE UPDATE: patch state.odds with fresh WS data
+                                    if let (Some(o1), Some(o2)) = (new_odds1, new_odds2) {
+                                        let now = Utc::now();
+                                        let mut odds_w = state.odds.write().await;
+                                        let mut updated = false;
+                                        for (_ok, os) in odds_w.iter_mut() {
+                                            if os.payload.condition_id.as_deref() == Some(cid.as_str()) {
+                                                let old1 = os.payload.odds_team1;
+                                                let old2 = os.payload.odds_team2;
+                                                os.payload.odds_team1 = o1;
+                                                os.payload.odds_team2 = o2;
+                                                os.seen_at = now;
+                                                updated = true;
+                                                if (old1 - o1).abs() > 0.01 || (old2 - o2).abs() > 0.01 {
+                                                    info!(
+                                                        "[SHADOW-WS] LIVE UPDATE cid={}..{} odds {:.2}/{:.2} → {:.2}/{:.2}",
+                                                        &cid[..cid.len().min(12)],
+                                                        &cid[cid.len().saturating_sub(4)..],
+                                                        old1, old2, o1, o2
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        drop(odds_w);
+                                        if !updated {
+                                            debug!("[SHADOW-WS] ConditionUpdated cid={} — no matching OddsState", &cid[..cid.len().min(20)]);
+                                        }
+                                    }
+
                                     let total = metrics.updates_received.load(Ordering::Relaxed);
                                     debug!(
-                                        "[SHADOW-WS] ConditionUpdated cid={} state={} odds=[{}] (total: {})",
+                                        "[SHADOW-WS] ConditionUpdated cid={} state={} o1={:?} o2={:?} (total: {})",
                                         &cid[..cid.len().min(20)],
                                         state_str,
-                                        odds_str,
+                                        new_odds1, new_odds2,
                                         total
                                     );
                                 }
@@ -768,10 +795,11 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
     });
     let (condition_tx, condition_rx) = watch::channel::<ConditionSets>((vec![], vec![]));
     let ws_metrics_clone = ws_metrics.clone();
+    let ws_state = state.clone();
     tokio::spawn(async move {
-        run_shadow_ws(condition_rx, ws_metrics_clone).await;
+        run_shadow_ws(condition_rx, ws_metrics_clone, ws_state).await;
     });
-    info!("[SHADOW-WS] Shadow WebSocket daemon spawned");
+    info!("[SHADOW-WS] ACTIVE WebSocket daemon spawned (live odds updates enabled)");
 
     // Minimal startup delay
     tokio::time::sleep(Duration::from_secs(1)).await;

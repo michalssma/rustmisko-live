@@ -1478,12 +1478,28 @@ fn fuzzy_find_key<'a>(needle: &str, candidates: &'a [&str]) -> Option<&'a str> {
         // Check strong team equivalence in both orderings.
         // This handles truncated forms like "virginiacavalie" vs "virginiacavaliers"
         // and minor source-specific naming differences.
-        let match_fwd = team_name_equivalent(c_a, n_a)
-            && team_name_equivalent(c_b, n_b);
-        let match_rev = team_name_equivalent(c_a, n_b)
-            && team_name_equivalent(c_b, n_a);
-        if match_fwd || match_rev {
-            return Some(cand);
+        let a_match = team_name_equivalent(c_a, n_a);
+        let b_match = team_name_equivalent(c_b, n_b);
+        let a_rev_match = team_name_equivalent(c_a, n_b);
+        let b_rev_match = team_name_equivalent(c_b, n_a);
+
+        let is_esports = matches!(sport, "cs2" | "dota-2" | "league-of-legends" | "valorant" | "esports");
+
+        if is_esports {
+            // THE SHARED OPPONENT LOOPHOLE (for esports only)
+            // A team cannot play two different matches at the exact same time.
+            // If at least one team name strongly matches, we assume the other is an alias pairing and force a match.
+            // E.g., "NAVI" matches "Natus Vincere" because their opponent "Faze" matched perfectly.
+            if a_match || b_match || a_rev_match || b_rev_match {
+                return Some(cand);
+            }
+        } else {
+            // Strict AND matching for traditional sports
+            let match_fwd = a_match && b_match;
+            let match_rev = a_rev_match && b_rev_match;
+            if match_fwd || match_rev {
+                return Some(cand);
+            }
         }
     }
     None

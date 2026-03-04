@@ -98,9 +98,12 @@
             for(let j=0; j<5; j++) {
                 if(!prev) break;
                 const text = prev.innerText || '';
-                // Pokud text vypadá jako hlavička (krátký, bez skóre, bez tlačítka play)
-                if (text.length > 2 && text.length < 100 && !/\d:\d/.test(text) && !text.includes('1.8') && text.includes(',')) {
-                    return text.toLowerCase();
+                if (text.length > 2 && text.length < 150) {
+                    const lower = text.toLowerCase();
+                    // Pokud obsahuje známý sport, je to přímo hlavička události
+                    if (lower.includes('fotbal') || lower.includes('tenis') || lower.includes('basket') || lower.includes('nba') || lower.includes('volejbal') || ALLOWED_ESPORTS.some(e => lower.includes(e))) {
+                        return lower;
+                    }
                 }
                 prev = prev.previousElementSibling;
             }
@@ -162,20 +165,21 @@
             for (let i = 1; i < lines.length; i++) {
                 const line = lines[i];
 
-                // Hlavní skóre (formát X:Y přesně, nebo jako 0:0 v stringu bez nového řádku)
-                if (/^\d{1,3}:\d{1,3}$/.test(line)) {
-                    mainScoreStr = line;
-                }
-                // Detailní skóre (obsahuje mapa, set, pol., třetina, Lepší)
-                else if (line.includes('mapa') || line.includes('set') || line.includes('pol.') || line.includes('.tř.') || line.includes('Lepší z') || line.includes('přestávka') || (line.includes('(') && line.includes(')'))) {
-                    detailedScore = line;
-                    // Extrakce kol pro esport
-                    if (sport === 'esport') {
-                        const scorePartIndex = line.lastIndexOf('-');
-                        if (scorePartIndex !== -1 && /[0-9:]/.test(line.substring(scorePartIndex))) {
-                             esportRounds = line.substring(scorePartIndex + 1).trim();
+                // 1. Skóre s případnými doplňky v závorce (např. "0:1 (6:18)" nebo "1:0")
+                const scoreMatch = line.match(/^(\d{1,3}:\d{1,3})(?:\s*\((.*?)\))?/);
+                if (scoreMatch) {
+                    mainScoreStr = scoreMatch[1];
+                    if (scoreMatch[2]) {
+                        detailedScore = line;
+                        if (sport === 'esport') {
+                           // Extrakce kol pro CS2 (např. "6:18")
+                           esportRounds = scoreMatch[2].trim();
                         }
                     }
+                }
+                // 2. Detailní skóre (fáze zápasu jako "Lepší z", "mapa", "set")
+                else if (line.includes('mapa') || line.includes('set') || line.includes('pol.') || line.includes('.tř.') || line.includes('Lepší z') || line.includes('přestávka') || (line.includes('(') && line.includes(')'))) {
+                    detailedScore = line;
                 }
                 // Časový údaj (Za X minut, Za okamžik)
                 else if (line.startsWith('Za ')) {
