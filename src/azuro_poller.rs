@@ -624,6 +624,7 @@ async fn run_shadow_ws(
                 Ok(Some(Ok(WsMessage::Text(txt)))) => {
                     let now_ms = Utc::now().timestamp_millis();
                     metrics.last_update_epoch_ms.store(now_ms, Ordering::Relaxed);
+                    state.ws_last_ok_ms.store(now_ms, Ordering::Relaxed);
 
                     // Parse incoming JSON
                     match serde_json::from_str::<WsIncoming>(&txt) {
@@ -967,6 +968,7 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
         } else {
             debug!("azuro poll: 0 games with odds right now");
         }
+        state.gql_last_ok_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
 
         // ── Feed active condition IDs to WS Shadow daemon ──
         {

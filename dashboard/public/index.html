@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>RustMisko Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Top bar -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="logo">⚡ RustMisko</span>
+    </div>
+    <div class="topbar-right">
+      <span id="balance" class="balance">--</span>
+      <span id="conn-dot" class="dot grey" title="WebSocket"></span>
+    </div>
+  </header>
+
+  <!-- Tab content -->
+  <main class="content">
+
+    <!-- ── TAB: DASHBOARD ── -->
+    <section id="tab-dashboard" class="tab active">
+
+      <!-- Health row -->
+      <div class="row health-row">
+        <div class="chip-group">
+          <span class="chip-label">WS</span>
+          <span id="chip-ws" class="chip grey">—</span>
+        </div>
+        <div class="chip-group">
+          <span class="chip-label">GQL</span>
+          <span id="chip-gql" class="chip grey">—</span>
+        </div>
+        <div class="chip-group">
+          <span class="chip-label">EXEC</span>
+          <span id="chip-exec" class="chip grey">—</span>
+        </div>
+        <div class="chip-group">
+          <span class="chip-label">BOT</span>
+          <span id="chip-bot" class="chip grey">—</span>
+        </div>
+      </div>
+
+      <!-- Process row -->
+      <div class="row process-row">
+        <div id="proc-feed-hub" class="proc-chip">feed-hub <span class="dot grey"></span></div>
+        <div id="proc-alert-bot" class="proc-chip">alert-bot <span class="dot grey"></span></div>
+        <div id="proc-executor" class="proc-chip">executor <span class="dot grey"></span></div>
+      </div>
+
+      <!-- P&L + win rate -->
+      <div class="row stats-row">
+        <div class="stat-card">
+          <div class="stat-label">P&L dnes</div>
+          <div id="pnl-today" class="stat-value">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Win rate</div>
+          <div id="win-rate" class="stat-value">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Bety dnes</div>
+          <div id="bets-today" class="stat-value">—</div>
+        </div>
+      </div>
+
+      <!-- Pending bets -->
+      <div class="card">
+        <div class="card-header" onclick="togglePending()">
+          <span>⏳ Pending bety</span>
+          <span id="pending-count" class="badge">0</span>
+          <span class="chevron" id="pending-chevron">▼</span>
+        </div>
+        <div id="pending-list" class="pending-list hidden"></div>
+      </div>
+
+      <!-- Emergency stop -->
+      <button id="btn-killall" class="btn danger full-width" onclick="killAll()">
+        🛑 EMERGENCY STOP (Kill All)
+      </button>
+    </section>
+
+    <!-- ── TAB: BETY ── -->
+    <section id="tab-bets" class="tab hidden">
+      <div class="card">
+        <div class="card-header">Posledních 50 betů</div>
+        <div id="bets-list" class="bets-list"></div>
+      </div>
+    </section>
+
+    <!-- ── TAB: CONTROLS ── -->
+    <section id="tab-controls" class="tab hidden">
+      <div class="card">
+        <div class="card-header">Process Management</div>
+        <div class="proc-controls">
+          <div class="proc-row">
+            <span>feed-hub</span>
+            <div class="btn-pair">
+              <button class="btn sm green" onclick="startProc('feed-hub')">▶ Start</button>
+              <button class="btn sm red"   onclick="stopProc('feed-hub')">■ Stop</button>
+            </div>
+          </div>
+          <div class="proc-row">
+            <span>alert-bot</span>
+            <div class="btn-pair">
+              <button class="btn sm green" onclick="startProc('alert-bot')">▶ Start</button>
+              <button class="btn sm red"   onclick="stopProc('alert-bot')">■ Stop</button>
+            </div>
+          </div>
+          <div class="proc-row">
+            <span>executor</span>
+            <div class="btn-pair">
+              <button class="btn sm green" onclick="startProc('executor')">▶ Start</button>
+              <button class="btn sm red"   onclick="stopProc('executor')">■ Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Log (dnes)</div>
+        <div id="log-view" class="log-view">Klikni na proces pro log...</div>
+        <div class="btn-pair" style="padding:8px">
+          <button class="btn sm" onclick="loadLog('alert-bot')">Bot log</button>
+          <button class="btn sm" onclick="loadLog('feed-hub')">Feed log</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Účet</div>
+        <button class="btn full-width muted" disabled>
+          💸 Withdraw (placeholder — neaktivní)
+        </button>
+      </div>
+
+      <div style="padding:12px">
+        <a href="/logout" class="btn full-width muted">Odhlásit</a>
+      </div>
+    </section>
+
+    <!-- ── TAB: STATS ── -->
+    <section id="tab-stats" class="tab hidden">
+      <div class="card">
+        <div class="card-header">Výkon (posledních 50 betů)</div>
+        <div id="stats-content" class="stats-content">Načítám...</div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Bottom tab nav -->
+  <nav class="tabnav">
+    <button class="tabnav-btn active" onclick="switchTab('dashboard', this)">📊<br>Přehled</button>
+    <button class="tabnav-btn"        onclick="switchTab('bets', this)">🎯<br>Bety</button>
+    <button class="tabnav-btn"        onclick="switchTab('controls', this)">⚙️<br>Ovládání</button>
+    <button class="tabnav-btn"        onclick="switchTab('stats', this)">📈<br>Stats</button>
+  </nav>
+
+  <!-- Pending bet modal -->
+  <div id="modal" class="modal hidden" onclick="closeModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <span id="modal-title">Bet detail</span>
+        <button class="modal-close" onclick="closeModal()">✕</button>
+      </div>
+      <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

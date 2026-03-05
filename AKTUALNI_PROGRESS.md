@@ -1,20 +1,20 @@
 # AKTUALNI_PROGRESS
 
-Aktualizováno: **2026-03-01 10:00**
+Aktualizováno: **2026-03-05 15:00**
 Repo: `C:\RustMiskoLive`
 
 ## Source of truth (teď)
 
 Tento soubor je jediný „live" přehled stavu. Ostatní strategické `.md` ber jako plán/historii.
 
-## Runtime stav (ověřeno 10:00)
+## Runtime stav (ověřeno 2026-03-05)
 
 - Executor: **ONLINE** — port 3030
-- Feed-hub: **ONLINE** (port 8081/8080)
-- Alert-bot: **ONLINE** — s WS State Gate + Created follow-up polling
-- **USDT balance: ~$46.64**
-- AzuroBet NFTs: **119 celkem** (viz detail níže)
-- Fortuna scraper: **v3.2** (draw filter, adaptive polling, fast scroll)
+- Feed-hub: **ONLINE** (port 8081/8080), `/health` vrací JSON `{gql_age_ms, ws_age_ms}`
+- Alert-bot: **ONLINE** — WS_STATE_GATE=false (GQL fallback), condition-dead blacklist active
+- **USDT balance: ~$26.99** (session 2026-03-05)
+- AzuroBet NFTs: viz ledger.jsonl
+- Dashboard: **INSTALLED** — port 7777 (`node dashboard/server.js`; PIN setup: `node dashboard/setup.js`)
 
 ## NFT stav (on-chain verified)
 

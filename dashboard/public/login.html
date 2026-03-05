@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login — RustMisko</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="login-page">
+  <div class="login-box">
+    <h1>⚡ RustMisko</h1>
+    <p class="login-sub">Dashboard přístup</p>
+    <div id="login-error" class="error-msg hidden"></div>
+    <input id="pin-input" type="password" inputmode="numeric" pattern="\d{6}"
+           maxlength="6" placeholder="• • • • • •" class="pin-input" autocomplete="off">
+    <button id="login-btn" class="btn full-width accent" onclick="doLogin()">Vstoupit</button>
+  </div>
+  <script>
+    const input = document.getElementById('pin-input');
+    const errorEl = document.getElementById('error-msg');
+    input.focus();
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+    // Auto-submit when 6 digits typed
+    input.addEventListener('input', () => { if (input.value.length === 6) doLogin(); });
+
+    async function doLogin() {
+      const pin = input.value.trim();
+      if (!/^\d{6}$/.test(pin)) return;
+      document.getElementById('login-btn').disabled = true;
+      try {
+        const r = await fetch('/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pin }),
+        });
+        const data = await r.json();
+        if (data.ok) { window.location.href = '/'; }
+        else {
+          showError(data.error || 'Špatný PIN');
+          input.value = '';
+          input.focus();
+        }
+      } catch (e) { showError('Chyba připojení'); }
+      finally { document.getElementById('login-btn').disabled = false; }
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('login-error');
+      el.textContent = msg; el.classList.remove('hidden');
+      setTimeout(() => el.classList.add('hidden'), 4000);
+    }
+  </script>
+</body>
+</html>

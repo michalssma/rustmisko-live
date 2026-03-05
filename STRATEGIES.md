@@ -1,6 +1,6 @@
 # Strategie
 
-Aktualizováno: **2026-03-01**
+Aktualizováno: **2026-03-05**
 
 ## Aktivní produkční strategie
 
@@ -16,7 +16,7 @@ Aktualizováno: **2026-03-01**
 ### 2. Path B: Odds anomaly (sekundární)
 - **Trigger**: HIGH confidence, 2+ market sources, bounded discrepancy
 - **Stake**: **$0.50–$1.00** (dynamicky dle odds: `base × (1.25/odds)^1.5`, cap $1.00)
-- **Odds range**: 1.15–2.50 (CS2 map: 1.15–3.00)
+- **Odds range**: **1.70–2.50** (CS2 map: 1.70–3.00)
 - **Min discrepancy**: **28%** (zvýšeno z 22%; bets pod 28% měly záporné EV v produkci)
 - **Guards**: `!azuro_odds_identical` + MIN_ODDS + MAX_ODDS check
 - **Sporty**: ALL (football + basketball anomaly ON)
@@ -30,7 +30,7 @@ Aktualizováno: **2026-03-01**
 ## Risk guardy
 
 ### Layer 1: Vstupní filtry
-- Min/max odds: 1.15–2.50 (CS2 map: až 3.00)
+- Min/max odds: **1.70–2.50** (CS2 map: až 3.00) — break-even při 59% WR = $1/0.59 = 1.695$
 - Max odds age: 20s (stale data skip)
 - Sport-specific min edge: 12%–18%
 - Identické Azuro odds guard (`penalty += 6`)

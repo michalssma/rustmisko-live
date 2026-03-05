@@ -1,0 +1,16 @@
+{
+  "name": "rustmisko-dashboard",
+  "version": "1.0.0",
+  "description": "RustMiskoLive monitoring dashboard",
+  "main": "server.js",
+  "scripts": {
+    "setup": "node setup.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2",
+    "express": "^4",
+    "jsonwebtoken": "^9",
+    "ws": "^8"
+  }
+}

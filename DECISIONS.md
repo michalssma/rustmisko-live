@@ -198,6 +198,63 @@ Nový agent: přečti CONTEXT.md → pak tento soubor → pak kóduj.
 
 ---
 
+## 2026-03-05 — Condition-dead blacklist fix
+
+**Rozhodnutí:** Přidat `is_condition_dead` flag pro errory obsahující "not available" / "live is not".
+**Proč:** Tyto errory způsobovaly 3x retry spam (circleinner map3, 3× stejná chyba) místo okamžitého blacklistu.
+**Implementace:** alert_bot.rs, obě paths (edge + anomaly). Condition jde přímo do `condition_blacklist`, bez retry.
+
+---
+
+## 2026-03-05 — WS_STATE_GATE disabled
+
+**Rozhodnutí:** `WS_STATE_GATE=false` v start_system.ps1.
+**Proč:** WS-GATE byl duplicitní WS (1700ms pomalejší než SHADOW-WS). GQL fallback (age check) je dostatečný. SHADOW-WS zůstává aktivní.
+**Rollback:** Změnit `'false'` → `'true'` v start_system.ps1 řádek ~94.
+
+---
+
+## 2026-03-05 — CONDITION_MAX_AGE_MS 2000 → 4000, WS_SUBSCRIBE_THROTTLE_SECS 5 → 2
+
+**Rozhodnutí:** Zvýšit age limit z 2s na 4s, snížit WS subscribe throttle z 5s na 2s.
+**Proč:** GQL poll cycle je 3s → 2s způsoboval false drops. WS throttle 5s zvětšoval NoData okno.
+
+---
+
+## 2026-03-05 — AUTO_BET_MIN_ODDS zvýšeno 1.40 → 1.70
+
+**Rozhodnutí:** `AUTO_BET_MIN_ODDS` zvýšeno z 1.40 na 1.70.
+**Proč:** Analýza dnešních proher: bety na 1.25–1.47 potřebují 68–80% WR. Naše reálná WR je 59%. Break-even = 1/0.59 = 1.695.
+**Příklady ztrátových betů:** `liquid_vs_semperfi @ 1.27`, `acend_vs_kolesie::map2 @ 1.47`, `3dmax @ 1.25`.
+**Implementace:** alert_bot.rs řádek 57.
+
+---
+
+## 2026-03-05 — ANOMALY_MIN_DISC_AUTOBET 22 → 28
+
+**Rozhodnutí:** Minimální discrepancy pro anomaly auto-bet zvýšena z 22% na 28%.
+**Proč:** Tennis anomaly bety pod 28% měly záporné EV v produkci.
+
+---
+
+## 2026-03-05 — Feed-hub /health rozšíření o GQL + WS metriky
+
+**Rozhodnutí:** Endpoint `/health` vrací JSON `{ok, gql_age_ms, ws_age_ms}` místo `"ok"`.
+**Proč:** Dashboard potřebuje real-time health indikátory.
+**Implementace:** `gql_last_ok_ms` + `ws_last_ok_ms` jako `Arc<AtomicI64>` v `FeedHubState`. azuro_poller.rs je zapisuje.
+
+---
+
+## 2026-03-05 — Dashboard (port 7777)
+
+**Rozhodnutí:** Node.js monitoring dashboard na portu 7777 pro iPhone přes VPN.
+**Stack:** Express, ws, bcryptjs, jsonwebtoken. Vanilla JS, zero build step.
+**Auth:** 6-digit PIN → bcrypt → JWT httpOnly cookie 24h. Max 5 pokusů → 15min lockout.
+**Features:** 4 taby (Přehled/Bety/Ovládání/Stats), WS push každé 2s, health chips WS/GQL/EXEC/BOT, process start/stop, emergency stop.
+**Spuštění:** `node dashboard/setup.js` (jednou) → `node dashboard/server.js`.
+
+---
+
 ## 2026-03-01 — Tennis min edge 15→12 (commit 45b1713)
 
 **Rozhodnutí:** Tennis min_edge snížen z 15% na 12%.

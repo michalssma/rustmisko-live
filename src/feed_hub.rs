@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -198,6 +198,10 @@ struct FeedHubState {
     connections: Arc<RwLock<usize>>,
     alias_cache: AliasCache,
     ingest_lock: Arc<Mutex<()>>,
+    /// Epoch ms of last successful GQL poll cycle (written by azuro_poller, read by /health)
+    gql_last_ok_ms: Arc<AtomicI64>,
+    /// Epoch ms of last SHADOW-WS update received (written by azuro_poller, read by /health)
+    ws_last_ok_ms: Arc<AtomicI64>,
 }
 
 impl FeedHubState {
@@ -208,6 +212,8 @@ impl FeedHubState {
             connections: Arc::new(RwLock::new(0)),
             alias_cache: new_alias_cache(),
             ingest_lock: Arc::new(Mutex::new(())),
+            gql_last_ok_ms: Arc::new(AtomicI64::new(0)),
+            ws_last_ok_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 }
@@ -2258,7 +2264,15 @@ async fn handle_http_connection(mut stream: TcpStream, state: FeedHubState) -> R
     }
 
     let (status_line, content_type, body) = match (method, path) {
-        ("GET", "/health") => ("HTTP/1.1 200 OK", "text/plain; charset=utf-8", "ok".to_string()),
+        ("GET", "/health") => {
+            let now_ms = Utc::now().timestamp_millis();
+            let gql_last = state.gql_last_ok_ms.load(Ordering::Relaxed);
+            let ws_last = state.ws_last_ok_ms.load(Ordering::Relaxed);
+            let gql_age = if gql_last > 0 { now_ms - gql_last } else { -1_i64 };
+            let ws_age = if ws_last > 0 { now_ms - ws_last } else { -1_i64 };
+            let body = format!("{{\"ok\":true,\"gql_age_ms\":{},\"ws_age_ms\":{}}}", gql_age, ws_age);
+            ("HTTP/1.1 200 OK", "application/json; charset=utf-8", body)
+        }
         ("GET", "/state") => {
             let snap = build_state_snapshot(&state).await;
             let json = serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string());
