@@ -8,12 +8,17 @@ let activeStatsPeriod = 1;
 let currentSportFocus = ['all'];
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
+let wsReady = false;
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
 
-  ws.addEventListener('open', () => setDot('conn-dot', 'green'));
+  ws.addEventListener('open', () => {
+    setDot('conn-dot', 'green');
+    wsReady = true;
+  });
   ws.addEventListener('close', (e) => {
+    wsReady = false;
     // 4001 is sent by server for missing/expired auth cookie.
     if (e && e.code === 4001) {
       window.location.href = '/login.html';
@@ -26,7 +31,13 @@ function connectWs() {
   ws.addEventListener('message', e => {
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'status') { lastData = msg.data; render(msg.data); }
+      if (msg.type === 'status') {
+        lastData = msg.data;
+        render(msg.data);
+        // Hide loading overlay after first message
+        const overlay = document.getElementById('loading-overlay');
+        if (overlay) overlay.style.display = 'none';
+      }
     } catch {}
   });
 }

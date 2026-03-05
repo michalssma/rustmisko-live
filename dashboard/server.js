@@ -80,17 +80,35 @@ function authApi(req, res, next) {
 }
 
 // ── HTTP fetch helper ─────────────────────────────────────────────────────────
-function fetchJson(url, timeoutMs = 2000) {
+function fetchJson(url, timeoutMs = 2000, opts = {}) {
   return new Promise(resolve => {
     const mod = url.startsWith('https') ? require('https') : require('http');
     try {
-      const req = mod.get(url, { timeout: timeoutMs }, res => {
-        let buf = '';
-        res.on('data', d => buf += d);
-        res.on('end', () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.on('timeout', () => { req.destroy(); resolve(null); });
+      const reqOpts = { timeout: timeoutMs };
+      if (opts.method === 'POST') {
+        const urlObj = new URL(url);
+        reqOpts.hostname = urlObj.hostname;
+        reqOpts.path = urlObj.pathname;
+        reqOpts.method = 'POST';
+        reqOpts.headers = opts.headers || {};
+        const req = mod.request(reqOpts, res => {
+          let buf = '';
+          res.on('data', d => buf += d);
+          res.on('end', () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+        if (opts.body) req.write(opts.body);
+        req.end();
+      } else {
+        const req = mod.get(url, reqOpts, res => {
+          let buf = '';
+          res.on('data', d => buf += d);
+          res.on('end', () => { try { resolve(JSON.parse(buf)); } catch { resolve(null); } });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+      }
     } catch { resolve(null); }
   });
 }
@@ -191,9 +209,21 @@ async function getStatus() {
 
   const balanceRaw   = execHealth?.balance ?? execHealth?.balanceUsd ?? null;
   const balance      = balanceRaw != null ? parseFloat(balanceRaw) : null;
-  // MATIC: executor /health does not expose native balance; read from RPC or set null for now.
-  // TODO: add RPC call to get MATIC balance if needed for display.
-  const maticBalance = null;
+  // MATIC: fetch native balance via RPC
+  let maticBalance = null;
+  if (execHealth?.wallet) {
+    try {
+      const rpcRes = await fetchJson('https://polygon-rpc.com', 5000, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_getBalance', params: [execHealth.wallet, 'latest'], id: 1 })
+      });
+      if (rpcRes?.result) {
+        const weiBalance = BigInt(rpcRes.result);
+        maticBalance = parseFloat((Number(weiBalance) / 1e18).toFixed(4));
+      }
+    } catch {}
+  }
 
   return {
     ts: new Date().toISOString(),
