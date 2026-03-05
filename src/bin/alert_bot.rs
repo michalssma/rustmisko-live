@@ -1,4 +1,4 @@
-//! Telegram Alert Bot pro CS2 odds anomálie
+﻿//! Telegram Alert Bot pro CS2 odds anomálie
 //!
 //! Standalone binary — polluje feed-hub /opportunities endpoint,
 //! detekuje odds discrepancy mezi Azuro a trhem, posílá Telegram alerty.
@@ -53,14 +53,15 @@ const AUTO_BET_STAKE_USD: f64 = 3.0;
 /// Paper-trading for data-collection sports (tennis, basketball) — ZERO USD risk, logs only!
 const AUTO_BET_STAKE_LOW_USD: f64 = 0.0;
 /// Minimum Azuro odds to auto-bet (skip heavy favorites, prevents massive risk/reward leakage)
-/// Relaxed 1.50→1.40: slightly broader range for score-edge bets (no anomaly path anymore)
-const AUTO_BET_MIN_ODDS: f64 = 1.40;
+/// Raised 1.40→1.70: at 59% WR break-even is 1/0.59=1.695 — below 1.70 is systematically -EV
+const AUTO_BET_MIN_ODDS: f64 = 1.70;
 /// Maximum odds for auto-bet (skip extreme underdogs)
 /// Relaxed 2.50→3.00: score-edge is fact-based, safe to bet slightly wider
 const AUTO_BET_MAX_ODDS: f64 = 3.00;
 /// CS2 map_winner exception: allow higher odds (score-based edge is more reliable on maps)
 const AUTO_BET_MAX_ODDS_CS2_MAP: f64 = 3.00;
-const SCORE_EDGE_STAKE_MAX_MULT: f64 = 2.5;
+/// Lowered 2.5→1.5: map-level bets are correlated within same series, limiting max multiplier reduces double-exposure risk (KRU map2+map3 = $2.88 at 2.5x)
+const SCORE_EDGE_STAKE_MAX_MULT: f64 = 1.5;
 const ESPORTS_MAPLEVEL_MATCH_EDGE_MIN_PCT: f64 = 16.0;
 const ESPORTS_MAPLEVEL_MATCH_MAX_ODDS: f64 = 1.65;
 const FOOTBALL_LATE_GAME_MINUTE: i32 = 70;
@@ -95,7 +96,9 @@ const DEDUP_HISTORY_LOOKBACK_HOURS: i64 = 8;
 /// Max age since last GQL sighting of this condition as Active
 /// If condition_age_ms > this, DROP before sending to executor
 /// ROLLBACK: set to 999_999 to effectively disable pre-flight gate
-const CONDITION_MAX_AGE_MS: u64 = 2000;
+/// Raised 2000→4000: GQL poll cycle is 3s, 2s was causing valid conditions to be dropped
+/// (condition fresh at t=0, bet decision at t=2.1s → age=2100ms > 2000ms → DROP = false negative)
+const CONDITION_MAX_AGE_MS: u64 = 4000;
 /// Base chain poll cadence is much slower than Polygon WS/GQL cadence.
 /// Tightened 120s→30s: still allows Base bets, but cuts truly stale conditions.
 const CONDITION_MAX_AGE_MS_BASE: u64 = 30_000;
@@ -116,8 +119,8 @@ const MIN_ODDS_FACTOR_TENNIS: f64 = 0.82;
 /// Basketball live also has fast score swings; use intermediate factor.
 const MIN_ODDS_FACTOR_BASKETBALL: f64 = 0.83;
 /// Prefer auto-bet only when anomaly is confirmed by at least N market sources
-/// Relaxed 2→1: with 2+ devices online, single source is safe with other guards
-const AUTO_BET_MIN_MARKET_SOURCES: usize = 1;
+/// Restored 1→2: single-source bets (e.g. Tipsport only) showed higher loss rate in production data
+const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
 /// Ignore stale odds snapshots older than this threshold
 const MAX_ODDS_AGE_SECS: i64 = 20;
 /// Maximum concurrent pending bets (inflight guard)
@@ -165,7 +168,9 @@ const WS_STALE_MS: u64 = 500;
 /// Reconnect backoff sequence (ms)
 const WS_GATE_BACKOFF_MS: &[u64] = &[500, 1_000, 2_000, 5_000, 15_000];
 /// Subscribe throttle: don't re-send SubscribeConditions more than once per N seconds
-const WS_SUBSCRIBE_THROTTLE_SECS: u64 = 5;
+/// Lowered 5→2: reduces NoData race window (bet arrives before WS subscribe response)
+/// At 5s throttle, a bet on a new condition always sees NoData on first attempt
+const WS_SUBSCRIBE_THROTTLE_SECS: u64 = 2;
 /// Maximum conditions to track before GC of stale entries
 const WS_MAX_TRACKED_CONDITIONS: usize = 500;
 
@@ -458,12 +463,13 @@ const FALSE_FAVORITE_STAKE: f64 = 0.50;
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
+        // Raised 10→15%: production data shows esports edge bets at 10-14% edge are unreliable (ecstatic, basementboys, liquid all lost)
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol" | "esports"
-            => (true, 10.0, 1.0, "match_or_map"),
+            => (true, 15.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
-        // Relaxed 12→10%: score evidence is strong (sets are fact)
+        // Raised 10→12%: tighter filter for tennis edge bets
         "tennis"
-            => (true, 10.0, 1.0, "match_winner"),
+            => (true, 12.0, 1.0, "match_winner"),
         // Basketball: match_winner — point spread model
         // Relaxed 12→11%
         "basketball"
@@ -590,7 +596,9 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 1.00;
 /// Anomaly gets only 30% of daily budget (score-edge gets the rest)
 const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.30;
 /// Minimum discrepancy for anomaly AUTO-BET (higher than alert threshold MIN_EDGE_PCT=8%)
-const ANOMALY_MIN_DISC_AUTOBET: f64 = 15.0;
+/// Raised 15→22→28: tennis anomaly at 22-28% showed negative EV in production;
+/// 28%+ threshold filters to only highest-confidence anomaly signals
+const ANOMALY_MIN_DISC_AUTOBET: f64 = 28.0;
 
 /// Odds-proportional anomaly stake: safe low odds → higher stake, risky high odds → lower
 /// Formula: base × (ref_odds / azuro_odds)^1.5
@@ -613,7 +621,7 @@ fn anomaly_stake_for_odds(azuro_odds: f64) -> f64 {
 fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64, f64) {
     // Returns: (per_bet_frac, per_condition_frac, per_match_frac, daily_loss_frac, inflight_frac)
     if bankroll < 150.0 {
-        (0.05, 0.10, 0.15, 0.30, 0.47)  // micro: 5% bet, 10% cond, 15% match, 30% daily, 47% inflight
+        (0.05, 0.10, 0.15, 0.60, 0.47)  // micro: 5% bet, 10% cond, 15% match, 60% daily, 47% inflight
     } else if bankroll < 500.0 {
         (0.03, 0.08, 0.12, 0.20, 0.42)  // small
     } else if bankroll < 1500.0 {
@@ -664,14 +672,16 @@ fn trim_stake(
     sod_bankroll: f64,        // start-of-day bankroll for daily loss limit (prevents shrinking box)
     stake_path: &str,         // "score_edge" | "anomaly" (path-aware daily budget)
     azuro_odds: f64,          // REAL EDGE GUARD: odds check pro exponenciální sizing
+    limit_override: f64,      // runtime daily limit — DAILY_LOSS_LIMIT_USD or /limit override
 ) -> f64 {
     // Effective daily limit: min(hard_limit, tier-based cap)
     // Uses SOD bankroll so the limit doesn't shrink as you lose bets during the day
-    let effective_daily_limit = if !FF_EXPOSURE_CAPS {
-        DAILY_LOSS_LIMIT_USD
+    // If limit_override > DAILY_LOSS_LIMIT_USD the user explicitly raised it via /limit — skip tier cap
+    let effective_daily_limit = if !FF_EXPOSURE_CAPS || limit_override > DAILY_LOSS_LIMIT_USD {
+        limit_override
     } else {
         let (_, _, _, daily_loss_frac, _) = get_exposure_caps(sod_bankroll);
-        DAILY_LOSS_LIMIT_USD.min(sod_bankroll * daily_loss_frac)
+        limit_override.min(sod_bankroll * daily_loss_frac)
     };
 
     let path_daily_limit = if stake_path == "anomaly" {
@@ -3742,6 +3752,8 @@ async fn main() -> Result<()> {
     let mut daily_date = Utc::now().format("%Y-%m-%d").to_string();
     let mut daily_loss_alert_sent = false;
     let mut daily_loss_last_reminder: Option<DateTime<Utc>> = None;
+    /// Runtime override pro daily limit — nastaven přes /limit +X, reset na None každý nový den
+    let mut daily_limit_override: Option<f64> = None;
     // === LOSS STREAK TRACKING ===
     let mut consecutive_losses: usize = 0;
     let mut loss_streak_pause_until: Option<std::time::Instant> = None;
@@ -3768,6 +3780,13 @@ async fn main() -> Result<()> {
                         if !sod_loaded_from_file && daily_wagered > 0.0 {
                             sod_loaded_from_file = true;
                             info!("📋 SOD bankroll not in file, but mid-day restart detected (wagered > 0). Keeping default SOD=${:.2} to prevent shrinking-box", start_of_day_bankroll);
+                        }
+                        // Restore limit override if saved
+                        if let Some(ov) = v["limit_override"].as_f64() {
+                            if ov > DAILY_LOSS_LIMIT_USD {
+                                daily_limit_override = Some(ov);
+                                info!("📋 Restored limit override: ${:.0}", ov);
+                            }
                         }
                         info!("📋 Loaded daily P&L: wagered={:.2} returned={:.2} net={:.2} sod_br=${:.2}",
                             daily_wagered, daily_returned, daily_returned - daily_wagered, start_of_day_bankroll);
@@ -4331,6 +4350,7 @@ async fn main() -> Result<()> {
                                     daily_date = today_now;
                                     daily_loss_alert_sent = false;
                                     daily_loss_last_reminder = None;
+                                    daily_limit_override = None; // clear override on new day
                                     // Lock start-of-day bankroll for today's loss limit calc
                                     start_of_day_bankroll = current_bankroll;
                                     info!("📅 SOD bankroll locked: ${:.2}", start_of_day_bankroll);
@@ -4338,7 +4358,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                     }
                                     // === RESET EXPOSURE + REBET TRACKERS ===
                                     condition_exposure.clear();
@@ -4358,7 +4378,7 @@ async fn main() -> Result<()> {
                                 // Uses START-OF-DAY bankroll to prevent "shrinking box" during losing streaks
                                 let effective_daily_limit = {
                                     let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
-                                    DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
+                                    daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac))
                                 };
                                 // OBSERVABILITY: log daily loss evaluation every cycle
                                 debug!("📊 DAILY_LOSS_EVAL: net_loss=${:.2} limit=${:.2} sod_br=${:.2} cur_br=${:.2} wagered=${:.2} returned=${:.2}",
@@ -4370,13 +4390,15 @@ async fn main() -> Result<()> {
                                         .unwrap_or(true);
 
                                     if !daily_loss_alert_sent || reminder_due {
+                                        let lim_display = daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD);
                                         let msg = format!(
-                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b> (min of ${:.0} hard, {:.0}% SOD BR=${:.0})\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.",
+                                            "🛑 <b>DAILY LOSS LIMIT HIT</b>\n\nDnešní NET loss: <b>${:.2}</b> (wagered ${:.2} - returned ${:.2})\nLimit: <b>${:.2}</b> (min of ${:.0}{}, {:.0}% SOD BR=${:.0})\n\n🤖 Auto-bety jsou pozastavené do dalšího dne nebo ručního resetu.\n📡 Monitoring + alerty jedou dál.\n\n💡 Navýšit limit: /limit +10",
                                             daily_net_loss,
                                             daily_wagered,
                                             daily_returned,
                                             effective_daily_limit,
-                                            DAILY_LOSS_LIMIT_USD,
+                                            lim_display,
+                                            if daily_limit_override.is_some() { " ⚡override" } else { " hard" },
                                             get_exposure_caps(start_of_day_bankroll).3 * 100.0,
                                             start_of_day_bankroll,
                                         );
@@ -4549,7 +4571,8 @@ async fn main() -> Result<()> {
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
                                     let cv_sm = edge.cv_stake_mult;
                                     let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
-                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge", azuro_odds);
+                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge", azuro_odds,
+                                        daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD));
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -5003,11 +5026,15 @@ async fn main() -> Result<()> {
                                                             let is_condition_paused = err_lower.contains("not active")
                                                                 || err_lower.contains("paused")
                                                                 || err_lower.contains("not exist");
+                                                            // Permanent dead condition (map3 finished, live unavailable, etc.)
+                                                            // These should NEVER be retried but MUST be blacklisted immediately.
+                                                            let is_condition_dead = err_lower.contains("not available")
+                                                                || err_lower.contains("live is not");
                                                             let is_fatal = err_lower.contains("insufficient")
                                                                 || err_lower.contains("allowance")
                                                                 || err_lower.contains("revert")
                                                                 || err_lower.contains("nonce");
-                                                            if is_condition_paused && !is_fatal && attempt < max_retries {
+                                                            if is_condition_paused && !is_condition_dead && !is_fatal && attempt < max_retries {
                                                                 if let Some((new_condition_id, new_outcome_id)) = remap_execution_ids_from_state(
                                                                     &state,
                                                                     &match_key_for_bet,
@@ -5063,7 +5090,7 @@ async fn main() -> Result<()> {
                                                                 continue;
                                                             }
                                                             let is_dedup = err_lower.contains("dedup") || err_lower.contains("already bet");
-                                                            let is_condition_state_reject = is_condition_paused;
+                                                            let is_condition_state_reject = is_condition_paused || is_condition_dead;
                                                             let reason_code = if is_condition_state_reject { "ConditionNotRunning" }
                                                                 else if is_minodds_reject { "MinOddsReject" }
                                                                 else if is_dedup { "Dedup" }
@@ -5163,7 +5190,7 @@ async fn main() -> Result<()> {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
                                                                 let _ = std::fs::write("data/daily_pnl.json",
-                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
@@ -5631,7 +5658,8 @@ async fn main() -> Result<()> {
                                         old_stake
                                     };
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
-                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds);
+                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds,
+                                        daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD));
 
                                     // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
                                     let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;
@@ -5720,7 +5748,8 @@ async fn main() -> Result<()> {
                                     let anomaly_within_daily_limit = {
                                         let net = (daily_wagered - daily_returned).max(0.0);
                                         let (_, _, _, dl_frac, _) = get_exposure_caps(current_bankroll);
-                                        net < DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac)
+                                        let lim = daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(current_bankroll * dl_frac));
+                                        net < lim
                                     };
 
                                     // New guards for anomaly path too
@@ -6052,11 +6081,14 @@ async fn main() -> Result<()> {
                                                             let is_condition_paused = err_lower.contains("not active")
                                                                 || err_lower.contains("paused")
                                                                 || err_lower.contains("not exist");
+                                                            // Permanent dead condition — no retry, but blacklist immediately
+                                                            let is_condition_dead = err_lower.contains("not available")
+                                                                || err_lower.contains("live is not");
                                                             let is_fatal = err_lower.contains("insufficient")
                                                                 || err_lower.contains("allowance")
                                                                 || err_lower.contains("revert")
                                                                 || err_lower.contains("nonce");
-                                                            if is_condition_paused && !is_fatal && attempt < max_retries {
+                                                            if is_condition_paused && !is_condition_dead && !is_fatal && attempt < max_retries {
                                                                 if let Some((new_condition_id, new_outcome_id)) = remap_execution_ids_from_state(
                                                                     &state,
                                                                     &match_key_for_bet,
@@ -6111,7 +6143,7 @@ async fn main() -> Result<()> {
                                                                 continue;
                                                             }
                                                             let is_dedup_b = err_lower.contains("dedup") || err_lower.contains("already bet");
-                                                            let is_condition_state_reject_b = is_condition_paused;
+                                                            let is_condition_state_reject_b = is_condition_paused || is_condition_dead;
                                                             let reason_code_b = if is_condition_state_reject_b { "ConditionNotRunning" }
                                                                 else if is_minodds_b { "MinOddsReject" }
                                                                 else if is_dedup_b { "Dedup" }
@@ -6201,7 +6233,7 @@ async fn main() -> Result<()> {
                                                                 let today = Utc::now().format("%Y-%m-%d").to_string();
                                                                 let _ = std::fs::write(bet_count_path, format!("{}|{}", today, auto_bet_count));
                                                                 let _ = std::fs::write("data/daily_pnl.json",
-                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                                                    serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                                             }
                                                             let bet_id = br.bet_id.as_deref().unwrap_or("?");
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
@@ -6713,7 +6745,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                     }
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         &format!("💰 <b>AUTO-CLAIM (safety net)</b>\n\nVyplaceno {} sázek, ${:.2}\n💰 Nový zůstatek: {} USDT",
@@ -6838,7 +6870,7 @@ async fn main() -> Result<()> {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write(
                                             "data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string(),
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string(),
                                         );
                                     }
                                     let loss_msg = format!(
@@ -6977,7 +7009,7 @@ async fn main() -> Result<()> {
                                 {
                                     let today = Utc::now().format("%Y-%m-%d").to_string();
                                     let _ = std::fs::write("data/daily_pnl.json",
-                                        serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                        serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                 }
                                 // Notify about loss immediately
                                 let loss_msg = format!(
@@ -7095,7 +7127,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                     }
 
                                     // Build detailed notification
@@ -7198,7 +7230,7 @@ async fn main() -> Result<()> {
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                            serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                     }
                                     info!("💰 Safety-net auto-claim: {} bets, ${:.2} (daily_returned now ${:.2})", claimed, payout, daily_returned);
                                     let _ = tg_send_message(&client, &token, chat_id,
@@ -7494,9 +7526,10 @@ async fn main() -> Result<()> {
                 let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
                 let effective_daily_limit = {
                     let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
-                    DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
+                    daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac))
                 };
-                msg.push_str(&format!("   Loss limit: ${:.2} / ${:.2}\n", daily_net_loss, effective_daily_limit));
+                let lim_override_tag = if daily_limit_override.is_some() { " ⚡" } else { "" };
+                msg.push_str(&format!("   Loss limit: ${:.2} / ${:.2}{}\n", daily_net_loss, effective_daily_limit, lim_override_tag));
                 msg.push_str(&format!("   Auto-bets dnes: {}\n", auto_bet_count));
 
                 // WS gate diagnostics
@@ -7816,6 +7849,52 @@ async fn main() -> Result<()> {
                                          Pokud chceš vypnout: /nabidka"
                                     ).await;
 
+                                } else if text.starts_with("/limit") {
+                                    let arg = text.trim_start_matches("/limit").trim();
+                                    let delta_str = arg.trim_start_matches('+').trim();
+                                    if let Ok(delta) = delta_str.parse::<f64>() {
+                                        if delta <= 0.0 || delta > 500.0 {
+                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                "❌ Delta musí být 0–500 USD. Příklad: /limit +10"
+                                            ).await;
+                                        } else {
+                                            let base = DAILY_LOSS_LIMIT_USD;
+                                            let new_limit = base + delta;
+                                            daily_limit_override = Some(new_limit);
+                                            daily_loss_alert_sent = false;
+                                            daily_loss_last_reminder = None;
+                                            let net_now = (daily_wagered - daily_returned).max(0.0);
+                                            let room = (new_limit - net_now).max(0.0);
+                                            let _ = tg_send_message(&client, &token, chat_id,
+                                                &format!(
+                                                    "📈 <b>DAILY LIMIT NAVÝŠEN</b>\n\n\
+                                                     Base: ${:.0} + přidáno ${:.0} = <b>${:.0}</b>\n\
+                                                     Net loss dnes: ${:.2}\n\
+                                                     Zbývá room: <b>${:.2}</b>\n\n\
+                                                     ✅ Auto-bety odblokované.",
+                                                    base, delta, new_limit, net_now, room
+                                                )
+                                            ).await;
+                                            info!("📈 /limit +{:.0} → override={:.0} (room={:.2})", delta, new_limit, room);
+                                            ledger_write("LIMIT_OVERRIDE", &serde_json::json!({
+                                                "base": base, "delta": delta,
+                                                "new_limit": new_limit,
+                                                "net_loss_now": net_now,
+                                                "room": room,
+                                                "trigger": "manual_command"
+                                            }));
+                                        }
+                                    } else {
+                                        let cur_lim = daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD);
+                                        let net_now = (daily_wagered - daily_returned).max(0.0);
+                                        let _ = tg_send_message(&client, &token, chat_id,
+                                            &format!("❌ Syntax: /limit +10\nAktuální limit: ${:.0}{}\nNet loss dnes: ${:.2}",
+                                                cur_lim,
+                                                if daily_limit_override.is_some() { " ⚡" } else { "" },
+                                                net_now)
+                                        ).await;
+                                    }
+
                                 } else if text == "/reset_daily" || text == "/resetdaily" {
                                     let old_w = daily_wagered;
                                     let old_r = daily_returned;
@@ -7824,10 +7903,11 @@ async fn main() -> Result<()> {
                                     daily_returned = 0.0;
                                     daily_loss_alert_sent = false;
                                     daily_loss_last_reminder = None;
+                                    daily_limit_override = None; // reset override on full daily reset
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write("data/daily_pnl.json",
-                                            serde_json::json!({"date": today, "wagered": 0.0, "returned": 0.0, "sod_bankroll": start_of_day_bankroll}).to_string());
+                                            serde_json::json!({"date": today, "wagered": 0.0, "returned": 0.0, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string());
                                     }
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         &format!(
@@ -8066,9 +8146,10 @@ async fn main() -> Result<()> {
                                     let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
                                     let effective_daily_limit = {
                                         let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
-                                        DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac)
+                                        daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac))
                                     };
-                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.2}\n", daily_net_loss, effective_daily_limit));
+                                    let lim_override_tag2 = if daily_limit_override.is_some() { " ⚡override" } else { "" };
+                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.2}{}\n", daily_net_loss, effective_daily_limit, lim_override_tag2));
                                     msg.push_str(&format!("Auto-bets dnes: {}\n", auto_bet_count));
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;

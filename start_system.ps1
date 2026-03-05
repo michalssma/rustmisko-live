@@ -91,7 +91,7 @@ if (-not $env:FEED_HUB_URL) { $env:FEED_HUB_URL = 'http://127.0.0.1:8081' }
 if (-not $env:EXECUTOR_URL) { $env:EXECUTOR_URL = 'http://127.0.0.1:3030' }
 if (-not $env:CHAIN_ID) { $env:CHAIN_ID = '137' }
 if (-not $env:EXECUTOR_PORT) { $env:EXECUTOR_PORT = '3030' }
-if (-not $env:WS_STATE_GATE) { $env:WS_STATE_GATE = 'true' }
+if (-not $env:WS_STATE_GATE) { $env:WS_STATE_GATE = 'false' }  # WS-GATE disabled: duplicate of SHADOW-WS, GQL fallback handles condition age check. Rollback: set 'true'
 
 # Secrets MUST NOT be hardcoded in repo.
 # Required for live on-chain execution:

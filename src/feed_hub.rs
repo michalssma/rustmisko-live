@@ -1729,6 +1729,35 @@ async fn build_opportunities(state: &FeedHubState) -> OpportunitiesResponse {
             // Skip stale odds (>60s)
             if odds_age > 60 { continue; }
 
+            // === MAP SERIES GUARD ===
+            // map3/4/5_winner conditions exist on Azuro from the start of a series,
+            // but live relay only accepts bets when the map is actually being played.
+            // Guard prevents wasted bet attempts on maps that haven't started yet
+            // or will never be played (e.g. map3 in a 2-0 BO3 sweep).
+            //
+            // Valid series scores per map market:
+            //   map3: 1-1 (BO3/BO5) OR 2-0/0-2 (BO5 only — 3 wins needed)
+            //   map4: 2-1/1-2 (BO5) OR 3-0/0-3 (BO7 only — rare)
+            //   map5: 2-2 only
+            match odds.market.as_str() {
+                "map3_winner" => {
+                    let tied_1_1   = score1 == 1 && score2 == 1;
+                    let bo5_two_oh = (score1 == 2 && score2 == 0) || (score1 == 0 && score2 == 2);
+                    if !tied_1_1 && !bo5_two_oh {
+                        continue; // map3 not in progress — Azuro relay will reject
+                    }
+                }
+                "map4_winner" => {
+                    let valid = (score1 == 2 && score2 == 1) || (score1 == 1 && score2 == 2)
+                        || (score1 == 3 && score2 == 0) || (score1 == 0 && score2 == 3);
+                    if !valid { continue; }
+                }
+                "map5_winner" => {
+                    if !(score1 == 2 && score2 == 2) { continue; }
+                }
+                _ => {}
+            }
+
             let implied1 = 1.0 / odds.odds_team1 * 100.0;
             let implied2 = 1.0 / odds.odds_team2 * 100.0;
 
