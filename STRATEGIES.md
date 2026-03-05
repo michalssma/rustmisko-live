@@ -1,26 +1,30 @@
 # Strategie
 
-Aktualizováno: **2026-03-05**
+Aktualizováno: **2026-03-05 (post-profitability tuning)**
 
 ## Aktivní produkční strategie
 
 ### 1. Path A: Score-edge (primární)
 - **Trigger**: live score změna → edge nad sport-specifickým limitem
-- **Esports/CS2**: min edge 12%, stake **$3**, `match_or_map` market
-- **Football**: min edge 18%, stake **$3**, `match_winner`
-- **Tennis**: min edge 12%, stake **$0** (data-collection only, paper-trading)
-- **Basketball**: min edge 12%, stake **$0** (data-collection only, paper-trading)
-- **Volleyball/Hockey/Baseball/Cricket/Boxing**: min edge 15%, stake **$1**
+- **Min edge: 30%** pro VŠECHNY sporty (data-driven: WR 61.1% při ≥30%, margin +16pp)
+- **Esports/CS2**: min edge **30%**, stake **$3**, `match_or_map` market
+- **Football**: min edge **30%**, stake **$3**, `match_winner`
+- **Tennis**: min edge **30%**, stake **$0.50** (nově real — dříve paper-trading $0)
+- **Basketball**: min edge **30%**, stake **$0.50** (nově real — dříve paper-trading $0)
+- **Volleyball/Hockey/Baseball/Cricket/Boxing**: min edge **30%**, stake **$1**
 - **Cíl**: využít zpoždění adjustace kurzů po skóre změně
 
-### 2. Path B: Odds anomaly (sekundární)
+### 2. Path B: Odds anomaly (sekundární — omezená)
 - **Trigger**: HIGH confidence, 2+ market sources, bounded discrepancy
 - **Stake**: **$0.50–$1.00** (dynamicky dle odds: `base × (1.25/odds)^1.5`, cap $1.00)
-- **Odds range**: **1.70–2.50** (CS2 map: 1.70–3.00)
-- **Min discrepancy**: **28%** (zvýšeno z 22%; bets pod 28% měly záporné EV v produkci)
-- **Guards**: `!azuro_odds_identical` + MIN_ODDS + MAX_ODDS check
-- **Sporty**: ALL (football + basketball anomaly ON)
-- **Cíl**: chytat čisté anomálie s cross-book potvrzením
+- **Max odds**: **1.70** (ANOMALY_MAX_ODDS — data: tennis ≥1.70 = 30% WR katastrofa)
+- **Min discrepancy**: **28%**
+- **Guards**: `!azuro_odds_identical` + MIN_ODDS + MAX_ODDS + `azuro_odds ≤ 1.70`
+- **⚫ ESPORTS: OFF** — WR 52.4% vs break-even 60.8%, -$14.55 PnL ve VŠECH odds bucketech
+- **⚫ FOOTBALL: OFF** — `FF_FOOTBALL_ANOMALY_GOALDIFF2 = false`, WR 40%, -$4.54 PnL
+- **✅ TENNIS: ON** — odds 1.50-1.70: WR 80%, PnL +$2.61
+- **✅ BASKETBALL: ON** — WR 4/4 (malý vzorek, monitorujeme)
+- **Cíl**: pouze nejbezpečnější anomálie (tennis low-odds)
 
 ### 3. Manual bet (Telegram command)
 - **Trigger**: user reply `YES`, `3 YES $5`, atd.
@@ -30,10 +34,12 @@ Aktualizováno: **2026-03-05**
 ## Risk guardy
 
 ### Layer 1: Vstupní filtry
-- Min/max odds: **1.70–2.50** (CS2 map: až 3.00) — break-even při 59% WR = $1/0.59 = 1.695$
+- Anomaly max odds: **1.70** (ANOMALY_MAX_ODDS) — break-even při 59% WR = $1/0.59 = 1.695$
 - Max odds age: 20s (stale data skip)
-- Sport-specific min edge: 12%–18%
+- Min edge: **30%** všechny sporty (data-driven: 61.1% WR při ≥30%)
 - Identické Azuro odds guard (`penalty += 6`)
+- Esports anomaly: **OFF** (guard returns false)
+- Football anomaly: **OFF** (FF_FOOTBALL_ANOMALY_GOALDIFF2 = false)
 
 ### Layer 2: Dedup & Cooldowns
 - Per-condition dedup (s re-bet upgrade)

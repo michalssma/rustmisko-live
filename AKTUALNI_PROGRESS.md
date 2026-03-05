@@ -26,6 +26,33 @@ Tento soubor je jediný „live" přehled stavu. Ostatní strategické `.md` ber
 | **CLAIMABLE** | 0 | Nic k vyzvednutí |
 | **Celkem** | 119 | |
 
+## Profitability tuning 2026-03-05 (data-driven 4-bod plán)
+
+Na základě analýzy 119 betů (ledger.jsonl) — strategie + sport + odds buckety:
+
+### Klíčová zjištění
+- **Anomaly WR 56.3%**, ale break-even potřebuje 62.6% → ztrátové
+- **Edge WR 39.5%**, break-even 50.0% → ztrátové při nízké edge
+- **Edge ≥ 30%: WR 61.1%**, margin +16pp, PnL +$5.94 na 18 betů ✅
+- **Tennis anomaly 1.50-1.70: WR 80%**, PnL +$2.61 ✅
+- **Esports anomaly: -EV ve VŠECH odds bucketech** → OFF
+- **Football anomaly: WR 40%** → OFF
+
+### Provedené změny (alert_bot.rs)
+| Bod | Změna | Před | Po |
+|-----|-------|------|-----|
+| 1 | min_edge_pct všechny sporty | 11-15% | **30%** |
+| 2a | FF_FOOTBALL_ANOMALY_GOALDIFF2 | true | **false** |
+| 2b | ANOMALY_MAX_ODDS (nová konstanta) | — | **1.70** |
+| 2c | Esports anomaly guard | aktivní | **false (OFF)** |
+| 4 | AUTO_BET_STAKE_LOW_USD (tennis/basket) | 0.0 | **$0.50** |
+
+### Očekávaný efekt
+- Méně betů, výrazně vyšší WR
+- Pouze tennis anomaly (odds ≤1.70) a edge ≥30% všechny sporty
+- Tennis/basketball score-edge nyní real ($0.50) místo paper-trading
+- Po potvrzení 30-50 betů → zvýšení stakes na $2-3
+
 ## Git stav (aktuální commity)
 
 ```

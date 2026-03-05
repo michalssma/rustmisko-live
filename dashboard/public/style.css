@@ -274,6 +274,15 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .limits-msg.error { background:#f4433622; color:var(--red); }
 .limits-msg.hidden { display:none; }
 
+/* ── Strategy info ───────────────────────────────────────────────────────────── */
+.strategy-info { padding:10px 14px 14px; }
+.strat-section { margin-bottom:10px; }
+.strat-title { font-size:12px; font-weight:700; color:var(--accent); text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid var(--border); }
+.strat-row { display:flex; justify-content:space-between; align-items:center; padding:4px 0; font-size:13px; }
+.strat-row span:first-child { color:var(--muted); }
+.strat-val { font-weight:600; color:var(--text); }
+.strat-val.accent { color:var(--accent); }
+
 /* ── Sparkline ───────────────────────────────────────────────────────────────── */
 .sparkline-wrap { padding:10px 14px 14px; }
 

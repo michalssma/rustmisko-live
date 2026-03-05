@@ -50,8 +50,9 @@ const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches
 const AUTO_BET_ENABLED: bool = true;
 /// Base stake per auto-bet in USD
 const AUTO_BET_STAKE_USD: f64 = 3.0;
-/// Paper-trading for data-collection sports (tennis, basketball) — ZERO USD risk, logs only!
-const AUTO_BET_STAKE_LOW_USD: f64 = 0.0;
+/// Tennis/basketball score-edge: activated at $0.50 (was paper-trading $0.00)
+/// Data shows tennis anomaly 1.50-1.70 is profitable; score-edge with 30% min is even stricter
+const AUTO_BET_STAKE_LOW_USD: f64 = 0.50;
 /// Minimum Azuro odds to auto-bet (skip heavy favorites, prevents massive risk/reward leakage)
 /// Raised 1.40→1.70: at 59% WR break-even is 1/0.59=1.695 — below 1.70 is systematically -EV
 const AUTO_BET_MIN_ODDS: f64 = 1.70;
@@ -442,8 +443,8 @@ const FF_PER_SPORT_CAP: bool = true;
 const FF_RESYNC_FREEZE: bool = true;
 /// Phase 1: CS2 match_winner from round scores (maps 1-0 / 1-1 + round lead)
 const FF_CS2_MATCH_FROM_ROUNDS: bool = true;
-/// Phase 1: Football anomaly enabled for goal_diff ≥ 2
-const FF_FOOTBALL_ANOMALY_GOALDIFF2: bool = true;
+/// Phase 1: Football anomaly DISABLED — production data: 40% WR, PnL -$4.54 (n=10)
+const FF_FOOTBALL_ANOMALY_GOALDIFF2: bool = false;
 /// Phase 2: Tennis game-level model (paper trade only until 50+ bets)
 const FF_TENNIS_GAME_MODEL: bool = false;
 /// Phase 4: Basketball live bets (OFF until live_score kalibrace)
@@ -463,24 +464,24 @@ const FALSE_FAVORITE_STAKE: f64 = 0.50;
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
-        // Raised 10→15%: production data shows esports edge bets at 10-14% edge are unreliable (ecstatic, basementboys, liquid all lost)
+        // Raised 15→30%: production data (n=37) shows edge<30% is -EV; edge>=30% has +16pp margin, PnL +$5.94
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol" | "esports"
-            => (true, 15.0, 1.0, "match_or_map"),
+            => (true, 30.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
-        // Raised 10→12%: tighter filter for tennis edge bets
+        // Raised 12→30%: same data-driven threshold as all sports
         "tennis"
-            => (true, 12.0, 1.0, "match_winner"),
+            => (true, 30.0, 1.0, "match_winner"),
         // Basketball: match_winner — point spread model
-        // Relaxed 12→11%
+        // Raised 11→30%: uniform threshold — only highest-confidence bets
         "basketball"
-            => (true, 11.0, 1.0, "match_winner"),
+            => (true, 30.0, 1.0, "match_winner"),
         // Football: DYNAMIC by minute — late game has stronger signal
-        // Base threshold here; dynamic_football_min_edge() overrides for late game
+        // Raised 14→30%: base threshold; dynamic_football_min_edge() can override for late game
         "football"
-            => (true, 14.0, 1.0, "match_winner"),
+            => (true, 30.0, 1.0, "match_winner"),
         // New sports: alerts enabled, conservative edge thresholds
         "volleyball" | "ice-hockey" | "baseball" | "cricket" | "boxing"
-            => (true, 14.0, 1.0, "match_winner"),
+            => (true, 30.0, 1.0, "match_winner"),
         // Unknown sport: alerts only
         _
             => (false, 0.0, 0.0, "none"),
@@ -593,6 +594,10 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_REF_ODDS: f64 = 1.25;
 const AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 1.00;
+/// Anomaly MAX ODDS: production data shows anomaly odds>=1.70 is -EV across all sports
+/// Tennis 1.50-1.70 = 80% WR +$2.61, tennis >=1.70 = 30% WR -$6.64
+/// Esports >=1.70 = 43.8% WR -$5.61. Only safe zone is 1.50-1.70.
+const ANOMALY_MAX_ODDS: f64 = 1.70;
 /// Anomaly gets only 30% of daily budget (score-edge gets the rest)
 const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.30;
 /// Minimum discrepancy for anomaly AUTO-BET (higher than alert threshold MIN_EDGE_PCT=8%)
@@ -5719,27 +5724,13 @@ async fn main() -> Result<()> {
                                             }
                                             tennis_ok
                                         }
-                                        // Esports (CS2, LoL, Dota, Valorant): require match in-progress
-                                        // At match start (0-0 maps, 0-0 rounds) Azuro oracle hasn't adjusted
-                                        // and odds discrepancy is noise. Need map_diff≥1 OR ≥5 rounds played.
-                                        // Uses live_score (map score) + detailed_score (round-level from Tipsport/Chance/Dust2).
+                                        // Esports anomaly DISABLED: production data shows -EV across ALL odds buckets
+                                        // esports anomaly (all odds): WR 52.4%, breakeven 60.8%, margin -8.4pp, PnL -$14.55
+                                        // Score-edge path remains active for esports with 30% edge threshold
                                         "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => {
-                                            let (s1, s2) = if let Some(ref score) = anomaly.live_score {
-                                                let parts: Vec<&str> = score.split('-').collect();
-                                                if parts.len() == 2 {
-                                                    (parts[0].trim().parse::<i32>().unwrap_or(0),
-                                                     parts[1].trim().parse::<i32>().unwrap_or(0))
-                                                } else { (0, 0) }
-                                            } else { (0, 0) };
-                                            let esports_ok = esports_anomaly_guard(
-                                                s1, s2,
-                                                anomaly.detailed_score.as_deref(),
-                                            );
-                                            if !esports_ok {
-                                                info!("🎮 ANOMALY SPORT GUARD: {} score={:?} detailed={:?} — esports needs map_diff≥1 or ≥5 rounds",
-                                                    anomaly.match_key, anomaly.live_score, anomaly.detailed_score);
-                                            }
-                                            esports_ok
+                                            info!("🎮 ANOMALY DISABLED for esports: {} — production data -EV, use score-edge path instead",
+                                                anomaly.match_key);
+                                            false
                                         }
                                         _ => true,
                                     };
@@ -5841,6 +5832,7 @@ async fn main() -> Result<()> {
                                         && anomaly_disc_ok         // DISC MINIMUM: ≥15% for auto-bet
                                         && anomaly_within_daily_limit
                                         && azuro_odds >= AUTO_BET_MIN_ODDS
+                                        && azuro_odds <= ANOMALY_MAX_ODDS  // odds>1.70 is -EV for anomaly
                                         && !azuro_odds_identical
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
