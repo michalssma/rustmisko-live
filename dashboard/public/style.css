@@ -167,3 +167,109 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
 .pin-input:focus { border-color: var(--accent); }
 .error-msg { background: #f4433622; color: var(--red); border: 1px solid var(--red); border-radius: 6px; padding: 8px 12px; font-size: 13px; }
 .error-msg.hidden { display: none; }
+
+/* ── Numpad (login) ─────────────────────────────────────────────────────────── */
+.pin-dots { display:flex; justify-content:center; gap:14px; margin:16px 0 24px; }
+.pin-dot { width:14px; height:14px; border-radius:50%; border:2px solid var(--muted); background:transparent; transition:background 0.1s; }
+.pin-dot.filled { background:var(--accent); border-color:var(--accent); }
+.numpad { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+.num-btn { background:var(--card2); border:1px solid var(--border); border-radius:var(--radius); color:var(--text); font-size:22px; font-weight:600; padding:18px 0; cursor:pointer; transition:background 0.1s; }
+.num-btn:active { background:var(--border); }
+.num-del { font-size:18px; }
+
+/* ── Topbar additions ────────────────────────────────────────────────────────── */
+.live-badge { font-size:11px; font-weight:700; margin-left:8px; }
+.btn-stop-hdr { background:none; border:none; font-size:20px; cursor:pointer; padding:0; line-height:1; }
+
+/* ── Balance row ─────────────────────────────────────────────────────────────── */
+.balance-row { display:flex; justify-content:space-between; align-items:center; background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; }
+.balance-main, .balance-matic { display:flex; align-items:baseline; gap:6px; }
+.bal-usdt { font-size:26px; font-weight:700; color:var(--accent); }
+.bal-matic { font-size:16px; font-weight:600; color:var(--info); }
+.bal-label { font-size:11px; color:var(--muted); font-weight:600; }
+
+/* ── Two-col ─────────────────────────────────────────────────────────────────── */
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+
+/* ── Pending card ────────────────────────────────────────────────────────────── */
+.pending-card { cursor:pointer; }
+.pending-row { display:flex; align-items:center; padding:12px 14px; gap:8px; }
+.pending-dots { font-size:14px; color:var(--warning); letter-spacing:2px; }
+.pending-summary { flex:1; font-size:14px; font-weight:600; }
+.chevron-r { color:var(--muted); font-size:12px; }
+
+/* ── Loss limit bar ──────────────────────────────────────────────────────────── */
+.loss-card { padding:12px 14px; }
+.loss-row { display:flex; justify-content:space-between; margin-bottom:8px; }
+.loss-label { font-size:11px; color:var(--muted); font-weight:600; text-transform:uppercase; }
+.loss-val { font-size:11px; color:var(--text); }
+.loss-bar-bg { height:8px; background:var(--border); border-radius:4px; overflow:hidden; }
+.loss-bar-fill { height:100%; background:var(--green); border-radius:4px; transition:width 0.5s; }
+.loss-bar-fill.warn { background:var(--warning); }
+.loss-bar-fill.danger { background:var(--red); }
+
+/* ── Win rate card ───────────────────────────────────────────────────────────── */
+.wr-card { padding:12px 14px; }
+.wr-row { display:flex; justify-content:space-between; align-items:center; }
+.wl-counts { font-size:15px; font-weight:700; color:var(--muted); }
+
+/* ── Chips section ───────────────────────────────────────────────────────────── */
+.chips-section { display:flex; flex-direction:column; gap:8px; }
+.proc-chips-row { display:flex; gap:8px; }
+.health-chips-row { display:flex; gap:8px; flex-wrap:wrap; }
+.hchip-group { display:flex; align-items:center; gap:5px; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:5px 9px; }
+
+/* ── Filter buttons ──────────────────────────────────────────────────────────── */
+.filter-row { display:flex; gap:8px; overflow-x:auto; padding:2px 0; }
+.filter-btn { background:var(--card); border:1px solid var(--border); border-radius:20px; color:var(--muted); font-size:12px; font-weight:600; padding:6px 14px; cursor:pointer; white-space:nowrap; }
+.filter-btn.active { background:var(--accent); color:#000; border-color:var(--accent); }
+
+/* ── Toggle switch ───────────────────────────────────────────────────────────── */
+.toggle-row { display:flex; justify-content:space-between; align-items:center; padding:12px 14px; }
+.toggle-label { font-size:14px; font-weight:600; }
+.toggle-switch { position:relative; width:52px; height:28px; }
+.toggle-switch input { opacity:0; width:0; height:0; }
+.toggle-thumb { position:absolute; inset:0; background:var(--border); border-radius:14px; cursor:pointer; transition:background 0.2s; }
+.toggle-thumb::before { content:''; position:absolute; width:22px; height:22px; background:#fff; border-radius:50%; top:3px; left:3px; transition:transform 0.2s; }
+.toggle-switch input:checked + .toggle-thumb { background:var(--accent); }
+.toggle-switch input:checked + .toggle-thumb::before { transform:translateX(24px); }
+
+/* ── Sport pills ─────────────────────────────────────────────────────────────── */
+.sport-pills { display:flex; flex-wrap:wrap; gap:8px; padding:10px 14px; }
+.sport-pill { background:var(--card2); border:1px solid var(--border); border-radius:20px; color:var(--muted); font-size:12px; font-weight:600; padding:5px 14px; cursor:pointer; }
+.sport-pill.active { background:#00e67622; color:var(--accent); border-color:var(--accent); }
+
+/* ── Daily limits ────────────────────────────────────────────────────────────── */
+.limits-form { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+.limits-label { font-size:12px; color:var(--muted); display:flex; flex-direction:column; gap:4px; }
+.limits-input { background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:16px; padding:8px 12px; outline:none; width:100%; }
+.limits-input:focus { border-color:var(--accent); }
+.limits-msg { padding:8px 14px; font-size:12px; border-radius:6px; margin:0 14px 12px; }
+.limits-msg.ok { background:#00c85322; color:var(--green); }
+.limits-msg.error { background:#f4433622; color:var(--red); }
+.limits-msg.hidden { display:none; }
+
+/* ── Sparkline ───────────────────────────────────────────────────────────────── */
+.sparkline-wrap { padding:10px 14px 14px; }
+
+/* ── Sport stats ─────────────────────────────────────────────────────────────── */
+.sport-stats-list { padding:4px 0; }
+.sport-stat-row { display:flex; align-items:center; padding:10px 14px; border-top:1px solid var(--border); gap:10px; }
+.sport-stat-name { flex:1; font-size:13px; font-weight:600; }
+.sport-stat-wl { font-size:12px; color:var(--muted); min-width:60px; }
+.sport-stat-pnl { font-size:14px; font-weight:700; }
+.sport-stat-pnl.pos { color:var(--green); }
+.sport-stat-pnl.neg { color:var(--red); }
+
+/* ── Pending modal items ─────────────────────────────────────────────────────── */
+.pmi-item { padding:12px 14px; }
+.pmi-top { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+.pmi-emoji { font-size:16px; }
+.pmi-match { flex:1; font-size:14px; font-weight:600; }
+.pmi-odds { font-size:13px; color:var(--warning); font-weight:700; }
+.pmi-bottom { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); }
+.pmi-time { color:var(--info); }
+.pmi-sep { border:none; border-top:1px solid var(--border); margin:0; }
+
+/* ── Bet row emoji ───────────────────────────────────────────────────────────── */
+.bet-emoji { font-size:16px; min-width:20px; }

@@ -9,41 +9,55 @@
 <body class="login-page">
   <div class="login-box">
     <h1>⚡ RustMisko</h1>
-    <p class="login-sub">Dashboard přístup</p>
+    <p class="login-sub">🔐 LOGIN</p>
     <div id="login-error" class="error-msg hidden"></div>
-    <input id="pin-input" type="password" inputmode="numeric" pattern="\d{6}"
-           maxlength="6" placeholder="• • • • • •" class="pin-input" autocomplete="off">
-    <button id="login-btn" class="btn full-width accent" onclick="doLogin()">Vstoupit</button>
+    <div class="pin-dots">
+      <span class="pin-dot" id="d0"></span>
+      <span class="pin-dot" id="d1"></span>
+      <span class="pin-dot" id="d2"></span>
+      <span class="pin-dot" id="d3"></span>
+      <span class="pin-dot" id="d4"></span>
+      <span class="pin-dot" id="d5"></span>
+    </div>
+    <div class="numpad">
+      <button class="num-btn" onclick="numPress('1')">1</button>
+      <button class="num-btn" onclick="numPress('2')">2</button>
+      <button class="num-btn" onclick="numPress('3')">3</button>
+      <button class="num-btn" onclick="numPress('4')">4</button>
+      <button class="num-btn" onclick="numPress('5')">5</button>
+      <button class="num-btn" onclick="numPress('6')">6</button>
+      <button class="num-btn" onclick="numPress('7')">7</button>
+      <button class="num-btn" onclick="numPress('8')">8</button>
+      <button class="num-btn" onclick="numPress('9')">9</button>
+      <div></div>
+      <button class="num-btn" onclick="numPress('0')">0</button>
+      <button class="num-btn num-del" onclick="numDel()">⌫</button>
+    </div>
   </div>
   <script>
-    const input = document.getElementById('pin-input');
-    const errorEl = document.getElementById('error-msg');
-    input.focus();
-    input.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
-    // Auto-submit when 6 digits typed
-    input.addEventListener('input', () => { if (input.value.length === 6) doLogin(); });
-
+    let pin = '';
+    function updateDots() {
+      for (let i = 0; i < 6; i++)
+        document.getElementById('d'+i).classList.toggle('filled', i < pin.length);
+    }
+    function numPress(d) {
+      if (pin.length >= 6) return;
+      pin += d; updateDots();
+      if (pin.length === 6) setTimeout(doLogin, 100);
+    }
+    function numDel() { pin = pin.slice(0,-1); updateDots(); }
+    document.addEventListener('keydown', e => {
+      if (e.key >= '0' && e.key <= '9') numPress(e.key);
+      else if (e.key === 'Backspace') numDel();
+    });
     async function doLogin() {
-      const pin = input.value.trim();
-      if (!/^\d{6}$/.test(pin)) return;
-      document.getElementById('login-btn').disabled = true;
       try {
-        const r = await fetch('/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pin }),
-        });
+        const r = await fetch('/auth', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ pin }) });
         const data = await r.json();
         if (data.ok) { window.location.href = '/'; }
-        else {
-          showError(data.error || 'Špatný PIN');
-          input.value = '';
-          input.focus();
-        }
-      } catch (e) { showError('Chyba připojení'); }
-      finally { document.getElementById('login-btn').disabled = false; }
+        else { showError(data.error || 'Špatný PIN'); pin=''; updateDots(); }
+      } catch { showError('Chyba připojení'); pin=''; updateDots(); }
     }
-
     function showError(msg) {
       const el = document.getElementById('login-error');
       el.textContent = msg; el.classList.remove('hidden');

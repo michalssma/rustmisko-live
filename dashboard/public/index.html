@@ -11,90 +11,114 @@
   <header class="topbar">
     <div class="topbar-left">
       <span class="logo">⚡ RustMisko</span>
+      <span id="live-dot" class="live-badge">🔴 --</span>
     </div>
     <div class="topbar-right">
-      <span id="balance" class="balance">--</span>
       <span id="conn-dot" class="dot grey" title="WebSocket"></span>
+      <button class="btn-stop-hdr" onclick="killAll()" title="Emergency Stop">🛑</button>
     </div>
   </header>
 
   <!-- Tab content -->
   <main class="content">
 
-    <!-- ── TAB: DASHBOARD ── -->
-    <section id="tab-dashboard" class="tab active">
+    <!-- ── TAB: PŘEHLED ── -->
+    <section id="tab-dashboard" class="tab">
 
-      <!-- Health row -->
-      <div class="row health-row">
-        <div class="chip-group">
-          <span class="chip-label">WS</span>
-          <span id="chip-ws" class="chip grey">—</span>
+      <!-- Balance row -->
+      <div class="balance-row">
+        <div class="balance-main">
+          <span id="balance" class="bal-usdt">--</span>
+          <span class="bal-label">USDT</span>
         </div>
-        <div class="chip-group">
-          <span class="chip-label">GQL</span>
-          <span id="chip-gql" class="chip grey">—</span>
-        </div>
-        <div class="chip-group">
-          <span class="chip-label">EXEC</span>
-          <span id="chip-exec" class="chip grey">—</span>
-        </div>
-        <div class="chip-group">
-          <span class="chip-label">BOT</span>
-          <span id="chip-bot" class="chip grey">—</span>
+        <div class="balance-matic">
+          <span id="matic-balance" class="bal-matic">--</span>
+          <span class="bal-label">MATIC</span>
         </div>
       </div>
 
-      <!-- Process row -->
-      <div class="row process-row">
-        <div id="proc-feed-hub" class="proc-chip">feed-hub <span class="dot grey"></span></div>
-        <div id="proc-alert-bot" class="proc-chip">alert-bot <span class="dot grey"></span></div>
-        <div id="proc-executor" class="proc-chip">executor <span class="dot grey"></span></div>
-      </div>
-
-      <!-- P&L + win rate -->
-      <div class="row stats-row">
+      <!-- Gain + P&L -->
+      <div class="two-col">
         <div class="stat-card">
-          <div class="stat-label">P&L dnes</div>
+          <div class="stat-label">📈 Dnešní gain</div>
+          <div id="gain-today" class="stat-value pos">—</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">⚠️ P&L dnes</div>
           <div id="pnl-today" class="stat-value">—</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">Win rate</div>
-          <div id="win-rate" class="stat-value">—</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">Bety dnes</div>
-          <div id="bets-today" class="stat-value">—</div>
+      </div>
+
+      <!-- Pending row -->
+      <div class="card pending-card" onclick="openPendingModal()">
+        <div class="pending-row">
+          <span class="pending-dots" id="pending-dots">○</span>
+          <span id="pending-summary" class="pending-summary">0 betů • $0.00</span>
+          <span class="chevron-r">▶</span>
         </div>
       </div>
 
-      <!-- Pending bets -->
-      <div class="card">
-        <div class="card-header" onclick="togglePending()">
-          <span>⏳ Pending bety</span>
-          <span id="pending-count" class="badge">0</span>
-          <span class="chevron" id="pending-chevron">▼</span>
+      <!-- Loss limit bar -->
+      <div class="card loss-card">
+        <div class="loss-row">
+          <span class="loss-label">Loss limit</span>
+          <span id="loss-val" class="loss-val">$0.00 / $15.55</span>
         </div>
-        <div id="pending-list" class="pending-list hidden"></div>
+        <div class="loss-bar-bg">
+          <div id="loss-bar" class="loss-bar-fill" style="width:0%"></div>
+        </div>
       </div>
 
-      <!-- Emergency stop -->
-      <button id="btn-killall" class="btn danger full-width" onclick="killAll()">
-        🛑 EMERGENCY STOP (Kill All)
-      </button>
+      <!-- Win rate + W/L -->
+      <div class="stat-card wr-card">
+        <div class="wr-row">
+          <div>
+            <div class="stat-label">Win rate</div>
+            <div id="win-rate" class="stat-value">—</div>
+          </div>
+          <div id="wl-counts" class="wl-counts">W:— L:—</div>
+          <div>
+            <div class="stat-label">Bety dnes</div>
+            <div id="bets-today" class="stat-value" style="font-size:18px">—</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Process + Health chips -->
+      <div class="chips-section">
+        <div class="proc-chips-row">
+          <div id="proc-feed-hub" class="proc-chip"><span class="dot grey"></span> FH</div>
+          <div id="proc-alert-bot" class="proc-chip"><span class="dot grey"></span> BOT</div>
+          <div id="proc-executor" class="proc-chip"><span class="dot grey"></span> EX</div>
+        </div>
+        <div class="health-chips-row">
+          <div class="hchip-group"><span class="chip-label">WS</span><span id="chip-ws" class="chip grey">—</span></div>
+          <div class="hchip-group"><span class="chip-label">GQL</span><span id="chip-gql" class="chip grey">—</span></div>
+          <div class="hchip-group"><span class="chip-label">EXEC</span><span id="chip-exec" class="chip grey">—</span></div>
+          <div class="hchip-group"><span class="chip-label">BOT</span><span id="chip-bot" class="chip grey">—</span></div>
+        </div>
+      </div>
+
     </section>
 
     <!-- ── TAB: BETY ── -->
     <section id="tab-bets" class="tab hidden">
+      <div class="filter-row">
+        <button class="filter-btn active" onclick="setBetFilter('all', this)">Vše</button>
+        <button class="filter-btn" onclick="setBetFilter('won', this)">Won</button>
+        <button class="filter-btn" onclick="setBetFilter('lost', this)">Lost</button>
+        <button class="filter-btn" onclick="setBetFilter('placed', this)">Pending</button>
+      </div>
       <div class="card">
-        <div class="card-header">Posledních 50 betů</div>
         <div id="bets-list" class="bets-list"></div>
       </div>
     </section>
 
-    <!-- ── TAB: CONTROLS ── -->
+    <!-- ── TAB: OVLÁDÁNÍ ── -->
     <section id="tab-controls" class="tab hidden">
+
       <div class="card">
-        <div class="card-header">Process Management</div>
+        <div class="card-header">Procesy</div>
         <div class="proc-controls">
           <div class="proc-row">
             <span>feed-hub</span>
@@ -117,12 +141,54 @@
               <button class="btn sm red"   onclick="stopProc('executor')">■ Stop</button>
             </div>
           </div>
+          <div style="padding:10px 14px">
+            <button class="btn full-width danger" onclick="killAll()">💀 Kill All</button>
+          </div>
         </div>
       </div>
 
       <div class="card">
-        <div class="card-header">Log (dnes)</div>
-        <div id="log-view" class="log-view">Klikni na proces pro log...</div>
+        <div class="card-header">Auto-bet</div>
+        <div class="toggle-row">
+          <span id="autobet-label" class="toggle-label">ENABLED</span>
+          <label class="toggle-switch">
+            <input type="checkbox" id="autobet-toggle" onchange="toggleAutobet()" checked>
+            <span class="toggle-thumb"></span>
+          </label>
+        </div>
+        <div style="padding:0 14px 10px;font-size:11px;color:var(--muted)">ON = alert-bot beží. OFF = alert-bot zastaven.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Sport focus</div>
+        <div id="sport-pills" class="sport-pills">
+          <button class="sport-pill active" data-sport="all"        onclick="toggleSport('all',this)">Vše</button>
+          <button class="sport-pill"        data-sport="cs2"        onclick="toggleSport('cs2',this)">CS2</button>
+          <button class="sport-pill"        data-sport="tennis"     onclick="toggleSport('tennis',this)">Tennis</button>
+          <button class="sport-pill"        data-sport="football"   onclick="toggleSport('football',this)">Fotbal</button>
+          <button class="sport-pill"        data-sport="basketball" onclick="toggleSport('basketball',this)">Basketbal</button>
+          <button class="sport-pill"        data-sport="esports"    onclick="toggleSport('esports',this)">Esports</button>
+        </div>
+        <div style="padding:0 14px 10px;font-size:11px;color:var(--muted)">Config — restart alert-bot pro aplikaci.</div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Denní limity</div>
+        <div class="limits-form">
+          <label class="limits-label">Loss limit ($)
+            <input type="number" id="loss-limit-input" class="limits-input" min="1" max="100" step="0.5" value="15.55">
+          </label>
+          <label class="limits-label">Max stake ($)
+            <input type="number" id="max-stake-input" class="limits-input" min="0.5" max="20" step="0.5" value="3.00">
+          </label>
+          <button class="btn accent" onclick="saveLimits()">💾 Uložit</button>
+        </div>
+        <div id="limits-msg" class="limits-msg hidden"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">Logy (dnes)</div>
+        <div id="log-view" class="log-view">Klikni níže pro načtení...</div>
         <div class="btn-pair" style="padding:8px">
           <button class="btn sm" onclick="loadLog('alert-bot')">Bot log</button>
           <button class="btn sm" onclick="loadLog('feed-hub')">Feed log</button>
@@ -131,21 +197,36 @@
 
       <div class="card">
         <div class="card-header">Účet</div>
-        <button class="btn full-width muted" disabled>
-          💸 Withdraw (placeholder — neaktivní)
-        </button>
+        <div style="padding:14px">
+          <button class="btn full-width muted" disabled>📤 Send USDT (placeholder)</button>
+        </div>
+        <div style="padding:0 14px 12px">
+          <a href="/logout" class="btn full-width muted" style="display:block;text-align:center">Odhlásit</a>
+        </div>
       </div>
 
-      <div style="padding:12px">
-        <a href="/logout" class="btn full-width muted">Odhlásit</a>
-      </div>
     </section>
 
     <!-- ── TAB: STATS ── -->
     <section id="tab-stats" class="tab hidden">
+      <div class="filter-row">
+        <button class="filter-btn active" onclick="setStatsPeriod(1, this)">Dnes</button>
+        <button class="filter-btn" onclick="setStatsPeriod(7, this)">7 dní</button>
+        <button class="filter-btn" onclick="setStatsPeriod(30, this)">30 dní</button>
+      </div>
       <div class="card">
-        <div class="card-header">Výkon (posledních 50 betů)</div>
+        <div class="card-header">P&L křivka (7 dní)</div>
+        <div class="sparkline-wrap">
+          <svg id="sparkline" width="100%" height="60" viewBox="0 0 300 60" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header" id="stats-period-label">Stats — Dnes</div>
         <div id="stats-content" class="stats-content">Načítám...</div>
+      </div>
+      <div class="card">
+        <div class="card-header">Per sport</div>
+        <div id="sport-stats" class="sport-stats-list"></div>
       </div>
     </section>
 
@@ -159,7 +240,18 @@
     <button class="tabnav-btn"        onclick="switchTab('stats', this)">📈<br>Stats</button>
   </nav>
 
-  <!-- Pending bet modal -->
+  <!-- Pending list modal -->
+  <div id="pending-modal" class="modal hidden" onclick="closePendingModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <span>⏳ Pending bety</span>
+        <button class="modal-close" onclick="closePendingModal()">✕</button>
+      </div>
+      <div id="pending-modal-list" style="max-height:50vh;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- Bet detail modal -->
   <div id="modal" class="modal hidden" onclick="closeModal()">
     <div class="modal-box" onclick="event.stopPropagation()">
       <div class="modal-header">

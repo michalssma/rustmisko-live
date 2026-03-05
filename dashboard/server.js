@@ -18,6 +18,7 @@ const ROOT        = path.join(__dirname, '..');
 const DATA        = path.join(ROOT, 'data');
 const EXECUTOR    = path.join(ROOT, 'executor');
 const SECRET_FILE = path.join(DATA, 'dashboard.secret');
+const CONFIG_FILE  = path.join(DATA, 'dashboard_config.json');
 const LOGS_DIR    = path.join(ROOT, 'logs');
 
 const FEED_HEALTH = 'http://127.0.0.1:8081/health';
@@ -133,6 +134,40 @@ function getProcessStatus(name) {
   } catch { return 'unknown'; }
 }
 
+function getConfig() {
+  const defaults = { autobet_enabled: true, sport_focus: ['all'], loss_limit: 15.55, max_stake: 3.00 };
+  try { return { ...defaults, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; }
+  catch { return defaults; }
+}
+
+function getPnl7d() {
+  const file = path.join(DATA, 'ledger.jsonl');
+  if (!fs.existsSync(file)) return [];
+  const result = {};
+  const cutoff = Date.now() - 8 * 86400_000;
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      try {
+        const o = JSON.parse(line);
+        if (!o.ts) continue;
+        const t = new Date(o.ts).getTime();
+        if (t < cutoff) continue;
+        const day = o.ts.slice(0,10);
+        if (!result[day]) result[day] = 0;
+        if (o.event==='WON')  result[day] += (o.payout_usd||0) - (o.amount_usd||o.stake||0);
+        if (o.event==='LOST') result[day] -= (o.amount_usd||o.stake||0);
+      } catch {}
+    }
+  } catch {}
+  const out = [];
+  for (let i=6; i>=0; i--) {
+    const d = new Date(Date.now()-i*86400_000).toISOString().slice(0,10);
+    out.push({ date: d, pnl: +(result[d]||0).toFixed(2) });
+  }
+  return out;
+}
+
 // ── Status snapshot ───────────────────────────────────────────────────────────
 async function getStatus() {
   const [feedHealth, execHealth] = await Promise.all([
@@ -142,7 +177,7 @@ async function getStatus() {
 
   const activeBets  = readJson(path.join(DATA, 'active_bets.json'), []);
   const dailyPnl    = readJson(path.join(DATA, 'daily_pnl.json'), {});
-  const recentBets  = getRecentBets(50);
+  const recentBets  = getRecentBets(500);
   const alertBotAge = getAlertBotAge();
 
   const processes = {
@@ -152,22 +187,20 @@ async function getStatus() {
                  : getProcessStatus('alert-bot.exe'),
   };
 
-  const balanceRaw = execHealth?.balance ?? execHealth?.balanceUsd ?? null;
-  const balance    = balanceRaw != null ? parseFloat(balanceRaw) : null;
-
-  // Compute win/loss from recent settled bets (last 100)
-  const settled = recentBets.filter(b => b.event === 'WON' || b.event === 'LOST');
-  const wins    = settled.filter(b => b.event === 'WON').length;
-  const wr      = settled.length > 0 ? Math.round((wins / settled.length) * 100) : null;
+  const balanceRaw   = execHealth?.balance ?? execHealth?.balanceUsd ?? null;
+  const balance      = balanceRaw != null ? parseFloat(balanceRaw) : null;
+  const maticRaw     = execHealth?.matic ?? execHealth?.maticBalance ?? execHealth?.native_balance ?? null;
+  const maticBalance = maticRaw != null ? parseFloat(maticRaw) : null;
 
   return {
     ts: new Date().toISOString(),
     balance_usd:   balance,
+    matic_balance: maticBalance,
     health: {
-      gql_age_ms:   feedHealth?.gql_age_ms  ?? -1,
-      ws_age_ms:    feedHealth?.ws_age_ms   ?? -1,
-      feed_ok:      feedHealth?.ok === true,
-      executor_ok:  execHealth != null,
+      gql_age_ms:       feedHealth?.gql_age_ms  ?? -1,
+      ws_age_ms:        feedHealth?.ws_age_ms   ?? -1,
+      feed_ok:          feedHealth?.ok === true,
+      executor_ok:      execHealth != null,
       alert_bot_age_ms: alertBotAge,
     },
     processes,
@@ -175,8 +208,9 @@ async function getStatus() {
     pending_count: Array.isArray(activeBets) ? activeBets.length : 0,
     pnl_today:     dailyPnl?.pnl_today  ?? dailyPnl?.total_pnl ?? 0,
     bets_today:    dailyPnl?.bets_today ?? dailyPnl?.total_bets ?? 0,
-    win_rate:      wr,
-    recent_bets:   recentBets.slice(0, 50),
+    recent_bets:   recentBets,
+    pnl_7d:        getPnl7d(),
+    config:        getConfig(),
   };
 }
 
@@ -297,6 +331,26 @@ app.get('/api/log/:name', authApi, (req, res) => {
   try {
     const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-100);
     res.json({ lines });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Config API ───────────────────────────────────────────────────────────────
+app.get('/api/config', authApi, (_req, res) => {
+  res.json(getConfig());
+});
+
+app.post('/api/config', authApi, (req, res) => {
+  const current = getConfig();
+  const body    = req.body || {};
+  const next = {
+    autobet_enabled: typeof body.autobet_enabled === 'boolean' ? body.autobet_enabled : current.autobet_enabled,
+    sport_focus:     Array.isArray(body.sport_focus) ? body.sport_focus.filter(s => typeof s === 'string' && s.length < 32) : current.sport_focus,
+    loss_limit:      (typeof body.loss_limit === 'number' && body.loss_limit > 0 && body.loss_limit < 1000) ? +body.loss_limit.toFixed(2) : current.loss_limit,
+    max_stake:       (typeof body.max_stake  === 'number' && body.max_stake  > 0 && body.max_stake  < 100)  ? +body.max_stake.toFixed(2)  : current.max_stake,
+  };
+  try {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8');
+    res.json({ ok: true, config: next });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
