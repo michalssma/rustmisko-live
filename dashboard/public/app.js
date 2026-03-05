@@ -13,7 +13,12 @@ function connectWs() {
   ws = new WebSocket(`${proto}://${location.host}`);
 
   ws.addEventListener('open', () => setDot('conn-dot', 'green'));
-  ws.addEventListener('close', () => {
+  ws.addEventListener('close', (e) => {
+    // 4001 is sent by server for missing/expired auth cookie.
+    if (e && e.code === 4001) {
+      window.location.href = '/login.html';
+      return;
+    }
     setDot('conn-dot', 'red');
     setTimeout(connectWs, 3000); // auto-reconnect
   });

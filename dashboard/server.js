@@ -39,7 +39,8 @@ const wss    = new WebSocket.Server({ server });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, 'public')));
+// Do not auto-serve index.html from static; root route is auth-protected below.
+app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 
 // Mini cookie parser (no extra deps)
 app.use((req, _res, next) => {
