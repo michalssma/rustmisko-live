@@ -1,31 +1,55 @@
 'use strict';
-/* ── app.js — Dashboard frontend logic ── */
+/* ── app.js — Dashboard frontend logic (v2 — iOS-quality UX) ── */
 
 let ws;
 let lastData          = null;
 let activeBetFilter   = 'all';
 let activeStatsPeriod = 1;
 let currentSportFocus = ['all'];
+let wsConnected       = false;
+let renderCount       = 0;
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-let wsReady = false;
+// ── Fast prefetch via REST (instant load instead of waiting for WS) ───────────
+(async function prefetch() {
+  const el = document.getElementById('loading-status');
+  try {
+    if (el) el.textContent = 'Načítání dat…';
+    const r = await fetch('/api/status', { credentials: 'same-origin' });
+    if (r.status === 401) { window.location.href = '/login.html'; return; }
+    const data = await r.json();
+    lastData = data;
+    render(data);
+    if (el) { el.textContent = 'Připojeno'; el.classList.add('connected'); }
+    dismissLoading();
+  } catch {
+    if (el) el.textContent = 'Čekání na server…';
+  }
+})();
+
+function dismissLoading() {
+  const overlay = document.getElementById('loading-overlay');
+  if (!overlay) return;
+  overlay.classList.add('fade-out');
+  setTimeout(() => overlay.style.display = 'none', 450);
+}
+
+// ── WebSocket (real-time updates) ─────────────────────────────────────────────
 function connectWs() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
 
   ws.addEventListener('open', () => {
+    wsConnected = true;
     setDot('conn-dot', 'green');
-    wsReady = true;
+    const el = document.getElementById('loading-status');
+    if (el) { el.textContent = 'Připojeno'; el.classList.add('connected'); }
+    dismissLoading();
   });
   ws.addEventListener('close', (e) => {
-    wsReady = false;
-    // 4001 is sent by server for missing/expired auth cookie.
-    if (e && e.code === 4001) {
-      window.location.href = '/login.html';
-      return;
-    }
+    wsConnected = false;
+    if (e && e.code === 4001) { window.location.href = '/login.html'; return; }
     setDot('conn-dot', 'red');
-    setTimeout(connectWs, 3000); // auto-reconnect
+    setTimeout(connectWs, 3000);
   });
   ws.addEventListener('error', () => setDot('conn-dot', 'yellow'));
   ws.addEventListener('message', e => {
@@ -34,9 +58,7 @@ function connectWs() {
       if (msg.type === 'status') {
         lastData = msg.data;
         render(msg.data);
-        // Hide loading overlay after first message
-        const overlay = document.getElementById('loading-overlay');
-        if (overlay) overlay.style.display = 'none';
+        dismissLoading();
       }
     } catch {}
   });
@@ -44,14 +66,19 @@ function connectWs() {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 function render(d) {
+  renderCount++;
+
   // Balance
   if (d.balance_usd != null) setText('balance', `$${d.balance_usd.toFixed(2)}`);
-  setText('matic-balance', d.matic_balance != null ? `$${(+d.matic_balance).toFixed(4)}` : '—');
+  setText('matic-balance', d.matic_balance != null ? `${(+d.matic_balance).toFixed(4)}` : '—');
 
   // LIVE indicator
   const live = d.health.feed_ok && d.health.executor_ok;
   const lb   = document.getElementById('live-dot');
-  if (lb) { lb.textContent = live ? '🟢 LIVE' : '🔴 DOWN'; }
+  if (lb) {
+    lb.textContent = live ? '🟢 LIVE' : '🔴 DOWN';
+    lb.classList.toggle('pulse', live);
+  }
 
   // Health chips
   renderChip('chip-ws',   d.health.ws_age_ms,  5000,  30000);
@@ -115,6 +142,13 @@ function render(d) {
   renderStats(allBets, activeStatsPeriod);
   renderSparkline(d.pnl_7d || []);
   renderSportStats(allBets);
+
+  // Last updated
+  const luEl = document.getElementById('last-updated');
+  if (luEl && d.ts) {
+    const t = new Date(d.ts);
+    luEl.textContent = `Aktualizováno ${t.toLocaleTimeString('cs', {hour:'2-digit',minute:'2-digit',second:'2-digit'})}`;
+  }
 }
 
 // ── Health chip ───────────────────────────────────────────────────────────────
@@ -482,3 +516,9 @@ async function api(method, url, body) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectWs();
+// Visibility API — reconnect on tab focus for instant sync
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && !wsConnected) {
+    connectWs();
+  }
+});

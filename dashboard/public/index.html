@@ -2,15 +2,19 @@
 <html lang="cs">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0a0c">
   <title>RustMisko Dashboard</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <!-- Loading overlay (hidden after first WS message) -->
+  <!-- Loading overlay — elegant, informative -->
   <div id="loading-overlay" class="loading-overlay">
-    <div class="spinner"></div>
-    <p>Připojování...</p>
+    <div class="loading-brand">⚡ RustMisko</div>
+    <div class="loading-bar-track"><div class="loading-bar-fill"></div></div>
+    <div id="loading-status" class="loading-status">Připojování...</div>
   </div>
 
   <!-- Top bar -->
@@ -105,6 +109,8 @@
         </div>
       </div>
 
+      <div id="last-updated" class="last-updated"></div>
+
     </section>
 
     <!-- ── TAB: BETY ── -->
@@ -138,10 +144,10 @@
           <div class="strat-section">
             <div class="strat-title">Path B: Odds anomaly</div>
             <div class="strat-row"><span>Max odds (ANOMALY_MAX_ODDS)</span><span class="strat-val accent">1.70 🆕</span></div>
-            <div class="strat-row"><span>Tennis anomaly</span><span class="strat-val" style="color:var(--green)">✅ ON</span></div>
-            <div class="strat-row"><span>Basketball anomaly</span><span class="strat-val" style="color:var(--green)">✅ ON</span></div>
-            <div class="strat-row"><span>Esports anomaly</span><span class="strat-val" style="color:var(--red)">⛔ OFF</span></div>
-            <div class="strat-row"><span>Football anomaly</span><span class="strat-val" style="color:var(--red)">⛔ OFF</span></div>
+            <div class="strat-row"><span>Tennis anomaly</span><span class="strat-val on">✅ ON</span></div>
+            <div class="strat-row"><span>Basketball anomaly</span><span class="strat-val on">✅ ON</span></div>
+            <div class="strat-row"><span>Esports anomaly</span><span class="strat-val off">⛔ OFF</span></div>
+            <div class="strat-row"><span>Football anomaly</span><span class="strat-val off">⛔ OFF</span></div>
           </div>
           <div style="padding:6px 0 0;font-size:11px;color:var(--muted)">Tuning 2026-03-05 · data-driven z 119 betů · edge≥30% WR=61.1%</div>
         </div>
@@ -264,15 +270,16 @@
 
   <!-- Bottom tab nav -->
   <nav class="tabnav">
-    <button class="tabnav-btn active" onclick="switchTab('dashboard', this)">📊<br>Přehled</button>
-    <button class="tabnav-btn"        onclick="switchTab('bets', this)">🎯<br>Bety</button>
-    <button class="tabnav-btn"        onclick="switchTab('controls', this)">⚙️<br>Ovládání</button>
-    <button class="tabnav-btn"        onclick="switchTab('stats', this)">📈<br>Stats</button>
+    <button class="tabnav-btn active" onclick="switchTab('dashboard', this)"><span class="tabnav-icon">📊</span>Přehled</button>
+    <button class="tabnav-btn"        onclick="switchTab('bets', this)"><span class="tabnav-icon">🎯</span>Bety</button>
+    <button class="tabnav-btn"        onclick="switchTab('controls', this)"><span class="tabnav-icon">⚙️</span>Ovládání</button>
+    <button class="tabnav-btn"        onclick="switchTab('stats', this)"><span class="tabnav-icon">📈</span>Stats</button>
   </nav>
 
   <!-- Pending list modal -->
   <div id="pending-modal" class="modal hidden" onclick="closePendingModal()">
     <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-handle"></div>
       <div class="modal-header">
         <span>⏳ Pending bety</span>
         <button class="modal-close" onclick="closePendingModal()">✕</button>
@@ -284,6 +291,7 @@
   <!-- Bet detail modal -->
   <div id="modal" class="modal hidden" onclick="closeModal()">
     <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-handle"></div>
       <div class="modal-header">
         <span id="modal-title">Bet detail</span>
         <button class="modal-close" onclick="closeModal()">✕</button>

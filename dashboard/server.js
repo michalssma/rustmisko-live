@@ -189,6 +189,10 @@ function getPnl7d() {
 }
 
 // ── Status snapshot ───────────────────────────────────────────────────────────
+let cachedMaticBalance = null;
+let maticCacheTs = 0;
+const MATIC_CACHE_TTL = 30_000; // cache MATIC balance for 30s (RPC is slow)
+
 async function getStatus() {
   const [feedHealth, execHealth] = await Promise.all([
     fetchJson(FEED_HEALTH),
@@ -209,9 +213,10 @@ async function getStatus() {
 
   const balanceRaw   = execHealth?.balance ?? execHealth?.balanceUsd ?? null;
   const balance      = balanceRaw != null ? parseFloat(balanceRaw) : null;
-  // MATIC: fetch native balance via RPC
-  let maticBalance = null;
-  if (execHealth?.wallet) {
+  // MATIC: fetch native balance via RPC (cached to avoid slowness)
+  let maticBalance = cachedMaticBalance;
+  const now = Date.now();
+  if (execHealth?.wallet && (now - maticCacheTs > MATIC_CACHE_TTL)) {
     try {
       const rpcRes = await fetchJson('https://polygon-rpc.com', 5000, {
         method: 'POST',
@@ -221,9 +226,8 @@ async function getStatus() {
       if (rpcRes?.result) {
         const weiBalance = BigInt(rpcRes.result);
         maticBalance = parseFloat((Number(weiBalance) / 1e18).toFixed(4));
-        console.log(`[dashboard] MATIC balance: ${maticBalance}`);
-      } else {
-        console.warn('[dashboard] MATIC RPC: no result field', rpcRes);
+        cachedMaticBalance = maticBalance;
+        maticCacheTs = now;
       }
     } catch (e) {
       console.error('[dashboard] MATIC RPC error:', e.message);
