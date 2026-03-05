@@ -221,8 +221,13 @@ async function getStatus() {
       if (rpcRes?.result) {
         const weiBalance = BigInt(rpcRes.result);
         maticBalance = parseFloat((Number(weiBalance) / 1e18).toFixed(4));
+        console.log(`[dashboard] MATIC balance: ${maticBalance}`);
+      } else {
+        console.warn('[dashboard] MATIC RPC: no result field', rpcRes);
       }
-    } catch {}
+    } catch (e) {
+      console.error('[dashboard] MATIC RPC error:', e.message);
+    }
   }
 
   return {
@@ -257,7 +262,7 @@ setInterval(async () => {
     const msg = JSON.stringify({ type: 'status', data: lastStatus });
     wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
     wsPushCount++;
-    if (wsPushCount % 30 === 1) console.log(`[dashboard] WS push #${wsPushCount} → ${wss.clients.size} clients`);
+    if (wsPushCount % 5 === 1) console.log(`[dashboard] WS push #${wsPushCount} → ${wss.clients.size} clients`);
   } catch (e) { console.error('[dashboard] WS push error:', e.message); }
 }, 2000);
 

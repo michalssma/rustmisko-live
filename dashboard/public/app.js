@@ -164,13 +164,13 @@ function openPendingModal() {
     el.innerHTML = bets.map(b => `
       <div class="pmi-item">
         <div class="pmi-top">
-          <span class="pmi-emoji">${sportEmoji(b.sport||detectSport(b.match_key||''))}</span>
-          <span class="pmi-match">${escHtml(shortMatchKey(b.match_key||b.condition_id||'?'))}</span>
+          <span class="pmi-emoji">${sportEmoji(b.sport||detectSport(b.matchKey||b.match_key||''))}</span>
+          <span class="pmi-match">${escHtml(b.team || shortMatchKey(b.matchKey||b.match_key||'') || '?')}</span>
           <span class="pmi-odds">@ ${+(b.odds||0).toFixed(2)}</span>
         </div>
         <div class="pmi-bottom">
-          <span>$${+(b.stake||b.amount_usd||0).toFixed(2)} · ${b.path||'?'}</span>
-          <span class="pmi-time">⏱ ${timeAgo(b.ts)}</span>
+          <span>$${+(b.stake||b.amount_usd||0).toFixed(2)}</span>
+          <span class="pmi-time">⏱ ${timeAgo(b.placedAt||b.ts)}</span>
         </div>
       </div>
     `).join('<hr class="pmi-sep">');
