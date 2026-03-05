@@ -425,6 +425,7 @@ function setDot(id, color) {
 }
 
 function shortMatchKey(key) {
+  if (!key || typeof key !== 'string') return '?';
   const parts = key.split('::');
   let match = parts[1] || key;
   match = match.replace(/_vs_/g,' vs ').replace(/_/g,' ');

@@ -110,7 +110,8 @@ function getRecentBets(n = 50) {
     for (let i = lines.length - 1; i >= 0 && out.length < n; i--) {
       try {
         const o = JSON.parse(lines[i]);
-        if (['WON','LOST','CANCELED','PLACED'].includes(o.event)) out.push(o);
+        // Only include bet events that have match_key (skip claim/system events)
+        if (['WON','LOST','CANCELED','PLACED'].includes(o.event) && o.match_key) out.push(o);
       } catch {}
     }
     return out;
@@ -190,8 +191,9 @@ async function getStatus() {
 
   const balanceRaw   = execHealth?.balance ?? execHealth?.balanceUsd ?? null;
   const balance      = balanceRaw != null ? parseFloat(balanceRaw) : null;
-  const maticRaw     = execHealth?.matic ?? execHealth?.maticBalance ?? execHealth?.native_balance ?? null;
-  const maticBalance = maticRaw != null ? parseFloat(maticRaw) : null;
+  // MATIC: executor /health does not expose native balance; read from RPC or set null for now.
+  // TODO: add RPC call to get MATIC balance if needed for display.
+  const maticBalance = null;
 
   return {
     ts: new Date().toISOString(),
@@ -217,13 +219,16 @@ async function getStatus() {
 
 // ── WebSocket push (every 2s) ─────────────────────────────────────────────────
 let lastStatus = null;
+let wsPushCount = 0;
 setInterval(async () => {
   if (wss.clients.size === 0) return;
   try {
     lastStatus = await getStatus();
     const msg = JSON.stringify({ type: 'status', data: lastStatus });
     wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
-  } catch (e) { /* ignore */ }
+    wsPushCount++;
+    if (wsPushCount % 30 === 1) console.log(`[dashboard] WS push #${wsPushCount} → ${wss.clients.size} clients`);
+  } catch (e) { console.error('[dashboard] WS push error:', e.message); }
 }, 2000);
 
 wss.on('connection', async (ws, req) => {
