@@ -1,0 +1,130 @@
+param(
+    [string]$LedgerPath = "data/ledger.jsonl",
+    [string]$FromDate = "",
+    [string]$ToDate = "",
+    [string]$OutputPath = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not $FromDate) {
+    $FromDate = (Get-Date).ToString("yyyy-MM-dd")
+}
+if (-not $ToDate) {
+    $ToDate = $FromDate
+}
+
+$fromTs = [datetimeoffset]::Parse("${FromDate}T00:00:00+00:00")
+$toTs = [datetimeoffset]::Parse("${ToDate}T23:59:59+00:00")
+
+function Get-MatchPrefix([string]$matchKey) {
+    if ([string]::IsNullOrWhiteSpace($matchKey)) { return "unknown" }
+    return ($matchKey -split "::")[0]
+}
+
+function Get-MarketKey($row) {
+    if ($row.PSObject.Properties.Name -contains "market_key" -and -not [string]::IsNullOrWhiteSpace($row.market_key)) {
+        return [string]$row.market_key
+    }
+    $matchKey = [string]$row.match_key
+    if ($matchKey -match "::([A-Za-z0-9_]+_winner)$") {
+        return $Matches[1].ToLowerInvariant()
+    }
+    return "match_winner"
+}
+
+function Get-PathName($row) {
+    if ($row.PSObject.Properties.Name -contains "path" -and -not [string]::IsNullOrWhiteSpace($row.path)) {
+        return [string]$row.path
+    }
+    return "unknown"
+}
+
+$rows = Get-Content $LedgerPath | ForEach-Object {
+    try { $_ | ConvertFrom-Json } catch { $null }
+} | Where-Object {
+    $_ -and $_.ts -and ([datetimeoffset]::Parse($_.ts) -ge $fromTs) -and ([datetimeoffset]::Parse($_.ts) -le $toTs)
+}
+
+$reportRows = @{}
+
+foreach ($row in $rows) {
+    $prefix = Get-MatchPrefix ([string]$row.match_key)
+    $market = Get-MarketKey $row
+    $path = Get-PathName $row
+    $bucketKey = "$prefix|$market|$path"
+
+    if (-not $reportRows.ContainsKey($bucketKey)) {
+        $reportRows[$bucketKey] = [ordered]@{
+            prefix = $prefix
+            market_key = $market
+            path = $path
+            placed = 0
+            accepted = 0
+            rejected = 0
+            failed = 0
+            won = 0
+            lost = 0
+            canceled = 0
+            placed_stake = 0.0
+            realized_pnl = 0.0
+            edge_samples = 0
+            edge_gap_sum = 0.0
+        }
+    }
+
+    $bucket = $reportRows[$bucketKey]
+    $event = [string]$row.event
+    $amount = if ($row.PSObject.Properties.Name -contains "amount_usd") { [double]$row.amount_usd } else { 0.0 }
+    $payout = if ($row.PSObject.Properties.Name -contains "payout_usd") { [double]$row.payout_usd } else { 0.0 }
+
+    switch ($event) {
+        "PLACED" {
+            $bucket.placed += 1
+            $bucket.placed_stake += $amount
+            if (($row.PSObject.Properties.Name -contains "score_implied_pct") -and ($row.PSObject.Properties.Name -contains "azuro_implied_pct")) {
+                $bucket.edge_samples += 1
+                $bucket.edge_gap_sum += ([double]$row.score_implied_pct - [double]$row.azuro_implied_pct)
+            }
+        }
+        "ON_CHAIN_ACCEPTED" { $bucket.accepted += 1 }
+        "ON_CHAIN_REJECTED" { $bucket.rejected += 1 }
+        "BET_FAILED" { $bucket.failed += 1 }
+        "WON" {
+            $bucket.won += 1
+            $bucket.realized_pnl += ($payout - $amount)
+        }
+        "LOST" {
+            $bucket.lost += 1
+            $bucket.realized_pnl -= $amount
+        }
+        "CANCELED" {
+            $bucket.canceled += 1
+            $bucket.realized_pnl += ($payout - $amount)
+        }
+    }
+}
+
+$lines = New-Object System.Collections.Generic.List[string]
+$lines.Add("# Daily Edge Report")
+$lines.Add("")
+$lines.Add("Range: $FromDate -> $ToDate")
+$lines.Add("")
+$lines.Add("| Prefix | Market | Path | Placed | Accepted | Failed | Rejected | Won | Lost | Canceled | Stake | Realized PnL | Avg Model Gap |")
+$lines.Add("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+
+$reportRows.Values |
+    Sort-Object @{ Expression = { $_.realized_pnl }; Descending = $true }, @{ Expression = { $_.placed_stake }; Descending = $true } |
+    ForEach-Object {
+        $avgGap = if ($_.edge_samples -gt 0) { [math]::Round($_.edge_gap_sum / $_.edge_samples, 2) } else { $null }
+        $gapText = if ($null -eq $avgGap) { "-" } else { [string]$avgGap }
+        $lines.Add("| $($_.prefix) | $($_.market_key) | $($_.path) | $($_.placed) | $($_.accepted) | $($_.failed) | $($_.rejected) | $($_.won) | $($_.lost) | $($_.canceled) | $([math]::Round($_.placed_stake, 2)) | $([math]::Round($_.realized_pnl, 2)) | $gapText |")
+    }
+
+$output = ($lines -join [Environment]::NewLine)
+
+if ($OutputPath) {
+    [System.IO.File]::WriteAllText($OutputPath, $output)
+}
+
+$output

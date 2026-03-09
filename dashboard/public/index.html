@@ -68,12 +68,13 @@
         </div>
       </div>
 
-      <!-- Loss limit bar -->
-      <div class="card loss-card">
+      <!-- Loss limit bar (clickable → adjust limit) -->
+      <div class="card loss-card" onclick="openLimitModal()">
         <div class="loss-row">
-          <span class="loss-label">Loss limit</span>
+          <span class="loss-label">Loss limit ⚡</span>
           <span id="loss-val" class="loss-val">$0.00 / $15.55</span>
         </div>
+        <div id="loss-detail" class="loss-detail"></div>
         <div class="loss-bar-bg">
           <div id="loss-bar" class="loss-bar-fill" style="width:0%"></div>
         </div>
@@ -297,6 +298,26 @@
         <button class="modal-close" onclick="closeModal()">✕</button>
       </div>
       <div id="modal-body" class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Limit adjustment modal -->
+  <div id="limit-modal" class="modal hidden" onclick="closeLimitModal()">
+    <div class="modal-box" onclick="event.stopPropagation()">
+      <div class="modal-handle"></div>
+      <div class="modal-header">
+        <span>⚡ Navýšit loss limit</span>
+        <button class="modal-close" onclick="closeLimitModal()">✕</button>
+      </div>
+      <div class="limit-modal-body">
+        <div id="limit-info" class="limit-current"></div>
+        <div class="limit-buttons">
+          <button class="limit-btn" onclick="raiseLimit(5)">+$5</button>
+          <button class="limit-btn" onclick="raiseLimit(10)">+$10</button>
+          <button class="limit-btn" onclick="raiseLimit(20)">+$20</button>
+        </div>
+        <div id="limit-result" class="limit-result hidden"></div>
+      </div>
     </div>
   </div>
 

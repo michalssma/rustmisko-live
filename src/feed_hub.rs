@@ -155,9 +155,22 @@ struct FeedHeartbeatEvent {
     live_items: usize,
     odds_items: usize,
     fused_ready: usize,
+    sport_readiness: Vec<SportReadinessMetric>,
     freshness_by_bookmaker: Vec<BookmakerFreshnessMetric>,
     source_count_per_market: Vec<MarketSourceCountMetric>,
     fused_ready_per_market: Vec<FusedReadyPerMarketMetric>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SportReadinessMetric {
+    sport: String,
+    live_total: usize,
+    with_numeric_score: usize,
+    with_detailed_score: usize,
+    with_any_score: usize,
+    azuro_match_market: usize,
+    actionable: usize,
+    actionable_ratio_pct: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -200,8 +213,10 @@ struct FeedHubState {
     ingest_lock: Arc<Mutex<()>>,
     /// Epoch ms of last successful GQL poll cycle (written by azuro_poller, read by /health)
     gql_last_ok_ms: Arc<AtomicI64>,
-    /// Epoch ms of last SHADOW-WS update received (written by azuro_poller, read by /health)
+    /// Epoch ms of last SHADOW-WS operational sign-of-life (connect, subscribe, inbound frame)
     ws_last_ok_ms: Arc<AtomicI64>,
+    /// Epoch ms of last inbound SHADOW-WS text frame received
+    ws_last_event_ms: Arc<AtomicI64>,
 }
 
 impl FeedHubState {
@@ -214,6 +229,7 @@ impl FeedHubState {
             ingest_lock: Arc::new(Mutex::new(())),
             gql_last_ok_ms: Arc::new(AtomicI64::new(0)),
             ws_last_ok_ms: Arc::new(AtomicI64::new(0)),
+            ws_last_event_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 }
@@ -280,6 +296,19 @@ fn normalize_sport(sport: &str) -> String {
         "volejbal" => "volleyball".to_string(),
         "házenou" | "handbal" => "handball".to_string(),
         _ => s,
+    }
+}
+
+fn is_trusted_cs2_live_source(source: &str) -> bool {
+    matches!(source.to_ascii_lowercase().as_str(), "dust2" | "hltv" | "hltv-tm")
+}
+
+fn normalize_live_sport_for_source(source: &str, sport: &str) -> String {
+    let normalized = normalize_sport(sport);
+    if normalized == "esports" && is_trusted_cs2_live_source(source) {
+        "cs2".to_string()
+    } else {
+        normalized
     }
 }
 
@@ -779,6 +808,7 @@ fn esports_team_signature(name: &str) -> Option<String> {
         "rush", "rushb", "betboom", "bucharest", "cracovia", "south", "north",
         "america", "europe", "final", "finals", "regional", "major", "minor",
     ];
+    let sponsor_prefixes = ["betclic"];
 
     let stripped = strip_esports_tournament_tail(name);
     let source = if stripped.is_empty() { name } else { stripped.as_str() };
@@ -791,6 +821,18 @@ fn esports_team_signature(name: &str) -> Option<String> {
         .filter(|t| t.len() >= 2)
         .filter(|t| !stopwords.contains(&t.as_str()))
         .collect();
+
+    if tokens.len() >= 2 {
+        let filtered_tokens: Vec<String> = tokens
+            .iter()
+            .filter(|t| !sponsor_prefixes.contains(&t.as_str()))
+            .cloned()
+            .collect();
+
+        if !filtered_tokens.is_empty() {
+            tokens = filtered_tokens;
+        }
+    }
 
     if tokens.is_empty() {
         return None;
@@ -1009,6 +1051,7 @@ struct HttpStateResponse {
     odds_items: usize,
     fused_ready: usize,
     fused_keys: Vec<String>,
+    sport_readiness: Vec<SportReadinessMetric>,
     freshness_by_bookmaker: Vec<BookmakerFreshnessMetric>,
     source_count_per_market: Vec<MarketSourceCountMetric>,
     fused_ready_per_market: Vec<FusedReadyPerMarketMetric>,
@@ -1194,6 +1237,107 @@ fn build_observability_metrics(
         source_count_per_market,
         fused_ready_per_market,
     )
+}
+
+fn build_sport_readiness_metrics(
+    live: &HashMap<String, LiveMatchState>,
+    odds: &HashMap<OddsKey, OddsState>,
+) -> Vec<SportReadinessMetric> {
+    #[derive(Default)]
+    struct Acc {
+        live_total: usize,
+        with_numeric_score: usize,
+        with_detailed_score: usize,
+        with_any_score: usize,
+        actionable: usize,
+        azuro_match_keys: HashSet<String>,
+    }
+
+    let mut azuro_match_by_sport: HashMap<String, HashSet<String>> = HashMap::new();
+    for (key, odds_item) in odds.iter() {
+        if !odds_item.payload.bookmaker.starts_with("azuro_") {
+            continue;
+        }
+        if odds_item.payload.market != "match_winner" {
+            continue;
+        }
+        azuro_match_by_sport
+            .entry(odds_item.payload.sport.clone())
+            .or_default()
+            .insert(key.match_key.clone());
+    }
+
+    let mut acc_by_sport: HashMap<String, Acc> = HashMap::new();
+    for (match_key, live_item) in live.iter() {
+        let sport = live_item.payload.sport.clone();
+        let acc = acc_by_sport.entry(sport.clone()).or_default();
+        acc.live_total += 1;
+
+        let has_numeric_score = live_item.payload.score1.is_some() && live_item.payload.score2.is_some();
+        let has_detailed_score = live_item.payload
+            .detailed_score
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        let has_any_score = has_numeric_score || has_detailed_score;
+
+        if has_numeric_score {
+            acc.with_numeric_score += 1;
+        }
+        if has_detailed_score {
+            acc.with_detailed_score += 1;
+        }
+        if has_any_score {
+            acc.with_any_score += 1;
+        }
+
+        let has_azuro_match_market = azuro_match_by_sport
+            .get(&sport)
+            .map(|keys| keys.contains(match_key))
+            .unwrap_or(false)
+            || match_key_aliases(match_key).iter().any(|alias_key| {
+                let alias_sport = alias_key.split("::").next().unwrap_or("");
+                azuro_match_by_sport
+                    .get(alias_sport)
+                    .map(|keys| keys.contains(alias_key))
+                    .unwrap_or(false)
+            });
+        if has_azuro_match_market {
+            acc.azuro_match_keys.insert(match_key.clone());
+        }
+        if has_any_score && has_azuro_match_market {
+            acc.actionable += 1;
+        }
+    }
+
+    let mut metrics: Vec<SportReadinessMetric> = acc_by_sport
+        .into_iter()
+        .map(|(sport, acc)| {
+            let actionable_ratio_pct = if acc.live_total > 0 {
+                (acc.actionable as f64 * 100.0) / acc.live_total as f64
+            } else {
+                0.0
+            };
+
+            SportReadinessMetric {
+                sport,
+                live_total: acc.live_total,
+                with_numeric_score: acc.with_numeric_score,
+                with_detailed_score: acc.with_detailed_score,
+                with_any_score: acc.with_any_score,
+                azuro_match_market: acc.azuro_match_keys.len(),
+                actionable: acc.actionable,
+                actionable_ratio_pct: (actionable_ratio_pct * 10.0).round() / 10.0,
+            }
+        })
+        .collect();
+
+    metrics.sort_by(|a, b| {
+        b.actionable
+            .cmp(&a.actionable)
+            .then_with(|| a.sport.cmp(&b.sport))
+    });
+    metrics
 }
 
 // ====================================================================
@@ -1963,6 +2107,7 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
     let (fused_keys, _fusion_misses) = collect_fusion_status(&live_map, &odds_map);
 
     let fused_ready = fused_keys.len();
+    let sport_readiness = build_sport_readiness_metrics(&live_map, &odds_map);
 
     let (freshness_by_bookmaker, source_count_per_market, fused_ready_per_market) =
         build_observability_metrics(&odds_map, &fused_keys);
@@ -1994,6 +2139,7 @@ async fn build_state_snapshot(state: &FeedHubState) -> HttpStateResponse {
         odds_items,
         fused_ready,
         fused_keys,
+        sport_readiness,
         freshness_by_bookmaker,
         source_count_per_market,
         fused_ready_per_market,
@@ -2268,9 +2414,20 @@ async fn handle_http_connection(mut stream: TcpStream, state: FeedHubState) -> R
             let now_ms = Utc::now().timestamp_millis();
             let gql_last = state.gql_last_ok_ms.load(Ordering::Relaxed);
             let ws_last = state.ws_last_ok_ms.load(Ordering::Relaxed);
+            let ws_last_event = state.ws_last_event_ms.load(Ordering::Relaxed);
             let gql_age = if gql_last > 0 { now_ms - gql_last } else { -1_i64 };
             let ws_age = if ws_last > 0 { now_ms - ws_last } else { -1_i64 };
-            let body = format!("{{\"ok\":true,\"gql_age_ms\":{},\"ws_age_ms\":{}}}", gql_age, ws_age);
+            let ws_event_age = if ws_last_event > 0 { now_ms - ws_last_event } else { -1_i64 };
+            let live_map = state.live.read().await;
+            let odds_map = state.odds.read().await;
+            let sport_readiness = build_sport_readiness_metrics(&live_map, &odds_map);
+            let body = serde_json::json!({
+                "ok": true,
+                "gql_age_ms": gql_age,
+                "ws_age_ms": ws_age,
+                "ws_event_age_ms": ws_event_age,
+                "sport_readiness": sport_readiness,
+            }).to_string();
             ("HTTP/1.1 200 OK", "application/json; charset=utf-8", body)
         }
         ("GET", "/state") => {
@@ -2373,6 +2530,7 @@ async fn handle_socket(
                                             (false, format!("payload_parse_error:{}", e))
                                         }
                                         Ok(mut payload) => {
+                                    payload.sport = normalize_live_sport_for_source(&env_source, &payload.sport);
                                     // === SANITIZE: strip score prefix from detailed_score + normalize status ===
                                     if let Some(ref ds) = payload.detailed_score {
                                         let clean = sanitize_detailed_score(ds);
@@ -2657,6 +2815,7 @@ async fn main() -> Result<()> {
 
                 let (fused_keys, fusion_misses) = collect_fusion_status(&live, &odds);
                 let fused_ready = fused_keys.len();
+                let sport_readiness = build_sport_readiness_metrics(&live, &odds);
                 let (freshness_by_bookmaker, source_count_per_market, fused_ready_per_market) =
                     build_observability_metrics(&odds, &fused_keys);
 
@@ -2676,6 +2835,7 @@ async fn main() -> Result<()> {
                     live_items,
                     odds_items,
                     fused_ready,
+                    sport_readiness,
                     freshness_by_bookmaker,
                     source_count_per_market,
                     fused_ready_per_market,

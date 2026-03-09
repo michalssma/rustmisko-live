@@ -1,0 +1,10 @@
+{
+  "autobet_enabled": true,
+  "sport_focus": [
+    "all"
+  ],
+  "loss_limit": 55,
+  "max_stake": 3,
+  "sod_bankroll": 25.913827,
+  "effective_limit": 15.5482962
+}

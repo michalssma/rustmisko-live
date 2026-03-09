@@ -120,11 +120,15 @@ const AZURO_WS_URL: &str = "wss://streams.onchainfeed.org/v1/streams/feed";
 /// Minimum interval between SubscribeConditions messages (throttle)
 const WS_RESUBSCRIBE_MIN_SECS: u64 = 10;
 
+/// Client heartbeat interval to force inbound pong frames from otherwise quiet stream
+const WS_CLIENT_PING_SECS: u64 = 10;
+
 /// Reconnect backoff sequence (ms)
 const WS_RECONNECT_BACKOFF_MS: &[u64] = &[1_000, 2_000, 5_000, 10_000, 30_000];
 
 /// Shadow WS metrics (shared across tasks)
 struct WsShadowMetrics {
+    inbound_frames_received: AtomicU64,
     updates_received: AtomicU64,
     reconnects: AtomicU64,
     last_update_epoch_ms: AtomicI64,
@@ -529,6 +533,7 @@ async fn run_shadow_ws(
         let ws_stream = match tokio_tungstenite::connect_async(AZURO_WS_URL).await {
             Ok((stream, resp)) => {
                 info!("[SHADOW-WS] Connected! HTTP {}", resp.status());
+                state.ws_last_ok_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                 backoff_idx = 0; // Reset backoff on successful connect
                 stream
             }
@@ -558,10 +563,20 @@ async fn run_shadow_ws(
         let mut last_subscribe_ts = std::time::Instant::now()
             .checked_sub(Duration::from_secs(WS_RESUBSCRIBE_MIN_SECS + 1))
             .unwrap_or_else(std::time::Instant::now);
+        let mut last_client_ping_ts = std::time::Instant::now();
 
         // Inner loop: read messages + periodic resubscribe
         let disconnect_reason: String;
         loop {
+            if last_client_ping_ts.elapsed() >= Duration::from_secs(WS_CLIENT_PING_SECS) {
+                if let Err(e) = ws_sink.send(WsMessage::Ping(Vec::new().into())).await {
+                    disconnect_reason = format!("ping send error: {}", e);
+                    break;
+                }
+                debug!("[SHADOW-WS] Client ping sent");
+                last_client_ping_ts = std::time::Instant::now();
+            }
+
             // Check if we need to (re)subscribe (new conditions from GQL poller)
             if condition_rx.has_changed().unwrap_or(false)
                 && last_subscribe_ts.elapsed() >= Duration::from_secs(WS_RESUBSCRIBE_MIN_SECS)
@@ -590,6 +605,7 @@ async fn run_shadow_ws(
                         new_poly.len(),
                         poly_set.len()
                     );
+                    state.ws_last_ok_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                     subscribed_polygon = poly_set;
                     metrics.subscribes_sent.fetch_add(1, Ordering::Relaxed);
                 }
@@ -610,6 +626,7 @@ async fn run_shadow_ws(
                         new_base.len(),
                         base_set.len()
                     );
+                    state.ws_last_ok_ms.store(Utc::now().timestamp_millis(), Ordering::Relaxed);
                     subscribed_base = base_set;
                     metrics.subscribes_sent.fetch_add(1, Ordering::Relaxed);
                 }
@@ -621,121 +638,137 @@ async fn run_shadow_ws(
             let msg = tokio::time::timeout(Duration::from_secs(5), ws_read.next()).await;
 
             match msg {
-                Ok(Some(Ok(WsMessage::Text(txt)))) => {
+                Ok(Some(Ok(frame))) => {
                     let now_ms = Utc::now().timestamp_millis();
+                    metrics.inbound_frames_received.fetch_add(1, Ordering::Relaxed);
                     metrics.last_update_epoch_ms.store(now_ms, Ordering::Relaxed);
                     state.ws_last_ok_ms.store(now_ms, Ordering::Relaxed);
+                    state.ws_last_event_ms.store(now_ms, Ordering::Relaxed);
 
-                    // Parse incoming JSON
-                    match serde_json::from_str::<WsIncoming>(&txt) {
-                        Ok(incoming) => {
-                            let event = incoming.event.as_deref().unwrap_or("?");
-                            match event {
-                                "ConditionUpdated" => {
-                                    metrics.updates_received.fetch_add(1, Ordering::Relaxed);
-                                    let cid = incoming.id.as_deref().unwrap_or("?").to_string();
+                    match frame {
+                        WsMessage::Text(txt) => {
+                            // Parse incoming JSON
+                            match serde_json::from_str::<WsIncoming>(&txt) {
+                                Ok(incoming) => {
+                                    let event = incoming.event.as_deref().unwrap_or("?");
+                                    match event {
+                                        "ConditionUpdated" => {
+                                            metrics.updates_received.fetch_add(1, Ordering::Relaxed);
+                                            let cid = incoming.id.as_deref().unwrap_or("?").to_string();
 
-                                    // Extract new odds from data.outcomes (sortOrder 0=team1, 1=team2)
-                                    let mut new_odds1: Option<f64> = None;
-                                    let mut new_odds2: Option<f64> = None;
-                                    if let Some(data) = &incoming.data {
-                                        if let Some(outcomes) = data.get("outcomes").and_then(|v| v.as_array()) {
-                                            for o in outcomes {
-                                                let sort = o.get("sortOrder").and_then(|v| v.as_u64());
-                                                let odds_raw = o.get("currentOdds").and_then(|v| v.as_str());
-                                                if let (Some(s), Some(raw)) = (sort, odds_raw) {
-                                                    if let Some(parsed) = parse_decimal_odds(raw) {
-                                                        match s {
-                                                            0 => new_odds1 = Some(parsed),
-                                                            1 => new_odds2 = Some(parsed),
-                                                            _ => {}
+                                            // Extract new odds from data.outcomes (sortOrder 0=team1, 1=team2)
+                                            let mut new_odds1: Option<f64> = None;
+                                            let mut new_odds2: Option<f64> = None;
+                                            if let Some(data) = &incoming.data {
+                                                if let Some(outcomes) = data.get("outcomes").and_then(|v| v.as_array()) {
+                                                    for o in outcomes {
+                                                        let sort = o.get("sortOrder").and_then(|v| v.as_u64());
+                                                        let odds_raw = o.get("currentOdds").and_then(|v| v.as_str());
+                                                        if let (Some(s), Some(raw)) = (sort, odds_raw) {
+                                                            if let Some(parsed) = parse_decimal_odds(raw) {
+                                                                match s {
+                                                                    0 => new_odds1 = Some(parsed),
+                                                                    1 => new_odds2 = Some(parsed),
+                                                                    _ => {}
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                    }
 
-                                    let state_str = incoming.data
-                                        .as_ref()
-                                        .and_then(|d| d.get("state"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("?");
+                                            let state_str = incoming.data
+                                                .as_ref()
+                                                .and_then(|d| d.get("state"))
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("?");
 
-                                    // ACTIVE UPDATE: patch state.odds with fresh WS data
-                                    if let (Some(o1), Some(o2)) = (new_odds1, new_odds2) {
-                                        let now = Utc::now();
-                                        let mut odds_w = state.odds.write().await;
-                                        let mut updated = false;
-                                        for (_ok, os) in odds_w.iter_mut() {
-                                            if os.payload.condition_id.as_deref() == Some(cid.as_str()) {
-                                                let old1 = os.payload.odds_team1;
-                                                let old2 = os.payload.odds_team2;
-                                                os.payload.odds_team1 = o1;
-                                                os.payload.odds_team2 = o2;
-                                                os.seen_at = now;
-                                                updated = true;
-                                                if (old1 - o1).abs() > 0.01 || (old2 - o2).abs() > 0.01 {
-                                                    info!(
-                                                        "[SHADOW-WS] LIVE UPDATE cid={}..{} odds {:.2}/{:.2} → {:.2}/{:.2}",
-                                                        &cid[..cid.len().min(12)],
-                                                        &cid[cid.len().saturating_sub(4)..],
-                                                        old1, old2, o1, o2
-                                                    );
+                                            // ACTIVE UPDATE: patch state.odds with fresh WS data
+                                            if let (Some(o1), Some(o2)) = (new_odds1, new_odds2) {
+                                                let now = Utc::now();
+                                                let mut odds_w = state.odds.write().await;
+                                                let mut updated = false;
+                                                for (_ok, os) in odds_w.iter_mut() {
+                                                    if os.payload.condition_id.as_deref() == Some(cid.as_str()) {
+                                                        let old1 = os.payload.odds_team1;
+                                                        let old2 = os.payload.odds_team2;
+                                                        os.payload.odds_team1 = o1;
+                                                        os.payload.odds_team2 = o2;
+                                                        os.seen_at = now;
+                                                        updated = true;
+                                                        if (old1 - o1).abs() > 0.01 || (old2 - o2).abs() > 0.01 {
+                                                            info!(
+                                                                "[SHADOW-WS] LIVE UPDATE cid={}..{} odds {:.2}/{:.2} → {:.2}/{:.2}",
+                                                                &cid[..cid.len().min(12)],
+                                                                &cid[cid.len().saturating_sub(4)..],
+                                                                old1, old2, o1, o2
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                drop(odds_w);
+                                                if !updated {
+                                                    debug!("[SHADOW-WS] ConditionUpdated cid={} — no matching OddsState", &cid[..cid.len().min(20)]);
                                                 }
                                             }
+
+                                            let total = metrics.updates_received.load(Ordering::Relaxed);
+                                            debug!(
+                                                "[SHADOW-WS] ConditionUpdated cid={} state={} o1={:?} o2={:?} (total: {})",
+                                                &cid[..cid.len().min(20)],
+                                                state_str,
+                                                new_odds1, new_odds2,
+                                                total
+                                            );
                                         }
-                                        drop(odds_w);
-                                        if !updated {
-                                            debug!("[SHADOW-WS] ConditionUpdated cid={} — no matching OddsState", &cid[..cid.len().min(20)]);
+                                        "SubscribedToConditions" => {
+                                            let count = incoming.data
+                                                .as_ref()
+                                                .and_then(|d| d.as_array())
+                                                .map(|a| a.len())
+                                                .unwrap_or(0);
+                                            info!(
+                                                "[SHADOW-WS] SubscribedToConditions: {} IDs confirmed",
+                                                count
+                                            );
+                                        }
+                                        _ => {
+                                            debug!("[SHADOW-WS] Unknown event: {} data={:?}",
+                                                event,
+                                                incoming.data.as_ref().map(|d| {
+                                                    let s = d.to_string();
+                                                    if s.len() > 100 { format!("{}...", &s[..100]) } else { s }
+                                                })
+                                            );
                                         }
                                     }
-
-                                    let total = metrics.updates_received.load(Ordering::Relaxed);
-                                    debug!(
-                                        "[SHADOW-WS] ConditionUpdated cid={} state={} o1={:?} o2={:?} (total: {})",
-                                        &cid[..cid.len().min(20)],
-                                        state_str,
-                                        new_odds1, new_odds2,
-                                        total
-                                    );
                                 }
-                                "SubscribedToConditions" => {
-                                    let count = incoming.data
-                                        .as_ref()
-                                        .and_then(|d| d.as_array())
-                                        .map(|a| a.len())
-                                        .unwrap_or(0);
-                                    info!(
-                                        "[SHADOW-WS] SubscribedToConditions: {} IDs confirmed",
-                                        count
-                                    );
-                                }
-                                _ => {
-                                    debug!("[SHADOW-WS] Unknown event: {} data={:?}",
-                                        event,
-                                        incoming.data.as_ref().map(|d| {
-                                            let s = d.to_string();
-                                            if s.len() > 100 { format!("{}...", &s[..100]) } else { s }
-                                        })
-                                    );
+                                Err(e) => {
+                                    debug!("[SHADOW-WS] JSON parse error: {} raw={}", e, &txt[..txt.len().min(200)]);
                                 }
                             }
                         }
-                        Err(e) => {
-                            debug!("[SHADOW-WS] JSON parse error: {} raw={}", e, &txt[..txt.len().min(200)]);
+                        WsMessage::Binary(payload) => {
+                            debug!("[SHADOW-WS] Binary frame: {} bytes", payload.len());
+                        }
+                        WsMessage::Ping(payload) => {
+                            debug!("[SHADOW-WS] Ping frame: {} bytes", payload.len());
+                            let _ = ws_sink.send(WsMessage::Pong(payload)).await;
+                        }
+                        WsMessage::Pong(payload) => {
+                            debug!("[SHADOW-WS] Pong frame: {} bytes", payload.len());
+                        }
+                        WsMessage::Close(frame) => {
+                            disconnect_reason = format!(
+                                "server close: {:?}",
+                                frame.map(|f| format!("{} {}", f.code, f.reason))
+                            );
+                            break;
+                        }
+                        _ => {
+                            debug!("[SHADOW-WS] Other inbound frame");
                         }
                     }
-                }
-                Ok(Some(Ok(WsMessage::Ping(payload)))) => {
-                    let _ = ws_sink.send(WsMessage::Pong(payload)).await;
-                }
-                Ok(Some(Ok(WsMessage::Close(frame)))) => {
-                    disconnect_reason = format!(
-                        "server close: {:?}",
-                        frame.map(|f| format!("{} {}", f.code, f.reason))
-                    );
-                    break;
                 }
                 Ok(Some(Err(e))) => {
                     disconnect_reason = format!("read error: {}", e);
@@ -749,7 +782,6 @@ async fn run_shadow_ws(
                     // Timeout — normal, loop back to check resubscribe
                     continue;
                 }
-                _ => {}
             }
         }
 
@@ -789,6 +821,7 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
 
     // ── Shadow WS spawn ──
     let ws_metrics = Arc::new(WsShadowMetrics {
+        inbound_frames_received: AtomicU64::new(0),
         updates_received: AtomicU64::new(0),
         reconnects: AtomicU64::new(0),
         last_update_epoch_ms: AtomicI64::new(0),
@@ -994,13 +1027,14 @@ pub async fn run_azuro_poller(state: FeedHubState, db_tx: mpsc::Sender<DbMsg>) {
                 let _ = condition_tx.send((poly_conds, base_conds));
             }
             // Periodic shadow metrics log (every ~30s = every 10th cycle)
+            let ws_frames = ws_metrics.inbound_frames_received.load(Ordering::Relaxed);
             let ws_updates = ws_metrics.updates_received.load(Ordering::Relaxed);
             let ws_reconnects = ws_metrics.reconnects.load(Ordering::Relaxed);
             let ws_subs = ws_metrics.subscribes_sent.load(Ordering::Relaxed);
-            if ws_updates > 0 || ws_subs > 0 {
+            if ws_frames > 0 || ws_updates > 0 || ws_subs > 0 {
                 debug!(
-                    "[SHADOW-WS] stats: {} updates, {} reconnects, {} subscribes, {} active conditions",
-                    ws_updates, ws_reconnects, ws_subs, total_ws
+                    "[SHADOW-WS] stats: {} inbound frames, {} updates, {} reconnects, {} subscribes, {} active conditions",
+                    ws_frames, ws_updates, ws_reconnects, ws_subs, total_ws
                 );
             }
         }

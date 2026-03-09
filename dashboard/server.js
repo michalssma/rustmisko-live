@@ -24,6 +24,8 @@ const LOGS_DIR    = path.join(ROOT, 'logs');
 const FEED_HEALTH = 'http://127.0.0.1:8081/health';
 const FEED_STATE  = 'http://127.0.0.1:8081/state';
 const EXEC_HEALTH = 'http://127.0.0.1:3030/health';
+const EXEC_ACTIVE = 'http://127.0.0.1:3030/active-bets';
+const EXEC_MY_BETS = 'http://127.0.0.1:3030/my-bets';
 
 // ── Load secret ──────────────────────────────────────────────────────────────
 if (!fs.existsSync(SECRET_FILE)) {
@@ -155,9 +157,19 @@ function getProcessStatus(name) {
 }
 
 function getConfig() {
-  const defaults = { autobet_enabled: true, sport_focus: ['all'], loss_limit: 15.55, max_stake: 3.00 };
-  try { return { ...defaults, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; }
-  catch { return defaults; }
+  const defaults = { autobet_enabled: true, sport_focus: ['all'], loss_limit: 30, max_stake: 3.00 };
+  let config;
+  try { config = { ...defaults, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; }
+  catch { config = defaults; }
+  // Enrich with SOD bankroll + effective limit from daily_pnl.json
+  const dailyPnl = readJson(path.join(DATA, 'daily_pnl.json'), {});
+  config.sod_bankroll = dailyPnl?.sod_bankroll ?? null;
+  if (config.sod_bankroll != null) {
+    const br = config.sod_bankroll;
+    const dlFrac = br < 150 ? 0.60 : br < 500 ? 0.20 : br < 1500 ? 0.15 : 0.10;
+    config.effective_limit = Math.min(config.loss_limit, br * dlFrac);
+  }
+  return config;
 }
 
 function getPnl7d() {
@@ -192,17 +204,36 @@ function getPnl7d() {
 let cachedMaticBalance = null;
 let maticCacheTs = 0;
 const MATIC_CACHE_TTL = 30_000; // cache MATIC balance for 30s (RPC is slow)
+let cachedMyBets = null;
+let myBetsCacheTs = 0;
+const MY_BETS_CACHE_TTL = 30_000;
 
 async function getStatus() {
-  const [feedHealth, execHealth] = await Promise.all([
+  const [feedHealth, execHealth, execActive] = await Promise.all([
     fetchJson(FEED_HEALTH),
     fetchJson(EXEC_HEALTH),
+    fetchJson(EXEC_ACTIVE),
   ]);
 
-  const activeBets  = readJson(path.join(DATA, 'active_bets.json'), []);
+  const localActiveBets = Array.isArray(execActive?.bets)
+    ? execActive.bets
+    : readJson(path.join(DATA, 'active_bets.json'), []);
   const dailyPnl    = readJson(path.join(DATA, 'daily_pnl.json'), {});
   const recentBets  = getRecentBets(500);
   const alertBotAge = getAlertBotAge();
+  const nowStatus = Date.now();
+
+  if (execHealth && (nowStatus - myBetsCacheTs > MY_BETS_CACHE_TTL || !cachedMyBets)) {
+    cachedMyBets = await fetchJson(EXEC_MY_BETS, 15000);
+    myBetsCacheTs = nowStatus;
+  }
+
+  const onchainBets = Array.isArray(cachedMyBets?.bets) ? cachedMyBets.bets : [];
+  const pendingTruth = onchainBets.filter(b => b.status === 'pending' || b.status === 'claimable');
+  const inflightPending = Array.isArray(localActiveBets)
+    ? localActiveBets.filter(b => !b.tokenId && !b.token_id)
+    : [];
+  const truthMismatch = Math.max((Array.isArray(localActiveBets) ? localActiveBets.length : 0) - pendingTruth.length, 0);
 
   const processes = {
     'feed-hub':  feedHealth  ? 'running' : getProcessStatus('feed-hub.exe'),
@@ -246,8 +277,14 @@ async function getStatus() {
       alert_bot_age_ms: alertBotAge,
     },
     processes,
-    pending:       Array.isArray(activeBets) ? activeBets : [],
-    pending_count: Array.isArray(activeBets) ? activeBets.length : 0,
+    pending:       pendingTruth,
+    pending_count: pendingTruth.length,
+    inflight_pending: inflightPending,
+    inflight_count: inflightPending.length,
+    local_pending_count: Array.isArray(localActiveBets) ? localActiveBets.length : 0,
+    pending_truth_mismatch: truthMismatch,
+    claimable_count: cachedMyBets?.claimable ?? 0,
+    claimable_usd: cachedMyBets?.claimableUsd ?? 0,
     pnl_today:     dailyPnl?.pnl_today  ?? dailyPnl?.total_pnl ?? 0,
     bets_today:    dailyPnl?.bets_today ?? dailyPnl?.total_bets ?? 0,
     recent_bets:   recentBets,
@@ -371,10 +408,19 @@ app.get('/api/log/:name', authApi, (req, res) => {
   const allowed = ['feed-hub', 'alert-bot'];
   if (!allowed.includes(req.params.name)) return res.status(403).json({ error: 'Forbidden' });
   const today = new Date().toISOString().slice(0, 10);
-  const file  = path.join(LOGS_DIR, `${today}.jsonl`);
+  // Ledger JSONL has all bet events
+  const ledgerFile = path.join(DATA, 'ledger.jsonl');
+  // Today's log file
+  const logFile = path.join(LOGS_DIR, `${today}.jsonl`);
+  
+  // For alert-bot: use ledger (bet events)
+  // For feed-hub: use today's log file
+  const file = req.params.name === 'alert-bot' ? ledgerFile : logFile;
   if (!fs.existsSync(file)) return res.json({ lines: [] });
   try {
-    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).slice(-100);
+    const raw = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    // Return last 100 lines (already pre-parsed as strings, frontend handles formatting)
+    const lines = raw.slice(-100);
     res.json({ lines });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -397,6 +443,46 @@ app.post('/api/config', authApi, (req, res) => {
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(next, null, 2), 'utf8');
     res.json({ ok: true, config: next });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Limit raise API (writes signal file for alert_bot) ───────────────────────
+const LIMIT_SIGNAL_FILE = path.join(DATA, 'limit_signal.json');
+
+app.post('/api/limit', authApi, (req, res) => {
+  const { delta } = req.body || {};
+  if (typeof delta !== 'number' || delta <= 0 || delta > 500) {
+    return res.status(400).json({ error: 'Delta musí být 1-500 USD' });
+  }
+  // Read current config / daily_pnl to compute effective state
+  const config = getConfig();
+  const dailyPnl = readJson(path.join(DATA, 'daily_pnl.json'), {});
+  const sodBankroll = dailyPnl?.sod_bankroll ?? 27;
+  const baseLimit = 30; // DAILY_LOSS_LIMIT_USD in alert_bot
+  const currentOverride = config.loss_limit || baseLimit;
+  const newLimit = currentOverride + delta;
+
+  // Update config
+  config.loss_limit = +newLimit.toFixed(2);
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8'); } catch {}
+
+  // Write signal file for alert_bot to pick up
+  const signal = {
+    ts: new Date().toISOString(),
+    action: 'raise_limit',
+    delta,
+    new_limit: newLimit,
+    source: 'dashboard',
+  };
+  try { fs.writeFileSync(LIMIT_SIGNAL_FILE, JSON.stringify(signal), 'utf8'); } catch {}
+
+  // Compute room
+  const dlFrac = sodBankroll < 150 ? 0.60 : sodBankroll < 500 ? 0.20 : sodBankroll < 1500 ? 0.15 : 0.10;
+  const tierCap = sodBankroll * dlFrac;
+  const effectiveLimit = Math.min(newLimit, tierCap);
+  const netLoss = Math.max((dailyPnl?.wagered || 0) - (dailyPnl?.returned || 0), 0);
+  const room = Math.max(effectiveLimit - netLoss, 0);
+
+  res.json({ ok: true, new_limit: newLimit, effective_limit: effectiveLimit, room, delta });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────

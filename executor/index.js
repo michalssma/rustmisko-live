@@ -272,8 +272,9 @@ function saveActiveBetsToDisk() {
 {
   const loaded = loadActiveBetsFromDisk();
   for (const b of loaded) {
-    activeBets.set(b.betId || b.tokenId, b);
-    if (b.conditionId) bettedConditions.add(b.conditionId);
+    const normalized = normalizeActiveBetRecord(b);
+    activeBets.set(normalized.betId || normalized.tokenId, normalized);
+    if (normalized.conditionId) bettedConditions.add(normalized.conditionId);
   }
   if (loaded.length > 0) {
     console.log(`📋 Loaded ${loaded.length} active bets from disk (${bettedConditions.size} conditions in dedup)`);
@@ -286,6 +287,13 @@ function saveActiveBetsToDisk() {
 // Anything else = genuinely pending or unknown → keep
 // ============================================================
 const ALREADY_PAID_SELECTOR = "d70a0e30";
+const CLAIM_LOCK_STALE_MS = 5 * 60_000;
+
+const claimLock = {
+  active: false,
+  label: null,
+  since: 0,
+};
 
 function classifyViewPayoutError(err) {
   const msg = (err?.message || err?.toString() || "").toLowerCase();
@@ -299,6 +307,102 @@ function classifyViewPayoutError(err) {
     console.warn(`⚠️ Unknown viewPayout revert selector: 0x${selectorMatch[1]}`);
   }
   return "pending";
+}
+
+function normalizeMatchKey(input) {
+  if (!input) return "";
+  return String(input).trim();
+}
+
+function parseFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function normalizeOdds(value) {
+  const num = parseFiniteNumber(value);
+  return num !== null && num > 0 ? num : null;
+}
+
+function getRequestedOddsFromBody(body) {
+  return normalizeOdds(body?.requestedOdds ?? body?.displayOdds ?? body?.odds);
+}
+
+function getMinOddsDisplay(rawMinOdds) {
+  const num = parseFiniteNumber(rawMinOdds);
+  return num !== null && num > 0 ? num / 1e12 : null;
+}
+
+function extractAcceptedOdds(result) {
+  return normalizeOdds(result?.odds ?? result?.meta?.odds);
+}
+
+function normalizeActiveBetRecord(bet) {
+  const requestedOdds = normalizeOdds(bet.requestedOdds ?? bet.displayOdds ?? bet.requested_odds);
+  const acceptedOdds = normalizeOdds(bet.acceptedOdds ?? bet.accepted_odds ?? bet.odds);
+  const minOdds = normalizeOdds(bet.minOdds ?? bet.min_odds);
+  return {
+    ...bet,
+    matchKey: normalizeMatchKey(bet.matchKey ?? bet.match_key),
+    team: bet.team || bet.valueTeam || bet.value_team || bet.team1 || "",
+    requestedOdds,
+    acceptedOdds,
+    minOdds,
+    odds: acceptedOdds ?? requestedOdds ?? minOdds ?? normalizeOdds(bet.odds) ?? 0,
+    result: bet.result || null,
+    state: bet.state || null,
+  };
+}
+
+function updateActiveBetFromResult(entry, result, discoveredTokenId, graphBetId) {
+  let changed = false;
+  const acceptedOdds = extractAcceptedOdds(result);
+  if (discoveredTokenId && entry.tokenId !== discoveredTokenId) {
+    entry.tokenId = discoveredTokenId;
+    changed = true;
+  }
+  if (graphBetId && entry.graphBetId !== graphBetId) {
+    entry.graphBetId = graphBetId;
+    changed = true;
+  }
+  if (acceptedOdds !== null) {
+    if (entry.acceptedOdds !== acceptedOdds) {
+      entry.acceptedOdds = acceptedOdds;
+      changed = true;
+    }
+    if (entry.odds !== acceptedOdds) {
+      entry.odds = acceptedOdds;
+      changed = true;
+    }
+  }
+  if (result?.state && entry.state !== result.state) {
+    entry.state = result.state;
+    entry.status = String(result.state).toLowerCase();
+    changed = true;
+  }
+  if ((result?.result || null) !== (entry.result || null)) {
+    entry.result = result?.result || null;
+    changed = true;
+  }
+  return changed;
+}
+
+function acquireClaimLock(label) {
+  const now = Date.now();
+  if (claimLock.active && now - claimLock.since < CLAIM_LOCK_STALE_MS) {
+    return false;
+  }
+  claimLock.active = true;
+  claimLock.label = label;
+  claimLock.since = now;
+  return true;
+}
+
+function releaseClaimLock() {
+  claimLock.active = false;
+  claimLock.label = null;
+  claimLock.since = 0;
 }
 
 // Ledger path for executor-side claim logging
@@ -321,19 +425,26 @@ async function autoPruneSettled() {
   const before = activeBets.size;
   let removed = 0;
   let kept_won = 0;
+  let updated = 0;
   const lpAbi = parseAbi(['function viewPayout(address,uint256) view returns (uint128)']);
   for (const [key, bet] of activeBets.entries()) {
     try {
       const result = await toolkit.getBet({ chainId: CHAIN_ID, orderId: bet.betId || key });
       const st = result?.state || "";
       const rs = result?.result || "";
+      const tid = extractTokenIdFromUnknown(result);
+      const graphBetId = tid
+        ? `${contracts.core.toLowerCase()}_${tid}`
+        : (bet.graphBetId || null);
+      if (updateActiveBetFromResult(bet, result, tid, graphBetId)) {
+        updated++;
+      }
       // Rejected: never on-chain, safe to remove
       if (st === "Rejected") { activeBets.delete(key); removed++; continue; }
       // Lost: no payout, safe to remove
       if (rs === "Lost") { activeBets.delete(key); removed++; continue; }
       // Won/Canceled: ONLY remove if on-chain payout already claimed
       if (rs === "Won" || rs === "Canceled" || st === "Canceled") {
-        const tid = extractTokenIdFromUnknown(result);
         if (tid && !DRY_RUN) {
           try {
             const payout = await publicClient.readContract({
@@ -356,13 +467,96 @@ async function autoPruneSettled() {
       }
     } catch {}
   }
+  if (removed > 0 || updated > 0) {
+    saveActiveBetsToDisk();
+    console.log(`🧹 Auto-prune sync: ${removed} removed, ${updated} updated, ${kept_won} Won/Canceled kept. ${before} -> ${activeBets.size}`);
+  }
+}
+
+async function fetchOnchainOwnedBetStatuses() {
+  const ownerAddress = account?.address;
+  if (!ownerAddress) {
+    return [];
+  }
+
+  const erc721Abi = parseAbi([
+    'function balanceOf(address) view returns (uint256)',
+    'function tokenOfOwnerByIndex(address,uint256) view returns (uint256)',
+  ]);
+  const lpAbi = parseAbi([
+    'function viewPayout(address,uint256) view returns (uint128)',
+  ]);
+
+  const nftCount = Number(await publicClient.readContract({
+    address: contracts.azuroBet,
+    abi: erc721Abi,
+    functionName: 'balanceOf',
+    args: [ownerAddress],
+  }));
+
+  if (nftCount === 0) {
+    return [];
+  }
+
+  const tokenIds = [];
+  for (let i = 0; i < nftCount; i += 10) {
+    const batch = [];
+    for (let j = i; j < Math.min(i + 10, nftCount); j++) {
+      batch.push(publicClient.readContract({
+        address: contracts.azuroBet,
+        abi: erc721Abi,
+        functionName: 'tokenOfOwnerByIndex',
+        args: [ownerAddress, BigInt(j)],
+      }));
+    }
+    tokenIds.push(...await Promise.all(batch));
+  }
+
+  return Promise.all(tokenIds.map(tid =>
+    publicClient.readContract({
+      address: contracts.lp,
+      abi: lpAbi,
+      functionName: 'viewPayout',
+      args: [contracts.core, tid],
+    }).then(p => {
+      const usd = Number(p) / (10 ** contracts.betTokenDecimals);
+      return { tokenId: tid.toString(), payoutUsd: usd, status: usd > 0 ? 'claimable' : 'lost' };
+    }).catch((e) => {
+      const cls = classifyViewPayoutError(e);
+      return { tokenId: tid.toString(), payoutUsd: 0, status: cls };
+    })
+  ));
+}
+
+async function reconcileActiveBetsWithOnchainTruth() {
+  if (DRY_RUN || activeBets.size === 0) return { removed: 0, kept: activeBets.size };
+
+  const statuses = await fetchOnchainOwnedBetStatuses();
+  const statusByTokenId = new Map(statuses.map(row => [row.tokenId, row.status]));
+
+  let removed = 0;
+  for (const [key, bet] of activeBets.entries()) {
+    const tokenId = bet?.tokenId ? String(bet.tokenId) : null;
+    if (!tokenId) continue;
+    const tokenStatus = statusByTokenId.get(tokenId);
+    if (tokenStatus === 'already_paid' || tokenStatus === 'lost') {
+      activeBets.delete(key);
+      removed++;
+    }
+  }
+
   if (removed > 0) {
     saveActiveBetsToDisk();
-    console.log(`🧹 Auto-prune on startup: ${removed} removed (Lost/Rejected/Claimed), ${kept_won} Won/Canceled kept (awaiting claim). ${before} -> ${activeBets.size}`);
+    console.log(`🧽 On-chain reconcile pruned ${removed} stale active bets using /my-bets truth (${activeBets.size} remain)`);
   }
+
+  return { removed, kept: activeBets.size };
 }
 // Schedule auto-prune 10s after startup (give toolkit time to init)
 setTimeout(() => autoPruneSettled().catch(e => console.error(`Auto-prune error: ${e.message}`)), 10000);
+setInterval(() => autoPruneSettled().catch(e => console.error(`Auto-prune interval error: ${e.message}`)), 60_000);
+setTimeout(() => reconcileActiveBetsWithOnchainTruth().catch(e => console.error(`On-chain reconcile startup error: ${e.message}`)), 15000);
+setInterval(() => reconcileActiveBetsWithOnchainTruth().catch(e => console.error(`On-chain reconcile interval error: ${e.message}`)), 60_000);
 
 function extractTokenIdFromUnknown(value) {
   const raw = _extractTokenIdRaw(value);
@@ -681,6 +875,9 @@ app.post("/approve", async (req, res) => {
 app.post("/bet", async (req, res) => {
   const { conditionId, outcomeId, amount, minOdds, gameId, team1, team2 } =
     req.body;
+  const normalizedMatchKey = normalizeMatchKey(req.body.matchKey || req.body.match_key);
+  const requestedOdds = getRequestedOddsFromBody(req.body);
+  const minOddsDisplay = getMinOddsDisplay(minOdds);
 
   if (!conditionId || !outcomeId || !amount) {
     return res
@@ -734,9 +931,16 @@ app.post("/bet", async (req, res) => {
       conditionId,
       outcomeId,
       amount: amountUsd,
+      stake: amountUsd,
       gameId,
+      matchKey: normalizedMatchKey,
       team1: team1 || "?",
       team2: team2 || "?",
+      team: req.body.valueTeam || req.body.value_team || req.body.team || team1 || "",
+      requestedOdds,
+      minOdds: minOddsDisplay,
+      acceptedOdds: requestedOdds,
+      odds: requestedOdds ?? minOddsDisplay ?? 0,
       placedAt: new Date().toISOString(),
       state: "DRY-RUN",
     });
@@ -823,6 +1027,7 @@ app.post("/bet", async (req, res) => {
       });
 
       const discoveredTokenId = extractTokenIdFromUnknown(result);
+      const acceptedOdds = extractAcceptedOdds(result);
       const graphBetId = discoveredTokenId
         ? `${contracts.core.toLowerCase()}_${discoveredTokenId}`
         : null;
@@ -852,12 +1057,17 @@ app.post("/bet", async (req, res) => {
           conditionId,
           outcomeId: cleanOutcomeId,
           stake: parseFloat(amount) / 10 ** contracts.betTokenDecimals,
-          odds: parseFloat(minOdds || "0") / 1e12,
-          sport: (req.body.matchKey || "").split("::")[0] || "?",
-          matchKey: req.body.matchKey || "",
+          minOdds: minOddsDisplay,
+          requestedOdds,
+          acceptedOdds,
+          odds: acceptedOdds ?? requestedOdds ?? minOddsDisplay ?? 0,
+          sport: normalizedMatchKey.split("::")[0] || "?",
+          matchKey: normalizedMatchKey,
           team: selectedTeam,
           placedAt: new Date().toISOString(),
           status: "pending",
+          state: result.state,
+          result: result.result || null,
         };
         activeBets.set(result.id, betData);
         // bettedConditions already added by optimistic lock (Layer 3)
@@ -876,6 +1086,9 @@ app.post("/bet", async (req, res) => {
         tokenId: discoveredTokenId,
         graphBetId,
         state: result.state,
+        acceptedOdds,
+        requestedOdds,
+        minOdds: minOddsDisplay,
         error: result.errorMessage || result.error,
       });
     } else {
@@ -945,6 +1158,7 @@ app.get("/bet/:id", async (req, res) => {
     });
 
     const discoveredTokenId = extractTokenIdFromUnknown(result);
+    const acceptedOdds = extractAcceptedOdds(result);
     const graphBetId = discoveredTokenId
       ? `${contracts.core.toLowerCase()}_${discoveredTokenId}`
       : null;
@@ -953,11 +1167,12 @@ app.get("/bet/:id", async (req, res) => {
     if (activeBets.has(req.params.id)) {
       const entry = activeBets.get(req.params.id);
       const prevState = entry?.state;
-      entry.state = result.state;
-      // Keep legacy field for UI/debugging
-      entry.status = (result.state || "unknown").toLowerCase();
+      const changed = updateActiveBetFromResult(entry, result, discoveredTokenId, graphBetId);
 
-      if (result.state === "Rejected" || result.state === "Failed" || result.state === "Canceled") {
+      if (result.result === "Lost") {
+        activeBets.delete(req.params.id);
+        saveActiveBetsToDisk();
+      } else if (result.state === "Rejected" || result.state === "Failed" || result.state === "Canceled") {
         // Confirmed terminal failure — unlock idempotence so the condition can be retried.
         // Without this, a Created->Rejected transition permanently blocks all future bets on the same condition.
         if (entry?.conditionId) {
@@ -969,7 +1184,34 @@ app.get("/bet/:id", async (req, res) => {
         }
         activeBets.delete(req.params.id);
         saveActiveBetsToDisk();
-      } else if (prevState !== result.state) {
+      } else if (result.result === "Won" || result.result === "Canceled") {
+        if (discoveredTokenId && !DRY_RUN) {
+          try {
+            const payout = await publicClient.readContract({
+              address: contracts.lp,
+              abi: parseAbi(['function viewPayout(address,uint256) view returns (uint128)']),
+              functionName: 'viewPayout',
+              args: [contracts.core, BigInt(discoveredTokenId)],
+            });
+            if (Number(payout) === 0) {
+              activeBets.delete(req.params.id);
+              saveActiveBetsToDisk();
+            } else if (changed || prevState !== result.state) {
+              saveActiveBetsToDisk();
+            }
+          } catch (e) {
+            const cls = classifyViewPayoutError(e);
+            if (cls === 'already_paid') {
+              activeBets.delete(req.params.id);
+              saveActiveBetsToDisk();
+            } else if (changed || prevState !== result.state) {
+              saveActiveBetsToDisk();
+            }
+          }
+        } else if (changed || prevState !== result.state) {
+          saveActiveBetsToDisk();
+        }
+      } else if (changed || prevState !== result.state) {
         saveActiveBetsToDisk();
       }
     }
@@ -978,6 +1220,7 @@ app.get("/bet/:id", async (req, res) => {
       ...result,
       tokenId: discoveredTokenId,
       graphBetId,
+      acceptedOdds,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1169,6 +1412,15 @@ app.post("/prune-settled", async (req, res) => {
   res.json({ before, after: activeBets.size, removed, kept });
 });
 
+app.post("/reconcile-active", async (req, res) => {
+  try {
+    const result = await reconcileActiveBetsWithOnchainTruth();
+    res.json({ ok: true, ...result, count: activeBets.size });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============================================================
 // POST /check-cashout — check if cashout is profitable
 // ============================================================
@@ -1292,6 +1544,9 @@ app.post("/claim", async (req, res) => {
       tokenIds,
     });
   }
+  if (!acquireClaimLock('claim')) {
+    return res.status(409).json({ error: `Claim already running (${claimLock.label || 'unknown'})` });
+  }
   try {
     const abi = toolkit
       ? toolkit.lpAbi
@@ -1368,6 +1623,7 @@ app.post("/claim", async (req, res) => {
       status: "ok",
       txHash: hash,
       claimed: claimable.length,
+      tokenIds: claimable.map(t => t.toString()),
       totalPayoutUsd: totalPayout,
       newBalanceUsd: balanceUsd,
       blockNumber: receipt.blockNumber.toString(),
@@ -1375,6 +1631,8 @@ app.post("/claim", async (req, res) => {
   } catch (e) {
     console.error(`❌ Claim error: ${e.message}`);
     res.status(500).json({ error: e.message, details: e.stack });
+  } finally {
+    releaseClaimLock();
   }
 });
 
@@ -1400,42 +1658,13 @@ app.get('/my-bets', async (req, res) => {
       'function viewPayout(address,uint256) view returns (uint128)',
     ]);
 
-    // Step 1: Count NFTs
-    const nftCount = Number(await publicClient.readContract({
-      address: contracts.azuroBet, abi: erc721Abi,
-      functionName: 'balanceOf', args: [walletAddr],
-    }));
+    // Step 1-3: Enumerate owned AzuroBet NFTs and classify them by on-chain payout truth
+    const results = await fetchOnchainOwnedBetStatuses();
+    const nftCount = results.length;
 
     if (nftCount === 0) {
       return res.json({ total: 0, claimable: 0, pending: 0, lost: 0, bets: [], source: 'on-chain' });
     }
-
-    // Step 2: Enumerate tokenIds (batches of 10)
-    const tokenIds = [];
-    for (let i = 0; i < nftCount; i += 10) {
-      const batch = [];
-      for (let j = i; j < Math.min(i + 10, nftCount); j++) {
-        batch.push(publicClient.readContract({
-          address: contracts.azuroBet, abi: erc721Abi,
-          functionName: 'tokenOfOwnerByIndex', args: [walletAddr, BigInt(j)],
-        }));
-      }
-      tokenIds.push(...await Promise.all(batch));
-    }
-
-    // Step 3: Check viewPayout for each (parallel)
-    const results = await Promise.all(tokenIds.map(tid =>
-      publicClient.readContract({
-        address: contracts.lp, abi: lpAbi,
-        functionName: 'viewPayout', args: [contracts.core, tid],
-      }).then(p => {
-        const usd = Number(p) / (10 ** contracts.betTokenDecimals);
-        return { tokenId: tid.toString(), payoutUsd: usd, status: usd > 0 ? 'claimable' : 'lost' };
-      }).catch((e) => {
-        const cls = classifyViewPayoutError(e);
-        return { tokenId: tid.toString(), payoutUsd: 0, status: cls }; // "already_paid" or "pending"
-      })
-    ));
 
     // Step 4: Enrich with activeBets metadata (team, odds, amount, matchKey)
     const activeBetsArr = Array.from(activeBets.values());
@@ -1448,7 +1677,11 @@ app.get('/my-bets', async (req, res) => {
       if (meta) {
         r.team = meta.team || '';
         r.matchKey = meta.matchKey || '';
+        r.conditionId = meta.conditionId || '';
         r.odds = meta.odds || 0;
+        r.requestedOdds = meta.requestedOdds || 0;
+        r.acceptedOdds = meta.acceptedOdds || 0;
+        r.minOdds = meta.minOdds || 0;
         r.amount = meta.stake || 0;
         r.betId = meta.betId || '';
         r.sport = meta.sport || '';
@@ -1500,6 +1733,9 @@ app.post("/auto-claim", async (req, res) => {
       claimed: 0,
       warning: "Nastav PRIVATE_KEY pro live claim",
     });
+  }
+  if (!acquireClaimLock('auto-claim')) {
+    return res.status(409).json({ error: `Claim already running (${claimLock.label || 'unknown'})` });
   }
 
   try {
@@ -1669,6 +1905,8 @@ app.post("/auto-claim", async (req, res) => {
   } catch (e) {
     console.error(`❌ Auto-claim error: ${e.message}`);
     res.status(500).json({ error: e.message, details: e.stack });
+  } finally {
+    releaseClaimLock();
   }
 });
 

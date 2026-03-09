@@ -545,3 +545,149 @@ Conservative scenario (same WR, better sizing):
 - Anomaly path: Regime-based stake místo flat $0.50
 - Football anomaly: Enabled s goal_diff ≥ 2 guardem
 - Feature flags: `FF_CS2_MATCH_FROM_ROUNDS`, `FF_FOOTBALL_ANOMALY_GOALDIFF2`, `FF_REGIME_STAKE`, `FF_TENNIS_GAME_MODEL`, `FF_BASKETBALL_LIVE`
+
+---
+
+## 8. Dota-2 — produkční score-edge model
+
+### Verdikt
+
+`dota-2` dává smysl jako další live esport po `cs2`, ale pouze tehdy, když máme reálný live state. Pokud event nese jen odds a nemá použitelný `score` / `detailed_score`, není to score-edge model, ale slepý price chase. To do live rollout nepatří.
+
+### Co už v systému máme
+
+1. Samostatnou sport větev `dota-2`.
+2. Funkci `dota2_score_to_win_prob(...)`.
+3. Sport resolution, který umí odlišit `dota-2` od generic `esports`.
+
+### Co dnes blokuje rollout
+
+1. Část live eventů má `score=null` a `detailed_score=null`.
+2. Není dostatečně vidět readiness ratio po sportu.
+3. Chybí přísný reject taxonomy pro `missing score state`.
+
+### Produkční guard pro Dota
+
+```rust
+if sport == "dota-2" {
+    if live_score.is_none() && detailed_score.is_none() {
+        return Skip("DOTA_SCORE_MISSING");
+    }
+
+    if market_key != "match_winner" {
+        return Skip("DOTA_MARKET_NOT_ENABLED");
+    }
+
+    if odds < 1.45 || odds > 2.10 {
+        return Skip("DOTA_ODDS_CORRIDOR");
+    }
+
+    if edge_pct < 30.0 {
+        return Skip("DOTA_EDGE_TOO_LOW");
+    }
+}
+```
+
+### Dota state -> probability princip
+
+První produkční verze má zůstat jednoduchá. Nepotřebujeme hned sofistikovaný model na economy, buyback a Roshan. Potřebujeme konzervativní převod "stav hry -> pravděpodobnost výhry", který nepustí slabé či nejasné situace.
+
+#### Doporučené pásma pro první rollout
+
+| Stav | Interpretace | true_p | Režim |
+|:--|:--|:-:|:--|
+| Slabý nebo nejasný lead | score bez zjevné dominance | <0.58 | NoBet |
+| Střední lead | kontrolovaná výhoda, ale ne closeout | 0.60-0.68 | FalseFavorite / paper-only |
+| Silný lead | jasná dominance v live state | 0.72-0.80 | StrongEdge micro-stake |
+| Closeout stav | velmi silná pozice, bez datového šumu | 0.82+ | StrongEdge |
+
+### Dota rollout pravidla
+
+1. Start jen `match_winner`.
+2. `map*_winner` až po tom, co live data stabilně odliší map state a market state.
+3. Prvních 50 kandidátů pouze dry-run.
+4. Prvních 20 settlech v live režimu musí držet ROI >= 0 a bez strukturálních false-positive patternů.
+
+---
+
+## 9. Valorant — produkční score-edge model
+
+### Verdikt
+
+`valorant` je strukturálně bližší `cs2` než Dota, ale datově je dnes křehčí. Proto musí mít přísnější feed gate. Pokud nevíme, zda score reprezentuje match nebo mapu, musí model mlčet.
+
+### Co už v systému máme
+
+1. `map_score_to_win_prob(...)` použitelnou pro `valorant` / `league-of-legends`.
+2. Sport resolution na konkrétní titul.
+3. Základní path pro `match_winner` hodnocení.
+
+### Co dnes blokuje rollout
+
+1. Časté `score=null` / `detailed_score=null` u live eventů.
+2. Ne vždy je jasné, jestli score značí match nebo map state.
+3. Bez explicitního market-state guardu hrozí mix match edge a map marketu.
+
+### Produkční guard pro Valorant
+
+```rust
+if sport == "valorant" {
+    if live_score.is_none() && detailed_score.is_none() {
+        return Skip("VALORANT_SCORE_MISSING");
+    }
+
+    if market_key != "match_winner" {
+        return Skip("VALORANT_MARKET_NOT_ENABLED");
+    }
+
+    if !score_state_is_unambiguous(score, detailed_score) {
+        return Skip("VALORANT_SCORE_AMBIGUOUS");
+    }
+
+    if odds < 1.50 || odds > 2.05 {
+        return Skip("VALORANT_ODDS_CORRIDOR");
+    }
+
+    if edge_pct < 30.0 {
+        return Skip("VALORANT_EDGE_TOO_LOW");
+    }
+}
+```
+
+### Valorant state -> probability princip
+
+První verze nemá honit každý map lead. Má pustit jen stavy, kde score jasně říká, že favorit už má reálný informační náskok.
+
+#### Doporučené pásma pro první rollout
+
+| Stav | Interpretace | true_p | Režim |
+|:--|:--|:-:|:--|
+| Nejasný score context | nevíme match vs mapa | — | NoBet |
+| Těsný lead | mírný náskok | 0.58-0.66 | FalseFavorite / paper-only |
+| Jasný map lead | silná pozice v aktuální mapě | 0.70-0.78 | StrongEdge micro-stake |
+| Match closeout | kombinace map lead + round dominance | 0.80+ | StrongEdge |
+
+### Valorant rollout pravidla
+
+1. Start jen `match_winner`.
+2. Map markets povolit až po samostatném replay packu.
+3. Pokud `market_ambiguous` nebo `score_ambiguous` tvoří významný podíl kandidátů, rollout stop.
+4. Výsledky reportovat odděleně od generic `esports`.
+
+---
+
+## 10. Společné guardy pro Dota a Valorant
+
+### Co musí být pravda před live rolloutem
+
+1. Sport má vlastní readiness metriky.
+2. `market_key` je přítomný od kandidáta až po settlement follow-up.
+3. Ledger umí rozlišit `missing score`, `ambiguous score`, `market disabled`, `edge too low`, `odds corridor`.
+4. Replay test běží na reálných JSONL samplech daného sportu.
+
+### Co se nesmí stát
+
+1. Bet na základě odds-only eventu bez state edge.
+2. Mix `match_winner` a `map*_winner` bez explicitního přepočtu.
+3. Vyhodnocování nového sportu přes generic `esports` bucket.
+4. Přesun do vyššího stake režimu bez prvních auditovatelných settle výsledků.

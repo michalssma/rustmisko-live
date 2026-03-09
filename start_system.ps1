@@ -91,7 +91,14 @@ if (-not $env:FEED_HUB_URL) { $env:FEED_HUB_URL = 'http://127.0.0.1:8081' }
 if (-not $env:EXECUTOR_URL) { $env:EXECUTOR_URL = 'http://127.0.0.1:3030' }
 if (-not $env:CHAIN_ID) { $env:CHAIN_ID = '137' }
 if (-not $env:EXECUTOR_PORT) { $env:EXECUTOR_PORT = '3030' }
-if (-not $env:WS_STATE_GATE) { $env:WS_STATE_GATE = 'false' }  # WS-GATE disabled: duplicate of SHADOW-WS, GQL fallback handles condition age check. Rollback: set 'true'
+
+# Legacy alert-bot WS gate is an opt-in debug fallback only.
+# Ignore stale WS_STATE_GATE values from .env unless the new explicit opt-in is present.
+$legacyWsGateOptIn = ($env:LEGACY_WS_GATE -eq 'true' -or $env:LEGACY_WS_GATE -eq '1')
+if (($env:WS_STATE_GATE -eq 'true' -or $env:WS_STATE_GATE -eq '1') -and -not $legacyWsGateOptIn) {
+    Write-Host 'WARN: Ignoring stale WS_STATE_GATE=true from environment. Use LEGACY_WS_GATE=true for explicit legacy opt-in.' -ForegroundColor Yellow
+}
+$env:WS_STATE_GATE = if ($legacyWsGateOptIn) { 'true' } else { 'false' }
 
 # Secrets MUST NOT be hardcoded in repo.
 # Required for live on-chain execution:
@@ -168,6 +175,16 @@ if ($alertProc) {
     Write-Host "  alert-bot OK (PID: $($alertProc.Id))" -ForegroundColor Green
 } else {
     Write-Host '  ERROR: alert-bot did not start' -ForegroundColor Red
+}
+
+Write-Host '[5/5] Starting watchdog...' -ForegroundColor Green
+$watchdogScript = Join-Path $ROOT 'watchdog.ps1'
+if (Test-Path $watchdogScript) {
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$watchdogScript`"" -WorkingDirectory $ROOT -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+    Write-Host '  watchdog OK (background, 30s intervals)' -ForegroundColor Green
+} else {
+    Write-Host '  watchdog.ps1 not found, skipping' -ForegroundColor Yellow
 }
 
 Write-Host ''

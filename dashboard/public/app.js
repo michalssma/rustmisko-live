@@ -123,14 +123,23 @@ function render(d) {
 
   // Pending
   const pending    = d.pending || [];
-  const totalStake = pending.reduce((s,b) => s+(b.stake||b.amount_usd||0), 0);
+  const inflight   = d.inflight_pending || [];
+  const totalStake = pending.reduce((s,b) => s+(b.amount||b.stake||b.amount_usd||0), 0);
+  const mismatch   = d.pending_truth_mismatch || 0;
   setText('pending-dots',    pending.length > 0 ? '●'.repeat(Math.min(pending.length,5)) : '○');
-  setText('pending-summary', `${pending.length} betů • $${totalStake.toFixed(2)}`);
+  setText('pending-summary', `${pending.length} chain • $${totalStake.toFixed(2)}${inflight.length ? ` • +${inflight.length} inflight` : ''}${mismatch ? ` • ${mismatch} stale` : ''}`);
 
-  // Loss limit bar
-  const lossLimit = d.config?.loss_limit ?? 15.55;
-  const lossPct   = Math.min(lossLimit > 0 ? (lossToday/lossLimit)*100 : 0, 100);
-  setText('loss-val', `$${lossToday.toFixed(2)} / $${lossLimit.toFixed(2)}`);
+  // Loss limit bar — show REAL effective limit
+  const configLimit = d.config?.loss_limit ?? 30;
+  const sodBankroll = d.config?.sod_bankroll ?? d.balance_usd ?? 27;
+  // Micro tier: daily_loss_frac = 60% of SOD bankroll
+  const dlFrac = sodBankroll < 150 ? 0.60 : sodBankroll < 500 ? 0.20 : sodBankroll < 1500 ? 0.15 : 0.10;
+  const tierCap = sodBankroll * dlFrac;
+  const effectiveLimit = d.config?.effective_limit ?? Math.min(configLimit, tierCap);
+  const lossPct   = Math.min(effectiveLimit > 0 ? (lossToday/effectiveLimit)*100 : 0, 100);
+  setText('loss-val', `$${lossToday.toFixed(2)} / $${effectiveLimit.toFixed(2)}`);
+  const detailEl = document.getElementById('loss-detail');
+  if (detailEl) detailEl.textContent = `min($${configLimit.toFixed(0)} hard, $${tierCap.toFixed(1)} = ${(dlFrac*100).toFixed(0)}% × $${sodBankroll.toFixed(0)} SOD)`;
   const bar = document.getElementById('loss-bar');
   if (bar) { bar.style.width=`${lossPct}%`; bar.className='loss-bar-fill'+(lossPct>80?' danger':lossPct>50?' warn':''); }
 
@@ -190,12 +199,15 @@ function renderProc(id, status) {
 function openPendingModal() {
   if (!lastData) return;
   const bets = lastData.pending || [];
+  const inflight = lastData.inflight_pending || [];
   const el   = document.getElementById('pending-modal-list');
   if (!el) return;
-  if (bets.length === 0) {
+  if (bets.length === 0 && inflight.length === 0) {
     el.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted)">Žádné pending bety</div>';
   } else {
-    el.innerHTML = bets.map(b => `
+    const renderItems = (items, title, subtitle) => `
+      <div class="pmi-section-title" style="padding:8px 4px 10px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em">${escHtml(title)}${subtitle ? ` <span style="font-size:11px;text-transform:none;letter-spacing:0;color:var(--muted)">${escHtml(subtitle)}</span>` : ''}</div>
+      ${items.map(b => `
       <div class="pmi-item">
         <div class="pmi-top">
           <span class="pmi-emoji">${sportEmoji(b.sport||detectSport(b.matchKey||b.match_key||''))}</span>
@@ -207,7 +219,12 @@ function openPendingModal() {
           <span class="pmi-time">⏱ ${timeAgo(b.placedAt||b.ts)}</span>
         </div>
       </div>
-    `).join('<hr class="pmi-sep">');
+      `).join('<hr class="pmi-sep">')}
+    `;
+    const sections = [];
+    if (bets.length) sections.push(renderItems(bets, 'On-chain pending', `${bets.length} NFT`));
+    if (inflight.length) sections.push(renderItems(inflight, 'Local inflight', `${inflight.length} čeká na reconcile`));
+    el.innerHTML = sections.join('<div style="height:14px"></div>');
   }
   document.getElementById('pending-modal').classList.remove('hidden');
 }
@@ -444,7 +461,28 @@ async function loadLog(name) {
   el.textContent = 'Načítám...';
   try {
     const r = await api('GET', `/api/log/${name}`);
-    el.textContent = (r.lines||[]).slice(-50).join('\n') || '(prázdný log)';
+    const lines = r.lines || [];
+    if (!lines.length) { el.textContent = '(prázdný log)'; return; }
+    // Parse JSONL lines into human-readable format
+    const formatted = lines.slice(-60).map(line => {
+      try {
+        const o = typeof line === 'string' ? JSON.parse(line) : line;
+        const t = o.ts ? new Date(o.ts).toLocaleTimeString('cs',{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+        const ev = o.event || o.level || '?';
+        if (o.event === 'PLACED')   return `${t} ✅ BET ${o.match_key||''} edge=${(o.edge_pct||0).toFixed(1)}% @${(o.odds||0).toFixed(2)} $${(o.amount_usd||o.stake||0).toFixed(2)}`;
+        if (o.event === 'WON')      return `${t} 🏆 WON ${o.match_key||''} +$${((o.payout_usd||0)-(o.amount_usd||0)).toFixed(2)}`;
+        if (o.event === 'LOST')     return `${t} ❌ LOST ${o.match_key||''} -$${(o.amount_usd||0).toFixed(2)}`;
+        if (o.event === 'CANCELED') return `${t} ↩️ CANCEL ${o.match_key||''}`;
+        if (o.event === 'BET_FAILED') return `${t} ⛔ FAIL ${o.match_key||''} ${o.error||o.reason_code||''}`;
+        if (o.event === 'ON_CHAIN_ACCEPTED') return `${t} ⛓ CHAIN ${o.match_key||''} token=${o.token_id||'?'}`;
+        if (o.event === 'EXECUTOR_CLAIM') return `${t} 💰 CLAIM $${(o.totalPayoutUsd||0).toFixed(2)} bal=$${o.newBalanceUsd||'?'}`;
+        if (o.event === 'SAFETY_CLAIM') return `${t} 🔒 SAFE_CLAIM $${(o.payout_usd||0).toFixed(2)}`;
+        if (o.event === 'LIMIT_OVERRIDE') return `${t} ⚡ LIMIT +$${o.delta||'?'} → $${o.new_limit||'?'}`;
+        // Generic: just show ts + event + key info
+        return `${t} [${ev}] ${o.match_key || o.msg || JSON.stringify(o).slice(0,80)}`;
+      } catch { return typeof line === 'string' ? line.slice(0,120) : String(line); }
+    });
+    el.textContent = formatted.join('\n');
     el.scrollTop = el.scrollHeight;
   } catch { el.textContent = 'Chyba načtení logu'; }
 }
@@ -512,6 +550,52 @@ async function api(method, url, body) {
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   const r = await fetch(url, opts);
   return r.json().catch(() => ({}));
+}
+
+// ── Limit modal ───────────────────────────────────────────────────────────────
+function openLimitModal() {
+  const d = lastData;
+  const el = document.getElementById('limit-info');
+  if (!el || !d) return;
+  const configLimit = d.config?.loss_limit ?? 30;
+  const sodBankroll = d.config?.sod_bankroll ?? d.balance_usd ?? 27;
+  const dlFrac = sodBankroll < 150 ? 0.60 : sodBankroll < 500 ? 0.20 : sodBankroll < 1500 ? 0.15 : 0.10;
+  const tierCap = sodBankroll * dlFrac;
+  const effectiveLimit = d.config?.effective_limit ?? Math.min(configLimit, tierCap);
+  const todayStr  = new Date().toISOString().slice(0,10);
+  const todayBets = (d.recent_bets||[]).filter(b => b.ts && b.ts.slice(0,10) === todayStr);
+  const lossToday = todayBets.filter(b => b.event==='LOST').reduce((s,b) => s+(b.amount_usd||b.stake||0), 0);
+  const gainToday = todayBets.filter(b => b.event==='WON').reduce((s,b) => s+(b.payout_usd||0)-(b.amount_usd||b.stake||0), 0);
+  const netLoss = Math.max(lossToday - gainToday, 0);
+  const room = Math.max(effectiveLimit - netLoss, 0);
+  el.innerHTML = `
+    <b>Aktuální limit:</b> $${effectiveLimit.toFixed(2)}<br>
+    <b>Hard limit:</b> $${configLimit.toFixed(0)} · <b>Tier cap:</b> $${tierCap.toFixed(1)} (${(dlFrac*100).toFixed(0)}% × $${sodBankroll.toFixed(0)})<br>
+    <b>Net loss dnes:</b> $${netLoss.toFixed(2)} · <b>Zbývá:</b> $${room.toFixed(2)}<br>
+    <span style="color:var(--muted);font-size:11px">⚡ Navýšení se projeví PŘÍMO v alert-botu.</span>
+  `;
+  document.getElementById('limit-result').className = 'limit-result hidden';
+  document.getElementById('limit-modal').classList.remove('hidden');
+}
+function closeLimitModal() { document.getElementById('limit-modal').classList.add('hidden'); }
+
+async function raiseLimit(delta) {
+  const res = document.getElementById('limit-result');
+  res.textContent = 'Odesílám...'; res.className = 'limit-result ok';
+  try {
+    const r = await api('POST', '/api/limit', { delta });
+    if (r.ok) {
+      res.textContent = `✅ Limit navýšen na $${r.new_limit.toFixed(0)} (room: $${r.room.toFixed(2)})`;
+      res.className = 'limit-result ok';
+      // Update config locally
+      if (lastData?.config) lastData.config.loss_limit = r.new_limit;
+    } else {
+      res.textContent = `❌ ${r.error || 'Chyba'}`;
+      res.className = 'limit-result error';
+    }
+  } catch (e) {
+    res.textContent = '❌ Síťová chyba'; res.className = 'limit-result error';
+  }
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
