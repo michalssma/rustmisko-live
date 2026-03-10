@@ -5370,6 +5370,32 @@ async fn main() -> Result<()> {
     // === LOSS STREAK TRACKING ===
     let mut consecutive_losses: usize = 0;
     let mut loss_streak_pause_until: Option<std::time::Instant> = None;
+    // === DASHBOARD CONFIG (read from data/dashboard_config.json) ===
+    let mut dashboard_max_stake: Option<f64> = None;         // overrides AUTO_BET_STAKE_USD/.._LOW_USD cap
+    let mut dashboard_sport_focus: Vec<String> = vec!["all".to_string()]; // ["all"] = no filter
+    let mut dashboard_autobet_enabled: bool = true;          // kill switch from dashboard
+    // Load dashboard config at boot
+    {
+        let cfg_path = "data/dashboard_config.json";
+        if let Ok(contents) = std::fs::read_to_string(cfg_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                if let Some(ms) = v["max_stake"].as_f64() {
+                    if ms > 0.0 && ms < 100.0 { dashboard_max_stake = Some(ms); }
+                }
+                if let Some(arr) = v["sport_focus"].as_array() {
+                    let sports: Vec<String> = arr.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect();
+                    if !sports.is_empty() { dashboard_sport_focus = sports; }
+                }
+                if let Some(ae) = v["autobet_enabled"].as_bool() {
+                    dashboard_autobet_enabled = ae;
+                }
+                info!("📱 Dashboard config loaded: max_stake={:?}, sport_focus={:?}, autobet={}",
+                    dashboard_max_stake, dashboard_sport_focus, dashboard_autobet_enabled);
+            }
+        }
+    }
     // Load from daily_pnl.json if exists (includes SOD bankroll persistence)
     {
         let pnl_path = "data/daily_pnl.json";
@@ -6141,6 +6167,29 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
+                                // === DASHBOARD CONFIG RELOAD (every poll) ===
+                                {
+                                    let cfg_path = "data/dashboard_config.json";
+                                    if let Ok(contents) = std::fs::read_to_string(cfg_path) {
+                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                                            if let Some(ms) = v["max_stake"].as_f64() {
+                                                if ms > 0.0 && ms < 100.0 {
+                                                    dashboard_max_stake = Some(ms);
+                                                }
+                                            }
+                                            if let Some(arr) = v["sport_focus"].as_array() {
+                                                let sports: Vec<String> = arr.iter()
+                                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                                                    .collect();
+                                                if !sports.is_empty() { dashboard_sport_focus = sports; }
+                                            }
+                                            if let Some(ae) = v["autobet_enabled"].as_bool() {
+                                                dashboard_autobet_enabled = ae;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // === DAILY LOSS CAP NOTIFICATION ===
                                 // NET loss = settled losses minus claimed returns
                                 // e.g. wagered=$20 on losses, returned=$30 from wins => net = -$10 (profit!)
@@ -6338,7 +6387,11 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
-                                    let base_stake = dynamic_base_stake(current_bankroll, sport);
+                                    let mut base_stake = dynamic_base_stake(current_bankroll, sport);
+                                    // Dashboard max_stake override (caps the calculated stake)
+                                    if let Some(max_s) = dashboard_max_stake {
+                                        base_stake = base_stake.min(max_s);
+                                    }
                                     let score_stake_mult = score_edge_stake_multiplier(edge, sport, azuro_odds);
 
                                     // Regime-based sizing (Phase 1): use Kelly/3 when true_p is known
@@ -6564,6 +6617,8 @@ async fn main() -> Result<()> {
                                     };
 
                                     let should_auto_bet = AUTO_BET_ENABLED
+                                        && dashboard_autobet_enabled
+                                        && (dashboard_sport_focus.contains(&"all".to_string()) || dashboard_sport_focus.iter().any(|s| s == sport))
                                         && sport_auto_allowed
                                         && sport_live_enabled
                                         && is_preferred_market
@@ -6588,6 +6643,12 @@ async fn main() -> Result<()> {
 
                                     if !bankroll_ok && edge.confidence == "HIGH" {
                                         info!("🛑 MIN BANKROLL: ${:.2} < ${:.2} — skipping auto-bet", current_bankroll, MIN_BANKROLL_USD);
+                                    }
+                                    if !dashboard_autobet_enabled && edge.confidence == "HIGH" {
+                                        info!("📱 DASHBOARD: auto-bet DISABLED via dashboard toggle");
+                                    }
+                                    if !dashboard_sport_focus.contains(&"all".to_string()) && !dashboard_sport_focus.iter().any(|s| s == sport) && edge.confidence == "HIGH" {
+                                        info!("📱 DASHBOARD: sport '{}' not in focus {:?} — skipping auto-bet", sport, dashboard_sport_focus);
                                     }
                                     if !pending_ok && edge.confidence == "HIGH" {
                                         info!("🛑 PENDING CAP: {} >= {} — skipping auto-bet", pending_count, MAX_CONCURRENT_PENDING);
@@ -6923,7 +6984,19 @@ async fn main() -> Result<()> {
                                         let mut minodds_fallback_applied = false;
                                         let mut bet_success = false;
                                         loop {
-                                        let min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
+                                        let mut min_odds_factor = min_odds_factor_with_fallback(&match_key_for_bet, minodds_fallback_applied);
+                                        // HIGH EDGE OVERRIDE: when score-edge is >40% and GQL odds are stale,
+                                        // accept any odds >= AUTO_BET_MIN_ODDS (1.70). The edge is so large that
+                                        // even with massive slippage the bet remains +EV.
+                                        // Factor floor = max(AUTO_BET_MIN_ODDS / azuro_odds, 0.50)
+                                        if minodds_fallback_applied && edge.edge_pct >= 40.0 && azuro_odds > 2.0 {
+                                            let ev_floor = (AUTO_BET_MIN_ODDS / azuro_odds).max(0.50);
+                                            if ev_floor < min_odds_factor {
+                                                info!("🎯 HIGH-EDGE MIN_ODDS OVERRIDE: edge={:.1}% odds={:.2} → floor {:.3} (was {:.3})",
+                                                    edge.edge_pct, azuro_odds, ev_floor, min_odds_factor);
+                                                min_odds_factor = ev_floor;
+                                            }
+                                        }
                                         let (min_odds, min_odds_display) = compute_min_odds_raw(azuro_odds, min_odds_factor);
                                         let bet_body = serde_json::json!({
                                             "conditionId": condition_id,
@@ -7874,6 +7947,8 @@ async fn main() -> Result<()> {
                                     }
 
                                     let should_auto_bet_anomaly = AUTO_BET_ENABLED
+                                        && dashboard_autobet_enabled
+                                        && (dashboard_sport_focus.contains(&"all".to_string()) || dashboard_sport_focus.iter().any(|s| s == anomaly_sport))
                                         && AUTO_BET_ODDS_ANOMALY_ENABLED
                                         && anomaly.is_live
                                         && anomaly.confidence == "HIGH"

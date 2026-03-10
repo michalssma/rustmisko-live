@@ -21,6 +21,48 @@ const SECRET_FILE = path.join(DATA, 'dashboard.secret');
 const CONFIG_FILE  = path.join(DATA, 'dashboard_config.json');
 const LOGS_DIR    = path.join(ROOT, 'logs');
 
+// ── Current system strategy (update when alert_bot tuning changes) ──────────
+const STRATEGY = {
+  updated: '2026-03-10',
+  score_edge: {
+    min_edge_default: 38,
+    cs2_map_winner_min_edge: 28,
+    min_odds: 1.70,
+    max_odds_default: 3.00,
+    cs2_max_odds_tiers: {
+      ultra: { label: 'ULTRA (90%+ prob, ≥16 rnd)', max_odds: 5.00 },
+      high:  { label: 'HIGH (80%+ prob, ≥13 rnd)',  max_odds: 3.00 },
+      medium:{ label: 'MEDIUM (70%+ prob)',          max_odds: 2.00 },
+      low:   { label: 'LOW (<70%)',                  max_odds: 1.60 },
+    },
+    stakes: {
+      cs2:        { base: 3.00, note: 'Score-edge path' },
+      football:   { base: 3.00, note: 'Score-edge path' },
+      tennis:     { base: 0.50, note: 'Reduced — volatile' },
+      basketball: { base: 0.50, note: 'Reduced — volatile' },
+    },
+  },
+  anomaly: {
+    max_odds: 1.70,
+    min_disc_global: 28,
+    tennis_min_disc: 24,
+    stake_formula: '$0.50 × (1.25/odds)^1.5 (max $1.00)',
+    sports: {
+      tennis:     { enabled: true,  note: 'set diff ≥1, underdog 40%+' },
+      basketball: { enabled: true,  note: 'score confirmation required' },
+      football:   { enabled: false, note: 'WR=40%, net loss' },
+      esports:    { enabled: false, note: 'WR=52%, net loss' },
+    },
+  },
+  guards: {
+    daily_loss_limit: 30,
+    min_bankroll: 10,
+    block_generic_esports: true,
+    promotion_gate: 'esports:: → auto-bet only if high-confidence sport family confirmed',
+    total_guards: 27,
+  },
+};
+
 const FEED_HEALTH = 'http://127.0.0.1:8081/health';
 const FEED_STATE  = 'http://127.0.0.1:8081/state';
 const EXEC_HEALTH = 'http://127.0.0.1:3030/health';
@@ -285,8 +327,10 @@ async function getStatus() {
     pending_truth_mismatch: truthMismatch,
     claimable_count: cachedMyBets?.claimable ?? 0,
     claimable_usd: cachedMyBets?.claimableUsd ?? 0,
-    pnl_today:     dailyPnl?.pnl_today  ?? dailyPnl?.total_pnl ?? 0,
-    bets_today:    dailyPnl?.bets_today ?? dailyPnl?.total_bets ?? 0,
+    pnl_today:     dailyPnl?.pnl_today  ?? (dailyPnl?.returned != null ? +(dailyPnl.returned - dailyPnl.wagered).toFixed(4) : 0),
+    wagered_today: dailyPnl?.wagered ?? 0,
+    returned_today:dailyPnl?.returned ?? 0,
+    bets_today:    dailyPnl?.bets_today ?? dailyPnl?.total_bets ?? recentBets.filter(b => b.ts && b.ts.slice(0,10) === new Date().toISOString().slice(0,10)).length,
     recent_bets:   recentBets,
     pnl_7d:        getPnl7d(),
     config:        getConfig(),
@@ -360,6 +404,26 @@ app.get('/api/status', authApi, async (_req, res) => {
 
 app.get('/api/bets', authApi, (_req, res) => {
   res.json(getRecentBets(100));
+});
+
+app.get('/api/strategy', authApi, (_req, res) => {
+  // Also count promotion gate events from ledger
+  const file = path.join(DATA, 'ledger.jsonl');
+  let gatePass = 0, gateBlock = 0;
+  if (fs.existsSync(file)) {
+    try {
+      const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      for (const line of lines) {
+        try {
+          const o = JSON.parse(line);
+          if (o.event === 'ESPORTS_PROMOTION_GATE_AUDIT') {
+            if (o.allowed) gatePass++; else gateBlock++;
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+  res.json({ ...STRATEGY, promotion_gate_stats: { passed: gatePass, blocked: gateBlock } });
 });
 
 // Process control

@@ -478,6 +478,9 @@ async function loadLog(name) {
         if (o.event === 'EXECUTOR_CLAIM') return `${t} 💰 CLAIM $${(o.totalPayoutUsd||0).toFixed(2)} bal=$${o.newBalanceUsd||'?'}`;
         if (o.event === 'SAFETY_CLAIM') return `${t} 🔒 SAFE_CLAIM $${(o.payout_usd||0).toFixed(2)}`;
         if (o.event === 'LIMIT_OVERRIDE') return `${t} ⚡ LIMIT +$${o.delta||'?'} → $${o.new_limit||'?'}`;
+        if (o.event === 'ESPORTS_PROMOTION_GATE_AUDIT') return `${t} ${o.allowed?'🟢':'🔴'} GATE ${o.allowed?'PASS':'BLOCK'} ${o.match_key||''} sport=${o.esports_family||'?'} conf=${o.confidence||'?'}`;
+        if (o.event === 'DAILY_RESET') return `${t} 🔄 DAILY_RESET SOD=$${(o.sod_bankroll||0).toFixed(2)}`;
+        if (o.event === 'LOSS_STREAK_PAUSE') return `${t} ⏸️ LOSS_STREAK_PAUSE ${o.reason||''}`;
         // Generic: just show ts + event + key info
         return `${t} [${ev}] ${o.match_key || o.msg || JSON.stringify(o).slice(0,80)}`;
       } catch { return typeof line === 'string' ? line.slice(0,120) : String(line); }
@@ -600,9 +603,75 @@ async function raiseLimit(delta) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectWs();
+fetchStrategy();
 // Visibility API — reconnect on tab focus for instant sync
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && !wsConnected) {
     connectWs();
   }
 });
+
+// ── Strategy panel (fetched from /api/strategy) ───────────────────────────
+async function fetchStrategy() {
+  try {
+    const s = await api('GET', '/api/strategy');
+    if (!s || !s.score_edge) return;
+    renderStrategy(s);
+  } catch {}
+}
+
+function renderStrategy(s) {
+  const el = document.getElementById('strategy-info');
+  if (!el) return;
+  const se = s.score_edge;
+  const an = s.anomaly;
+  const g  = s.guards;
+  const gs = s.promotion_gate_stats || {};
+
+  // Score-edge stakes
+  const stakeRows = Object.entries(se.stakes).map(([sp, v]) =>
+    `<div class="strat-row"><span>${sportEmoji(sp)} ${sp}</span><span class="strat-val">$${v.base.toFixed(2)}</span></div>`
+  ).join('');
+
+  // CS2 max odds tiers
+  const tierRows = Object.values(se.cs2_max_odds_tiers).map(t =>
+    `<div class="strat-row"><span>${escHtml(t.label)}</span><span class="strat-val">${t.max_odds.toFixed(2)}</span></div>`
+  ).join('');
+
+  // Anomaly per sport
+  const anomalyRows = Object.entries(an.sports).map(([sp, v]) =>
+    `<div class="strat-row"><span>${sportEmoji(sp)} ${sp}</span><span class="strat-val ${v.enabled?'on':'off'}">${v.enabled?'✅ ON':'⛔ OFF'}</span></div>`
+  ).join('');
+
+  el.innerHTML = `
+    <div class="strat-section">
+      <div class="strat-title">Path A: Score-edge</div>
+      <div class="strat-row"><span>Min edge (default)</span><span class="strat-val">${se.min_edge_default}%</span></div>
+      <div class="strat-row"><span>CS2 map_winner min edge</span><span class="strat-val accent">${se.cs2_map_winner_min_edge}% 🎯</span></div>
+      <div class="strat-row"><span>Odds corridor</span><span class="strat-val">${se.min_odds} – ${se.max_odds_default}</span></div>
+      ${stakeRows}
+    </div>
+    <div class="strat-section">
+      <div class="strat-title">CS2 Max Odds Tiers</div>
+      ${tierRows}
+    </div>
+    <div class="strat-section">
+      <div class="strat-title">Path B: Odds anomaly</div>
+      <div class="strat-row"><span>Max odds</span><span class="strat-val">${an.max_odds}</span></div>
+      <div class="strat-row"><span>Min disc (global)</span><span class="strat-val">${an.min_disc_global}%</span></div>
+      <div class="strat-row"><span>Tennis min disc</span><span class="strat-val">${an.tennis_min_disc}%</span></div>
+      <div class="strat-row"><span>Stake formula</span><span class="strat-val" style="font-size:10px">${escHtml(an.stake_formula)}</span></div>
+      ${anomalyRows}
+    </div>
+    <div class="strat-section">
+      <div class="strat-title">🛡️ Guards</div>
+      <div class="strat-row"><span>Daily loss limit</span><span class="strat-val">$${g.daily_loss_limit}</span></div>
+      <div class="strat-row"><span>Min bankroll</span><span class="strat-val">$${g.min_bankroll}</span></div>
+      <div class="strat-row"><span>Total execution guards</span><span class="strat-val">${g.total_guards}</span></div>
+      <div class="strat-row"><span>Block generic esports</span><span class="strat-val ${g.block_generic_esports?'on':'off'}">${g.block_generic_esports?'✅ YES':'⛔ NO'}</span></div>
+      <div class="strat-row"><span>Promotion gate</span><span class="strat-val" style="font-size:10px">${escHtml(g.promotion_gate)}</span></div>
+      ${gs.passed != null ? `<div class="strat-row"><span>Gate stats</span><span class="strat-val">✅ ${gs.passed} passed · ⛔ ${gs.blocked} blocked</span></div>` : ''}
+    </div>
+    <div style="padding:6px 0 0;font-size:11px;color:var(--muted)">Tuning ${s.updated} · data-driven</div>
+  `;
+}
