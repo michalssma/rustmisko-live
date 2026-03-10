@@ -130,9 +130,9 @@ const MAX_ODDS_AGE_SECS: i64 = 20;
 /// Maximum concurrent pending bets (inflight guard)
 const MAX_CONCURRENT_PENDING: usize = 8;
 /// Loss streak cooldown: consecutive LOST count to trigger pause
-const LOSS_STREAK_PAUSE_THRESHOLD: usize = 3;
+const LOSS_STREAK_PAUSE_THRESHOLD: usize = 4;
 /// Loss streak pause duration (seconds)
-const LOSS_STREAK_PAUSE_SECS: u64 = 300;
+const LOSS_STREAK_PAUSE_SECS: u64 = 180;
 /// Minimum bankroll to allow auto-bet (skip if below)
 const MIN_BANKROLL_USD: f64 = 10.0;
 /// Periodic ledger-based recovery cadence for unresolved accepted bets.
@@ -968,6 +968,38 @@ impl ResyncState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct BackwardScoreState {
+    score1: i32,
+    score2: i32,
+    seen_count: u8,
+    first_seen_at: chrono::DateTime<Utc>,
+}
+
+impl BackwardScoreState {
+    fn new(score1: i32, score2: i32) -> Self {
+        Self {
+            score1,
+            score2,
+            seen_count: 1,
+            first_seen_at: Utc::now(),
+        }
+    }
+
+    fn observe(&mut self, score1: i32, score2: i32) -> bool {
+        if self.score1 == score1 && self.score2 == score2 {
+            self.seen_count = self.seen_count.saturating_add(1);
+        } else {
+            self.score1 = score1;
+            self.score2 = score2;
+            self.seen_count = 1;
+            self.first_seen_at = Utc::now();
+        }
+
+        self.seen_count >= 2
+    }
+}
+
 // ====================================================================
 // RE-BET TRACKING — allow multiple bets on same condition as edge grows
 // ====================================================================
@@ -1293,6 +1325,8 @@ struct ScoreTracker {
     prev_scores: HashMap<String, (i32, i32, chrono::DateTime<Utc>)>,
     /// match_key → timestamp when we last alerted score edge
     edge_cooldown: HashMap<String, chrono::DateTime<Utc>>,
+    /// match_key → transient lower score waiting for second confirmation
+    backward_scores: HashMap<String, BackwardScoreState>,
 }
 
 impl ScoreTracker {
@@ -1300,6 +1334,7 @@ impl ScoreTracker {
         Self {
             prev_scores: HashMap::new(),
             edge_cooldown: HashMap::new(),
+            backward_scores: HashMap::new(),
         }
     }
 
@@ -1308,6 +1343,7 @@ impl ScoreTracker {
         let cutoff = Utc::now() - chrono::Duration::seconds(1800);
         self.prev_scores.retain(|_, (_, _, ts)| *ts > cutoff);
         self.edge_cooldown.retain(|_, ts| *ts > cutoff);
+        self.backward_scores.retain(|_, state| state.first_seen_at > cutoff);
     }
 }
 
@@ -1459,13 +1495,24 @@ fn normalize_cs2_live_score_for_edge(
         return (score1, score2);
     };
 
-    if round1.max(round2) <= 3 {
+    if score1 == round1 && score2 == round2 {
         return (score1, score2);
+    }
+
+    let raw_looks_map_level = score1.max(score2) <= 1;
+    let round_has_progress = round1 > 0 || round2 > 0;
+
+    // Chance/Tipsport often reports fresh CS2 rounds as raw 0-0 / 0-1 while
+    // detailed_score already carries the real round score (e.g. R:2-2 M:0-0).
+    // Trust the detailed round context in these low-score openings so we don't
+    // manufacture fake backward jumps on every new map start.
+    if raw_looks_map_level && round_has_progress {
+        return (round1, round2);
     }
 
     // Prefer round score whenever payload score is map-level or otherwise inconsistent
     // with the richer round context from detailed_score.
-    if score1.max(score2) <= 3 || (score1 != round1 || score2 != round2) {
+    if round1.max(round2) > 3 && (score1.max(score2) <= 3 || (score1 != round1 || score2 != round2)) {
         return (round1, round2);
     }
 
@@ -1485,8 +1532,183 @@ fn has_cs2_round_context_override(
     raw_score1.max(raw_score2) <= 3
         && detailed
             .and_then(parse_esports_round_score)
-            .map(|(r1, r2)| r1.max(r2) > 3)
+            .map(|(r1, r2)| {
+                (r1.max(r2) > 3) || (raw_score1.max(raw_score2) <= 1 && (r1 > 0 || r2 > 0))
+            })
             .unwrap_or(false)
+}
+
+fn is_status_pregame_like(status: &str) -> bool {
+    let lower = status.to_lowercase();
+    lower.contains("za ")
+        || lower.contains("za okam")
+        || lower.contains("minut")
+        || lower.contains("minute")
+        || lower.contains("start")
+}
+
+fn is_cs2_reset_hold_state(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    detailed: Option<&str>,
+    live_status: &str,
+    esports_family: Option<&str>,
+) -> bool {
+    if esports_family != Some("cs2") {
+        return false;
+    }
+
+    if score1 != 0 || score2 != 0 {
+        return false;
+    }
+
+    if prev_score1.max(prev_score2) > 0 {
+        return true;
+    }
+
+    let detail = detailed.unwrap_or("").trim();
+    let pregame_or_blank = detail.is_empty()
+        || detail == "R:0-0 M:0-0"
+        || is_status_pregame_like(live_status);
+
+    if pregame_or_blank {
+        return prev_score1.max(prev_score2) > 0;
+    }
+
+    prev_score1.max(prev_score2) > 3
+}
+
+fn is_cs2_map_rollover_hold_state(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if esports_family != Some("cs2") {
+        return false;
+    }
+
+    if prev_score1.max(prev_score2) < 8 {
+        return false;
+    }
+
+    if score1.max(score2) > 1 || score1 == score2 {
+        return false;
+    }
+
+    let detail = detailed.unwrap_or("");
+    let has_cs2_detail = detail.contains("mapa") || detail.contains("R:") || detail.contains("M:") || detail.contains('(');
+
+    has_cs2_detail || detail.trim().is_empty()
+}
+
+fn is_cs2_round_rewind_hold_state(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if esports_family != Some("cs2") {
+        return false;
+    }
+
+    if prev_score1.max(prev_score2) <= 3 || score1.max(score2) <= 3 {
+        return false;
+    }
+
+    let drop1 = prev_score1 - score1;
+    let drop2 = prev_score2 - score2;
+    if drop1 <= 0 && drop2 <= 0 {
+        return false;
+    }
+
+    let detail = detailed.unwrap_or("");
+    let has_cs2_detail = detail.contains("mapa") || detail.contains("R:") || detail.contains("M:");
+    let strong_rewind = drop1.max(drop2) >= 6 || (drop1 >= 3 && drop2 >= 3);
+
+    has_cs2_detail && strong_rewind
+}
+
+fn is_cs2_legit_map_rollover(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    raw_score1: i32,
+    raw_score2: i32,
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if esports_family != Some("cs2") {
+        return false;
+    }
+
+    if prev_score1.max(prev_score2) <= 3 {
+        return false;
+    }
+
+    let detail = detailed.unwrap_or("");
+    let has_map_rollover_detail = detail.contains("mapa")
+        || detail.contains("M:")
+        || (detail.contains('(') && detail.contains(':'));
+    let explicit_next_map = parse_cs2_current_map(detail)
+        .map(|map_no| map_no > 1)
+        .unwrap_or(false)
+        && !parse_cs2_completed_maps(detail).is_empty();
+    let dust2_map_progress = parse_dust2_map_score(detail)
+        .map(|(m1, m2)| m1 > 0 || m2 > 0)
+        .unwrap_or(false);
+    let current_round_like = score1.max(score2) <= 12 || (score1.max(score2) <= 15 && prev_score1.max(prev_score2) >= 13);
+    let raw_round_like = raw_score1.max(raw_score2) <= 2
+        || (raw_score1.max(raw_score2) <= 12 && score1.max(score2) <= 12)
+        || (raw_score1.max(raw_score2) >= 10 && score1.max(score2) <= 12);
+    let score_dropped = score1 < prev_score1 || score2 < prev_score2;
+    let previous_map_finished = prev_score1.max(prev_score2) >= 10;
+    let plausible_rollover_score = score_dropped
+        && current_round_like
+        && raw_round_like
+        && previous_map_finished;
+
+    plausible_rollover_score && (has_map_rollover_detail || explicit_next_map || dust2_map_progress)
+}
+
+fn is_cs2_backward_score_pending_state(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if esports_family != Some("cs2") {
+        return false;
+    }
+
+    if score1 <= 0 && score2 <= 0 {
+        return false;
+    }
+
+    if prev_score1 <= 0 && prev_score2 <= 0 {
+        return false;
+    }
+
+    let detail = detailed.unwrap_or("");
+    let has_cs2_detail = detail.contains("mapa") || detail.contains("R:") || detail.contains("M:");
+    if !has_cs2_detail {
+        return false;
+    }
+
+    let drop1 = (prev_score1 - score1).max(0);
+    let drop2 = (prev_score2 - score2).max(0);
+    let total_drop = drop1 + drop2;
+
+    total_drop > 0 && total_drop <= 2
 }
 
 /// Esports anomaly guard: is the match "in-progress" enough to trust odds anomaly?
@@ -1600,11 +1822,25 @@ fn cs2_round_edge_max_odds_override(
     if sport != "cs2" {
         return None;
     }
-    if !(market_key.starts_with("map") && market_key.ends_with("_winner")) {
+    let is_map_winner = market_key.starts_with("map") && market_key.ends_with("_winner");
+    let is_match_winner = market_key == "match_winner";
+    if !is_map_winner && !is_match_winner {
         return None;
     }
     if score1.max(score2) <= 3 {
         return None;
+    }
+
+    if is_match_winner {
+        return if edge_pct >= 55.0 {
+            Some(3.10)
+        } else if edge_pct >= 45.0 {
+            Some(2.90)
+        } else if edge_pct >= 32.0 {
+            Some(2.70)
+        } else {
+            None
+        };
     }
 
     match cs2_map_confidence {
@@ -1668,10 +1904,96 @@ fn normalize_team_name(name: &str) -> String {
         .collect::<String>()
 }
 
+fn canonical_team_name(name: &str) -> String {
+    let mut normalized = normalize_team_name(name);
+
+    if normalized.starts_with("team") && normalized.len() > 8 {
+        normalized = normalized.trim_start_matches("team").to_string();
+    }
+
+    let aliases = [
+        ("bbteam", "betboom"),
+        ("betboomteam", "betboom"),
+        ("submarineyellow", "yellowsubmarine"),
+        ("yellowsubmarine", "yellowsubmarine"),
+        ("teamquazar", "quazar"),
+        ("quazarmpkbkcislan", "quazar"),
+        ("rustecmpkbkcislan", "rustec"),
+        ("teamnemesis", "nemesis"),
+        ("fengdacsasia", "fengda"),
+        ("lynnvisioncsasia", "lynnvision"),
+        ("depocsasia", "depo"),
+    ];
+    for (from, to) in aliases {
+        normalized = normalized.replace(from, to);
+    }
+
+    for suffix in ["mpkbkcislan", "cislan", "csasia", "academy", "esports"] {
+        if normalized.ends_with(suffix) && normalized.len() > suffix.len() + 3 {
+            normalized.truncate(normalized.len() - suffix.len());
+        }
+    }
+
+    normalized
+}
+
+fn match_key_team_parts(match_key: &str) -> Option<(String, String)> {
+    let tail = match_key.split("::").nth(1)?;
+    let (left, right) = tail.split_once("_vs_")?;
+    Some((canonical_team_name(left), canonical_team_name(right)))
+}
+
+fn team_matches_match_key_part(team_name: &str, key_part: &str) -> bool {
+    let team = canonical_team_name(team_name);
+    !team.is_empty() && !key_part.is_empty() && (team == key_part || team.contains(key_part) || key_part.contains(&team))
+}
+
+fn live_item_matches_match_key(item: &LiveItem) -> bool {
+    let Some((key_team1, key_team2)) = match_key_team_parts(&item.match_key) else {
+        return true;
+    };
+
+    let direct = team_matches_match_key_part(&item.payload.team1, &key_team1)
+        && team_matches_match_key_part(&item.payload.team2, &key_team2);
+    let swapped = team_matches_match_key_part(&item.payload.team1, &key_team2)
+        && team_matches_match_key_part(&item.payload.team2, &key_team1);
+
+    direct || swapped
+}
+
+fn live_item_priority(item: &LiveItem) -> i32 {
+    let mut score = match item.source.as_str() {
+        "dust2" => 60,
+        s if s.starts_with("hltv") => 55,
+        "chance" => 40,
+        "fortuna" => 30,
+        "tipsport" => 20,
+        _ => 10,
+    };
+
+    match item.payload.sport.as_deref() {
+        Some("cs2") => score += 20,
+        Some("dota-2") | Some("valorant") | Some("lol") | Some("league-of-legends") => score += 10,
+        Some("esports") => score += 5,
+        _ => {}
+    }
+
+    if item.payload.detailed_score.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false) {
+        score += 10;
+    }
+    if live_item_matches_match_key(item) {
+        score += 35;
+    } else {
+        score -= 45;
+    }
+
+    score
+}
+
 /// Check if a single team name loosely matches another (substring or equality after normalization)
 fn team_name_matches_single(live_name: &str, azuro_name: &str) -> bool {
-    let a = normalize_team_name(live_name);
-    let b = normalize_team_name(azuro_name);
+    let a = canonical_team_name(live_name);
+    let b = canonical_team_name(azuro_name);
     if a.is_empty() || b.is_empty() { return false; }
     if a == b || a.contains(&b) || b.contains(&a) { return true; }
     // Word-set match: handles first/last name reversal (tennis, individual sports)
@@ -1723,10 +2045,10 @@ fn resolve_azuro_side_pair(
 }
 
 fn teams_match_loose(a1: &str, a2: &str, b1: &str, b2: &str) -> bool {
-    let a1n = normalize_team_name(a1);
-    let a2n = normalize_team_name(a2);
-    let b1n = normalize_team_name(b1);
-    let b2n = normalize_team_name(b2);
+    let a1n = canonical_team_name(a1);
+    let a2n = canonical_team_name(a2);
+    let b1n = canonical_team_name(b1);
+    let b2n = canonical_team_name(b2);
 
     let direct = (a1n == b1n && a2n == b2n) || (a1n == b2n && a2n == b1n);
     if direct {
@@ -2568,9 +2890,23 @@ fn find_score_edges(
     let mut edges = Vec::new();
 
     // Build live score map
-    let live_map: HashMap<&str, &LiveItem> = state.live.iter()
-        .map(|l| (l.match_key.as_str(), l))
-        .collect();
+    let mut live_map: HashMap<&str, &LiveItem> = HashMap::new();
+    let mut live_map_priority: HashMap<&str, i32> = HashMap::new();
+    for live in &state.live {
+        let priority = live_item_priority(live);
+        if priority < 0 {
+            continue;
+        }
+        let key = live.match_key.as_str();
+        let should_replace = live_map_priority
+            .get(key)
+            .map(|current| priority > *current)
+            .unwrap_or(true);
+        if should_replace {
+            live_map.insert(key, live);
+            live_map_priority.insert(key, priority);
+        }
+    }
 
     // Build Azuro odds map (only azuro_ bookmakers, match_winner)
     let mut azuro_by_match: HashMap<&str, &StateOddsItem> = HashMap::new();
@@ -2630,13 +2966,97 @@ fn find_score_edges(
 
         // Check if score changed from previous poll
         let prev = tracker.prev_scores.get(*match_key).cloned();
-        tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
 
         let is_first_sight = prev.is_none();
         let (prev_s1, prev_s2, prev_seen_at) = match prev {
             Some((ps1, ps2, pts)) => (ps1, ps2, pts),
             None => (s1, s2, now), // First time: use current score as "previous" for edge calc
         };
+
+        let cs2_reset_hold_state = is_cs2_reset_hold_state(
+            prev_s1,
+            prev_s2,
+            s1,
+            s2,
+            live.payload.detailed_score.as_deref(),
+            &live.payload.status,
+            live_esports_class.family,
+        );
+        let cs2_round_rewind_hold_state = is_cs2_round_rewind_hold_state(
+            prev_s1,
+            prev_s2,
+            s1,
+            s2,
+            live.payload.detailed_score.as_deref(),
+            live_esports_class.family,
+        );
+        let cs2_map_rollover_hold_state = is_cs2_map_rollover_hold_state(
+            prev_s1,
+            prev_s2,
+            s1,
+            s2,
+            live.payload.detailed_score.as_deref(),
+            live_esports_class.family,
+        );
+        if cs2_reset_hold_state || cs2_round_rewind_hold_state || cs2_map_rollover_hold_state {
+            tracker.backward_scores.remove(*match_key);
+            let suppress_duplicate = tracker.edge_cooldown.get(*match_key)
+                .map(|ts| (now - *ts).num_seconds() < 45)
+                .unwrap_or(false);
+            if !suppress_duplicate {
+                let hold_reason = if cs2_round_rewind_hold_state {
+                    "ScoreRoundRewind"
+                } else if cs2_map_rollover_hold_state {
+                    "ScoreMapRolloverPending"
+                } else {
+                    "ScoreContextReset"
+                };
+                info!(
+                    "  ⏸️ {} CS2 hold {}-{} -> {}-{} ({})",
+                    match_key, prev_s1, prev_s2, s1, s2, hold_reason
+                );
+                if should_audit_esports_score_decision(
+                    match_key,
+                    live_esports_class.family,
+                    live_esports_class.confidence,
+                ) {
+                    append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                        "match_key": match_key,
+                        "path": "score_model",
+                        "decision": "hold_candidate",
+                        "reason_code": hold_reason,
+                        "reason_codes": [hold_reason],
+                        "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                        "esports_family": live_esports_class.family,
+                        "sport_confidence": live_esports_class.confidence,
+                        "sport_reason": live_esports_class.reason,
+                        "team1": live.payload.team1,
+                        "team2": live.payload.team2,
+                        "raw_score1": raw_s1,
+                        "raw_score2": raw_s2,
+                        "prev_score1": prev_s1,
+                        "prev_score2": prev_s2,
+                        "score1": s1,
+                        "score2": s2,
+                        "live_status": live.payload.status,
+                        "detailed_score": live.payload.detailed_score,
+                    }));
+                }
+            }
+            tracker.edge_cooldown.insert(match_key.to_string(), now);
+            continue;
+        }
+
+        let cs2_legit_map_rollover = is_cs2_legit_map_rollover(
+            prev_s1,
+            prev_s2,
+            s1,
+            s2,
+            raw_s1,
+            raw_s2,
+            live.payload.detailed_score.as_deref(),
+            live_esports_class.family,
+        );
 
         let score_changed = s1 != prev_s1 || s2 != prev_s2;
         // Guard against score-mode switches / parser glitches:
@@ -2645,8 +3065,71 @@ fn find_score_edges(
             && s1 <= prev_s1
             && s2 <= prev_s2
             && (s1 < prev_s1 || s2 < prev_s2)
-            && !cs2_round_context_override;
+            && !cs2_round_context_override
+            && !cs2_legit_map_rollover;
+
+        if !backward_score_jump {
+            tracker.backward_scores.remove(*match_key);
+        }
+
         if backward_score_jump {
+            if is_cs2_backward_score_pending_state(
+                prev_s1,
+                prev_s2,
+                s1,
+                s2,
+                live.payload.detailed_score.as_deref(),
+                live_esports_class.family,
+            ) {
+                let confirmed = tracker
+                    .backward_scores
+                    .entry(match_key.to_string())
+                    .or_insert_with(|| BackwardScoreState::new(s1, s2))
+                    .observe(s1, s2);
+
+                let hold_reason = if confirmed {
+                    tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
+                    tracker.backward_scores.remove(*match_key);
+                    "ScoreBackwardConfirmed"
+                } else {
+                    "ScoreBackwardPending"
+                };
+
+                info!(
+                    "  ⏸️ {} CS2 backward hold {}-{} -> {}-{} ({})",
+                    match_key, prev_s1, prev_s2, s1, s2, hold_reason
+                );
+                if should_audit_esports_score_decision(
+                    match_key,
+                    live_esports_class.family,
+                    live_esports_class.confidence,
+                ) {
+                    append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                        "match_key": match_key,
+                        "path": "score_model",
+                        "decision": "hold_candidate",
+                        "reason_code": hold_reason,
+                        "reason_codes": [hold_reason],
+                        "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                        "esports_family": live_esports_class.family,
+                        "sport_confidence": live_esports_class.confidence,
+                        "sport_reason": live_esports_class.reason,
+                        "team1": live.payload.team1,
+                        "team2": live.payload.team2,
+                        "raw_score1": raw_s1,
+                        "raw_score2": raw_s2,
+                        "prev_score1": prev_s1,
+                        "prev_score2": prev_s2,
+                        "score1": s1,
+                        "score2": s2,
+                        "live_status": live.payload.status,
+                        "detailed_score": live.payload.detailed_score,
+                    }));
+                }
+                tracker.edge_cooldown.insert(match_key.to_string(), now);
+                continue;
+            }
+
             info!(
                 "  ⏭️ {} score jump backward {}-{} -> {}-{} (source/reset), skipping edge eval",
                 match_key, prev_s1, prev_s2, s1, s2
@@ -2681,6 +3164,8 @@ fn find_score_edges(
             tracker.edge_cooldown.insert(match_key.to_string(), now);
             continue;
         }
+
+        tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
 
         // Guard against impossible forward spikes in basketball feed.
         // Example parser/source glitch: 7-7 -> 77-7 in one poll window.
@@ -3489,6 +3974,193 @@ struct ActiveBet {
     token_id: Option<String>,
     /// Strategy path that originated this bet: "score_edge", "anomaly_odds", "bet_command"
     path: String,
+}
+
+fn count_pending_slots(active_bets: &[ActiveBet]) -> usize {
+    active_bets.iter().filter(|bet| bet.token_id.is_none()).count()
+}
+
+fn rewrite_pending_claims_file(active_bets: &[ActiveBet], pending_claims_path: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true)
+        .open(pending_claims_path) {
+        use std::io::Write;
+        for bet in active_bets {
+            let tid = bet.token_id.as_deref().unwrap_or("?");
+            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+                tid, bet.bet_id, bet.match_key,
+                bet.value_team, bet.amount_usd, bet.odds);
+        }
+    }
+}
+
+fn should_count_loss_streak(bet: &ActiveBet) -> bool {
+    bet.alert_id > 0 && bet.path != "loaded" && bet.placed_at != "loaded"
+}
+
+fn record_live_loss_for_streak(
+    bet: &ActiveBet,
+    consecutive_losses: &mut usize,
+    loss_streak_pause_until: &mut Option<std::time::Instant>,
+) {
+    if !should_count_loss_streak(bet) {
+        info!(
+            "ℹ️ LOSS STREAK IGNORE: historical/recovered loss {} path={} placed_at={}",
+            bet.bet_id, bet.path, bet.placed_at
+        );
+        return;
+    }
+
+    *consecutive_losses += 1;
+    if *consecutive_losses >= LOSS_STREAK_PAUSE_THRESHOLD {
+        *loss_streak_pause_until = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(LOSS_STREAK_PAUSE_SECS)
+        );
+        info!(
+            "🛑 LOSS STREAK: {} consecutive live losses — pausing auto-bet for {}s",
+            *consecutive_losses,
+            LOSS_STREAK_PAUSE_SECS
+        );
+    }
+}
+
+fn reconcile_active_bets_with_executor_snapshot(
+    active_bets: &mut Vec<ActiveBet>,
+    bets_arr: &[serde_json::Value],
+    pending_claims_path: &str,
+    session_start: DateTime<Utc>,
+    inflight_ttl_secs: i64,
+) -> f64 {
+    let onchain_pending_tids: HashSet<String> = bets_arr.iter()
+        .filter(|b| b.get("status").and_then(|v| v.as_str()).unwrap_or("") == "pending")
+        .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect();
+
+    let onchain_enriched: Vec<(String, String, f64, f64, String, String)> = bets_arr.iter()
+        .filter(|b| b.get("status").and_then(|v| v.as_str()).unwrap_or("") == "pending")
+        .map(|b| {
+            let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let bet_id = b.get("betId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            (tid, team, odds, amount, match_key, bet_id)
+        })
+        .collect();
+
+    let mut needs_rewrite = false;
+    let pre_count = active_bets.len();
+
+    active_bets.retain(|b| {
+        match &b.token_id {
+            Some(tid) => onchain_pending_tids.contains(tid),
+            None => true,
+        }
+    });
+    if active_bets.len() != pre_count {
+        needs_rewrite = true;
+    }
+
+    let before_ttl = active_bets.len();
+    let now_utc = Utc::now();
+    active_bets.retain(|b| {
+        if b.token_id.is_some() { return true; }
+        if b.placed_at == "onchain" { return true; }
+        if b.placed_at == "loaded" {
+            let session_age = (now_utc - session_start).num_seconds();
+            if session_age > inflight_ttl_secs {
+                info!("⏰ ZOMBIE_TTL: loaded bet {} ({}) expired — session age {}s > TTL {}s",
+                    b.bet_id, b.value_team, session_age, inflight_ttl_secs);
+                return false;
+            }
+            return true;
+        }
+        match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+            Ok(placed) => {
+                let age_secs = (now_utc - placed.with_timezone(&Utc)).num_seconds();
+                if age_secs > inflight_ttl_secs {
+                    info!("⏰ INFLIGHT_TTL: bet {} ({}) expired after {}s — removing",
+                        b.bet_id, b.value_team, age_secs);
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(_) => true,
+        }
+    });
+    if active_bets.len() != before_ttl {
+        needs_rewrite = true;
+    }
+
+    let local_tids: HashSet<String> = active_bets.iter()
+        .filter_map(|b| b.token_id.clone())
+        .collect();
+    for (tid, team, odds, amount, match_key, bet_id) in &onchain_enriched {
+        if !local_tids.contains(tid) && !team.is_empty() {
+            active_bets.push(ActiveBet {
+                alert_id: 0,
+                bet_id: if !bet_id.is_empty() { bet_id.clone() } else { format!("onchain_{}", tid) },
+                match_key: match_key.clone(),
+                market_key: "unknown".to_string(),
+                team1: team.clone(),
+                team2: "?".to_string(),
+                value_team: team.clone(),
+                amount_usd: *amount,
+                odds: *odds,
+                placed_at: "onchain".to_string(),
+                condition_id: String::new(),
+                outcome_id: String::new(),
+                graph_bet_id: None,
+                token_id: Some(tid.clone()),
+                path: "onchain".to_string(),
+            });
+            needs_rewrite = true;
+        }
+    }
+
+    for b in active_bets.iter_mut() {
+        if b.token_id.is_none() {
+            if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
+                .find(|(_, _, _, _, _, bid)| !bid.is_empty() && bid == &b.bet_id)
+            {
+                b.token_id = Some(tid.clone());
+                info!("🔗 RECONCILE: Discovered tokenId {} for bet {} via betId match", tid, b.bet_id);
+                needs_rewrite = true;
+            } else if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
+                .find(|(_, t, o, _, mk, _)| {
+                    !t.is_empty() && t == &b.value_team
+                    && (*o - b.odds).abs() < 0.03
+                    && (mk.is_empty() || b.match_key.is_empty() || mk == &b.match_key)
+                })
+            {
+                b.token_id = Some(tid.clone());
+                info!("🔗 RECONCILE: Discovered tokenId {} for bet {} ({}) via team+odds+matchKey",
+                    tid, b.bet_id, b.value_team);
+                needs_rewrite = true;
+            }
+        }
+    }
+
+    let post_count = active_bets.len();
+    if pre_count != post_count {
+        info!("🔄 RECONCILE: active_bets {} → {} (on-chain pending: {})",
+            pre_count, post_count, onchain_pending_tids.len());
+    }
+
+    let local_onchain_count = active_bets.iter().filter(|b| b.token_id.is_some()).count();
+    if local_onchain_count != onchain_pending_tids.len() {
+        warn!("⚠️ INVARIANT MISMATCH: local on-chain verified={} vs on-chain pending={} — investigate!",
+            local_onchain_count, onchain_pending_tids.len());
+    }
+
+    if needs_rewrite {
+        rewrite_pending_claims_file(active_bets, pending_claims_path);
+        info!("💾 RECONCILE: pending_claims.txt rewritten ({} entries)", active_bets.len());
+    }
+
+    active_bets.iter().map(|b| b.amount_usd).sum()
 }
 
 #[derive(Debug, Deserialize)]
@@ -4753,7 +5425,7 @@ async fn main() -> Result<()> {
 
     // === WATCHDOG: SAFE MODE ===
     let mut safe_mode = false;
-    let mut last_good_data = std::time::Instant::now();
+    let mut last_good_data: Option<std::time::Instant> = None;
 
     // === EVENT LOG HELPER ===
     let events_path = "data/events.jsonl";
@@ -5305,7 +5977,7 @@ async fn main() -> Result<()> {
     let mut ws_gate_stale_fallback_count: u32 = 0; // WS stale → GQL fallback
     let mut ws_gate_nodata_fallback_count: u32 = 0; // WS no data → GQL fallback
     // In-flight TTL: bets with token_id=None older than this are considered stale
-    const INFLIGHT_TTL_SECS: i64 = 600; // 10 minutes
+    const INFLIGHT_TTL_SECS: i64 = 240; // 4 minutes
 
     loop {
         tokio::select! {
@@ -5319,14 +5991,16 @@ async fn main() -> Result<()> {
                     .map(|a| a.match_key.clone()).collect();
 
                 // === WATCHDOG: check for feed-hub timeout ===
-                if last_good_data.elapsed().as_secs() > WATCHDOG_TIMEOUT_SECS && !safe_mode {
-                    safe_mode = true;
-                    let elapsed = last_good_data.elapsed().as_secs();
-                    warn!("⚠️ SAFE MODE: Feed-hub silent for {}s > {}s threshold", elapsed, WATCHDOG_TIMEOUT_SECS);
-                    let _ = tg_send_message(&client, &token, chat_id,
-                        &format!("⚠️ <b>SAFE MODE ACTIVATED</b>\n\nFeed-hub neodpovídá {}s.\nAuto-bety POZASTAVENY.\nAlerty stále fungují.\n\nZkontroluj Chrome tab + Tampermonkey.", elapsed)
-                    ).await;
-                    log_event("SAFE_MODE_ON", &serde_json::json!({"elapsed_secs": elapsed}));
+                if let Some(last_good) = last_good_data {
+                    if last_good.elapsed().as_secs() > WATCHDOG_TIMEOUT_SECS && !safe_mode {
+                        safe_mode = true;
+                        let elapsed = last_good.elapsed().as_secs();
+                        warn!("⚠️ SAFE MODE: Feed-hub silent for {}s > {}s threshold", elapsed, WATCHDOG_TIMEOUT_SECS);
+                        let _ = tg_send_message(&client, &token, chat_id,
+                            &format!("⚠️ <b>SAFE MODE ACTIVATED</b>\n\nFeed-hub neodpovídá {}s.\nAuto-bety POZASTAVENY.\nAlerty stále fungují.\n\nZkontroluj Chrome tab + Tampermonkey.", elapsed)
+                        ).await;
+                        log_event("SAFE_MODE_ON", &serde_json::json!({"elapsed_secs": elapsed}));
+                    }
                 }
 
                 // 1. Check /state for cross-bookmaker odds anomalies
@@ -5335,7 +6009,7 @@ async fn main() -> Result<()> {
                         match resp.json::<StateResponse>().await {
                             Ok(state) => {
                                 // === WATCHDOG: feed-hub is alive ===
-                                last_good_data = std::time::Instant::now();
+                                last_good_data = Some(std::time::Instant::now());
                                 if safe_mode {
                                     safe_mode = false;
                                     let _ = tg_send_message(&client, &token, chat_id,
@@ -5751,12 +6425,7 @@ async fn main() -> Result<()> {
 
                                     // New guards: bankroll floor, pending cap, loss streak
                                     let bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let pending_count = active_bets.iter().filter(|b| {
-                                        match b.token_id.as_deref() {
-                                            Some(tid) => !deferred_claim_tokens.contains(tid),
-                                            None => true,
-                                        }
-                                    }).count();
+                                    let pending_count = count_pending_slots(&active_bets);
                                     let pending_ok = pending_count < MAX_CONCURRENT_PENDING;
                                     let streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
@@ -5960,6 +6629,12 @@ async fn main() -> Result<()> {
                                             "rebet_ok": rebet_ok,
                                             "bankroll_ok": bankroll_ok,
                                             "pending_ok": pending_ok,
+                                            "pending_count": pending_count,
+                                            "inflight_total": inflight_wagered_total,
+                                            "condition_exposure": cond_exp,
+                                            "match_exposure": match_exp,
+                                            "sport_exposure": sport_exp,
+                                            "daily_net_loss": daily_net_loss_for_cap,
                                             "streak_ok": streak_ok,
                                         }));
                                     }
@@ -7018,12 +7693,7 @@ async fn main() -> Result<()> {
 
                                     // New guards for anomaly path too
                                     let anomaly_bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let anomaly_pending_count = active_bets.iter().filter(|b| {
-                                        match b.token_id.as_deref() {
-                                            Some(tid) => !deferred_claim_tokens.contains(tid),
-                                            None => true,
-                                        }
-                                    }).count();
+                                    let anomaly_pending_count = count_pending_slots(&active_bets);
                                     let anomaly_pending_ok = anomaly_pending_count < MAX_CONCURRENT_PENDING;
                                     let anomaly_streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
@@ -8229,11 +8899,11 @@ async fn main() -> Result<()> {
                                 if result == "Lost" {
                                     // NOTE: daily_wagered is already incremented at PLACED time (BUG FIX: removed double-count)
                                     // Loss streak tracking
-                                    consecutive_losses += 1;
-                                    if consecutive_losses >= LOSS_STREAK_PAUSE_THRESHOLD {
-                                        loss_streak_pause_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(LOSS_STREAK_PAUSE_SECS));
-                                        info!("🛑 LOSS STREAK: {} consecutive losses — pausing auto-bet for {}s", consecutive_losses, LOSS_STREAK_PAUSE_SECS);
-                                    }
+                                    record_live_loss_for_streak(
+                                        bet,
+                                        &mut consecutive_losses,
+                                        &mut loss_streak_pause_until,
+                                    );
                                     {
                                         let today = Utc::now().format("%Y-%m-%d").to_string();
                                         let _ = std::fs::write(
@@ -8366,6 +9036,11 @@ async fn main() -> Result<()> {
                                 ));
                             }
                             "Lost" => {
+                                record_live_loss_for_streak(
+                                    bet,
+                                    &mut consecutive_losses,
+                                    &mut loss_streak_pause_until,
+                                );
                                 // === LEDGER: LOST (bet_status) ===
                                 if !ledger_settled_ids.contains(&bet.bet_id) {
                                     ledger_write("LOST", &serde_json::json!({
@@ -8585,7 +9260,7 @@ async fn main() -> Result<()> {
                 active_bets.retain(|b| !bets_to_remove.contains(&b.bet_id));
 
                 // Keep inflight cap grounded in reality: total USD currently locked
-                // in pending/claimable/on-chain + in-flight bets (NOT cumulative daily wagered).
+                // in on-chain pending + in-flight bets (NOT cumulative daily wagered).
                 inflight_wagered_total = active_bets.iter().map(|b| b.amount_usd).sum();
 
                 // Rewrite pending_claims file when bets removed OR tokenIds discovered
@@ -8665,6 +9340,23 @@ async fn main() -> Result<()> {
                         Err(e) => warn!("Auto-claim safety net error: {}", e),
                     }
                 }
+
+                match client.get(format!("{}/my-bets", executor_url)).send().await {
+                    Ok(resp) => {
+                        if let Ok(mb) = resp.json::<serde_json::Value>().await {
+                            if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
+                                inflight_wagered_total = reconcile_active_bets_with_executor_snapshot(
+                                    &mut active_bets,
+                                    bets_arr,
+                                    pending_claims_path,
+                                    session_start,
+                                    INFLIGHT_TTL_SECS,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => warn!("Pending reconcile /my-bets error: {}", e),
+                }
             }
 
             // === PORTFOLIO STATUS REPORT (every 30 min) ===
@@ -8740,159 +9432,15 @@ async fn main() -> Result<()> {
                         msg.push_str("⚠️ <b>Nevybráno!</b> Pošlu /auto-claim...\n");
                     }
 
-                    // === RECONCILE: on-chain is source of truth for pending list ===
+                    // === RECONCILE: on-chain pending is source of truth for locked exposure ===
                     if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
-                        // Collect on-chain pending + claimable tokenIds
-                        let onchain_pending_tids: HashSet<String> = bets_arr.iter()
-                            .filter(|b| {
-                                let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                st == "pending" || st == "claimable"
-                            })
-                            .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                            .collect();
-
-                        // Build enriched info from on-chain bets
-                        let onchain_enriched: Vec<(String, String, f64, f64, String, String)> = bets_arr.iter()
-                            .filter(|b| {
-                                let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                st == "pending" || st == "claimable"
-                            })
-                            .map(|b| {
-                                let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let bet_id = b.get("betId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                (tid, team, odds, amount, match_key, bet_id)
-                            })
-                            .collect();
-
-                        let pre_count = active_bets.len();
-
-                        // 1) Remove local bets whose tokenId is NOT in on-chain pending/claimable
-                        active_bets.retain(|b| {
-                            match &b.token_id {
-                                Some(tid) => onchain_pending_tids.contains(tid),
-                                None => true, // keep in-flight bets (tokenId unknown)
-                            }
-                        });
-
-                        // 2) TTL: expire in-flight bets (token_id=None) older than INFLIGHT_TTL_SECS
-                        let now_utc = Utc::now();
-                        active_bets.retain(|b| {
-                            if b.token_id.is_some() { return true; } // on-chain verified
-                            // "onchain" bets are verified — keep (reconcile handles)
-                            if b.placed_at == "onchain" { return true; }
-                            // "loaded" bets from pending_claims.txt with no tokenId are zombie entries.
-                            // Expire after INFLIGHT_TTL_SECS from session start.
-                            if b.placed_at == "loaded" {
-                                let session_age = (now_utc - session_start).num_seconds();
-                                if session_age > INFLIGHT_TTL_SECS {
-                                    info!("\u{23f0} ZOMBIE_TTL: loaded bet {} ({}) expired — session age {}s > TTL {}s",
-                                        b.bet_id, b.value_team, session_age, INFLIGHT_TTL_SECS);
-                                    return false;
-                                }
-                                return true;
-                            }
-                            match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
-                                Ok(placed) => {
-                                    let age_secs = (now_utc - placed.with_timezone(&Utc)).num_seconds();
-                                    if age_secs > INFLIGHT_TTL_SECS {
-                                        info!("⏰ INFLIGHT_TTL: bet {} ({}) expired after {}s — removing",
-                                            b.bet_id, b.value_team, age_secs);
-                                        false
-                                    } else {
-                                        true
-                                    }
-                                }
-                                Err(_) => true, // can't parse — keep it
-                            }
-                        });
-
-                        // 3) For on-chain pending bets not in local list, add them
-                        let local_tids: HashSet<String> = active_bets.iter()
-                            .filter_map(|b| b.token_id.clone())
-                            .collect();
-                        for (tid, team, odds, amount, match_key, bet_id) in &onchain_enriched {
-                            if !local_tids.contains(tid) && !team.is_empty() {
-                                active_bets.push(ActiveBet {
-                                    alert_id: 0,
-                                    bet_id: if !bet_id.is_empty() { bet_id.clone() } else { format!("onchain_{}", tid) },
-                                    match_key: match_key.clone(),
-                                    market_key: "unknown".to_string(),
-                                    team1: team.clone(),
-                                    team2: "?".to_string(),
-                                    value_team: team.clone(),
-                                    amount_usd: *amount,
-                                    odds: *odds,
-                                    placed_at: "onchain".to_string(),
-                                    condition_id: String::new(),
-                                    outcome_id: String::new(),
-                                    graph_bet_id: None,
-                                    token_id: Some(tid.clone()),
-                                    path: "onchain".to_string(),
-                                });
-                            }
-                        }
-
-                        // 4) Harden tokenId discovery: match by betId first, then team+odds+conditionId
-                        for b in active_bets.iter_mut() {
-                            if b.token_id.is_none() {
-                                // Primary: match by betId (most reliable)
-                                if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
-                                    .find(|(_, _, _, _, _, bid)| !bid.is_empty() && bid == &b.bet_id)
-                                {
-                                    b.token_id = Some(tid.clone());
-                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} via betId match", tid, b.bet_id);
-                                }
-                                // Secondary: match by team+odds (with tighter tolerance)
-                                else if let Some((tid, _, _, _, mk, _)) = onchain_enriched.iter()
-                                    .find(|(_, t, o, _, mk, _)| {
-                                        !t.is_empty() && t == &b.value_team
-                                        && (*o - b.odds).abs() < 0.03
-                                        && (mk.is_empty() || b.match_key.is_empty() || mk == &b.match_key)
-                                    })
-                                {
-                                    b.token_id = Some(tid.clone());
-                                    info!("🔗 RECONCILE: Discovered tokenId {} for bet {} ({}) via team+odds+matchKey",
-                                        tid, b.bet_id, b.value_team);
-                                }
-                            }
-                        }
-
-                        let post_count = active_bets.len();
-                        if pre_count != post_count {
-                            info!("🔄 RECONCILE: active_bets {} → {} (on-chain pending: {})",
-                                pre_count, post_count, onchain_pending_tids.len());
-                        }
-
-                        // 5) Atomic rewrite of pending_claims.txt
-                        if pre_count != post_count || active_bets.iter().any(|b| b.placed_at == "onchain") {
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).write(true).truncate(true)
-                                .open(pending_claims_path) {
-                                use std::io::Write;
-                                for bet in &active_bets {
-                                    let tid = bet.token_id.as_deref().unwrap_or("?");
-                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
-                                        tid, bet.bet_id, bet.match_key,
-                                        bet.value_team, bet.amount_usd, bet.odds);
-                                }
-                                info!("💾 RECONCILE: pending_claims.txt rewritten ({} entries)", active_bets.len());
-                            }
-                        }
-
-                        // 6) INVARIANT CHECK: on-chain pending vs local on-chain-verified count
-                        let local_onchain_count = active_bets.iter().filter(|b| b.token_id.is_some()).count();
-                        let onchain_count = onchain_pending_tids.len();
-                        if local_onchain_count != onchain_count {
-                            warn!("⚠️ INVARIANT MISMATCH: local on-chain verified={} vs on-chain pending+claimable={} — investigate!",
-                                local_onchain_count, onchain_count);
-                        }
-
-                        // Sync inflight cap total after reconcile changes
-                        inflight_wagered_total = active_bets.iter().map(|b| b.amount_usd).sum();
+                        inflight_wagered_total = reconcile_active_bets_with_executor_snapshot(
+                            &mut active_bets,
+                            bets_arr,
+                            pending_claims_path,
+                            session_start,
+                            INFLIGHT_TTL_SECS,
+                        );
                     }
                 }
 
@@ -9453,81 +10001,15 @@ async fn main() -> Result<()> {
                                                 total, won, lost, pending_count, redeemable
                                             ));
 
-                                            // Reconcile active_bets from on-chain data (same as ticker)
+                                            // Reconcile active_bets from on-chain pending data (same as ticker)
                                             if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
-                                                let onchain_pending_tids: HashSet<String> = bets_arr.iter()
-                                                    .filter(|b| {
-                                                        let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                                        st == "pending" || st == "claimable"
-                                                    })
-                                                    .filter_map(|b| b.get("tokenId").and_then(|v| v.as_str()).map(|s| s.to_string()))
-                                                    .collect();
-
-                                                let onchain_enriched: Vec<(String, String, f64, f64, String, String)> = bets_arr.iter()
-                                                    .filter(|b| {
-                                                        let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                                        st == "pending" || st == "claimable"
-                                                    })
-                                                    .map(|b| {
-                                                        let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                                        let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                        let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                        let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                        let match_key = b.get("matchKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                        let bet_id = b.get("betId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                                        (tid, team, odds, amount, match_key, bet_id)
-                                                    })
-                                                    .collect();
-
-                                                // Remove settled on-chain bets
-                                                active_bets.retain(|b| {
-                                                    match &b.token_id {
-                                                        Some(tid) => onchain_pending_tids.contains(tid),
-                                                        None => true,
-                                                    }
-                                                });
-
-                                                // TTL: expire stale in-flight bets
-                                                let now_utc = Utc::now();
-                                                active_bets.retain(|b| {
-                                                    if b.token_id.is_some() { return true; }
-                                                    if b.placed_at == "onchain" { return true; }
-                                                    if b.placed_at == "loaded" {
-                                                        let session_age = (now_utc - session_start).num_seconds();
-                                                        return session_age <= INFLIGHT_TTL_SECS;
-                                                    }
-                                                    match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
-                                                        Ok(placed) => (now_utc - placed.with_timezone(&Utc)).num_seconds() <= INFLIGHT_TTL_SECS,
-                                                        Err(_) => true,
-                                                    }
-                                                });
-
-                                                // Harden tokenId discovery: betId first, then team+odds+matchKey
-                                                for b in active_bets.iter_mut() {
-                                                    if b.token_id.is_none() {
-                                                        if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
-                                                            .find(|(_, _, _, _, _, bid)| !bid.is_empty() && bid == &b.bet_id)
-                                                        {
-                                                            b.token_id = Some(tid.clone());
-                                                        } else if let Some((tid, _, _, _, _, _)) = onchain_enriched.iter()
-                                                            .find(|(_, t, o, _, mk, _)| {
-                                                                !t.is_empty() && t == &b.value_team
-                                                                && (*o - b.odds).abs() < 0.03
-                                                                && (mk.is_empty() || b.match_key.is_empty() || mk == &b.match_key)
-                                                            })
-                                                        {
-                                                            b.token_id = Some(tid.clone());
-                                                        }
-                                                    }
-                                                }
-
-                                                // Invariant check
-                                                let local_onchain_count = active_bets.iter().filter(|b| b.token_id.is_some()).count();
-                                                let onchain_count = onchain_pending_tids.len();
-                                                if local_onchain_count != onchain_count {
-                                                    msg.push_str(&format!("⚠️ <b>INVARIANT:</b> local verified={} vs on-chain={}\n",
-                                                        local_onchain_count, onchain_count));
-                                                }
+                                                inflight_wagered_total = reconcile_active_bets_with_executor_snapshot(
+                                                    &mut active_bets,
+                                                    bets_arr,
+                                                    pending_claims_path,
+                                                    session_start,
+                                                    INFLIGHT_TTL_SECS,
+                                                );
                                             }
                                         }
                                     }

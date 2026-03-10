@@ -22,6 +22,10 @@ $MIN_UPTIME_SEC  = 60     # ignore if restarted < 60s ago (let process bind port
 $MAX_CONSECUTIVE = 5      # crashes before cooldown
 $COOLDOWN_MIN    = 10
 
+function Is-NightWatchEnabled {
+    return ($env:NIGHT_WATCH -eq 'true' -or $env:NIGHT_WATCH -eq '1')
+}
+
 # ── Re-launch self as hidden process ─────────────────────────────────────────
 if ($Background) {
     $me = $MyInvocation.MyCommand.Path
@@ -100,7 +104,7 @@ $procs = @(
         WorkDir = Join-Path $ROOT 'executor'
         LogOut  = Join-Path $ROOT 'logs\executor.log'
         LogErr  = Join-Path $ROOT 'logs\executor_err.log'
-    }
+    },
 )
 
 # ── Per-process state ─────────────────────────────────────────────────────────
@@ -118,6 +122,11 @@ function Test-Alive([hashtable]$proc) {
     if ($proc.Id -eq 'executor') {
         $hit = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
                Where-Object { $_.CommandLine -match 'executor\\index\.js' }
+        return ($null -ne $hit -and @($hit).Count -gt 0)
+    }
+    if ($proc.Id -eq 'night-watch') {
+        $hit = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+               Where-Object { ($_.Name -eq 'powershell.exe' -or $_.Name -eq 'pwsh.exe') -and $_.CommandLine -match 'night_watch\.ps1' }
         return ($null -ne $hit -and @($hit).Count -gt 0)
     }
     return ($null -ne (Get-Process -Name $proc.Name -ErrorAction SilentlyContinue))
@@ -159,8 +168,24 @@ if (($env:WS_STATE_GATE -eq 'true' -or $env:WS_STATE_GATE -eq '1') -and -not $le
 }
 $env:WS_STATE_GATE = if ($legacyWsGateOptIn) { 'true' } else { 'false' }
 
+if (Is-NightWatchEnabled) {
+    $procs += @{
+        Id      = 'night-watch'
+        Name    = 'powershell'
+        Exe     = 'powershell.exe'
+        Args    = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $ROOT 'night_watch.ps1'))
+        WorkDir = $ROOT
+        LogOut  = Join-Path $ROOT 'logs\night_watch_stdout.log'
+        LogErr  = Join-Path $ROOT 'logs\night_watch_monitor.log'
+    }
+}
+
 Write-WD 'INFO' "Watchdog started. interval=${CHECK_SEC}s backoff=${MAX_CONSECUTIVE}x->${COOLDOWN_MIN}min log-cap=${MAX_LOG_LINES}lines"
-Send-Alert "[Watchdog] STARTED. Monitoring: feed-hub, alert-bot, executor"
+$watchList = @('feed-hub', 'alert-bot', 'executor')
+if (Is-NightWatchEnabled) {
+    $watchList += 'night-watch'
+}
+Send-Alert "[Watchdog] STARTED. Monitoring: $($watchList -join ', ')"
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 $iter = 0

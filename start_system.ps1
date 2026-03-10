@@ -5,6 +5,10 @@ param (
 $ErrorActionPreference = 'Continue'
 $ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+function Is-NightWatchEnabled {
+    return ($env:NIGHT_WATCH -eq 'true' -or $env:NIGHT_WATCH -eq '1')
+}
+
 $FEED_HUB_EXE = Join-Path $ROOT 'target\release\feed-hub.exe'
 $ALERT_BOT_EXE = Join-Path $ROOT 'target\release\alert-bot.exe'
 $EXECUTOR_DIR = Join-Path $ROOT 'executor'
@@ -185,6 +189,18 @@ if (Test-Path $watchdogScript) {
     Write-Host '  watchdog OK (background, 30s intervals)' -ForegroundColor Green
 } else {
     Write-Host '  watchdog.ps1 not found, skipping' -ForegroundColor Yellow
+}
+
+Write-Host '[6/6] Starting night-watch...' -ForegroundColor Green
+$nightWatchScript = Join-Path $ROOT 'night_watch.ps1'
+if (-not (Is-NightWatchEnabled)) {
+    Write-Host '  night-watch skipped (set NIGHT_WATCH=true for overnight monitor mode)' -ForegroundColor Yellow
+} elseif (Test-Path $nightWatchScript) {
+    Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$nightWatchScript`"" -WorkingDirectory $ROOT -WindowStyle Hidden
+    Start-Sleep -Seconds 1
+    Write-Host '  night-watch OK (background, 10min monitor loop)' -ForegroundColor Green
+} else {
+    Write-Host '  night_watch.ps1 not found, skipping' -ForegroundColor Yellow
 }
 
 Write-Host ''
