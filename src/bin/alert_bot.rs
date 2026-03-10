@@ -1849,12 +1849,18 @@ fn cs2_round_edge_max_odds_override(
     }
 
     if is_match_winner {
-        return if edge_pct >= 55.0 {
-            Some(3.10)
+        let round_diff = (score1 - score2).abs();
+        // Stale GQL odds problem: when one team leads 0-4+ in a map, GQL still
+        // shows inflated odds (3.5+) because queries lag behind scoreboard.
+        // With 40%+ edge AND big score diff, we KNOW the odds are wrong — allow wider band.
+        return if edge_pct >= 40.0 && round_diff >= 4 {
+            Some(5.00)
+        } else if edge_pct >= 55.0 {
+            Some(4.00)
         } else if edge_pct >= 45.0 {
-            Some(2.90)
+            Some(3.50)
         } else if edge_pct >= 32.0 {
-            Some(2.70)
+            Some(2.90)
         } else {
             None
         };
