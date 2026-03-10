@@ -1547,6 +1547,13 @@ fn is_status_pregame_like(status: &str) -> bool {
         || lower.contains("start")
 }
 
+/// Returns true when the match is CS2 or strongly resembles CS2 by context.
+/// Used to apply CS2 score hold guards to `esports::` matches that Chance/Tipsport
+/// sends without resolving `sport = cs2`. Czech "mapa" appears ONLY in CS2 BO3 feeds.
+fn is_cs2_like(esports_family: Option<&str>, detailed: Option<&str>) -> bool {
+    esports_family == Some("cs2") || detailed.unwrap_or("").to_lowercase().contains("mapa")
+}
+
 fn is_cs2_reset_hold_state(
     prev_score1: i32,
     prev_score2: i32,
@@ -1556,7 +1563,7 @@ fn is_cs2_reset_hold_state(
     live_status: &str,
     esports_family: Option<&str>,
 ) -> bool {
-    if esports_family != Some("cs2") {
+    if !is_cs2_like(esports_family, detailed) {
         return false;
     }
 
@@ -1588,22 +1595,28 @@ fn is_cs2_map_rollover_hold_state(
     detailed: Option<&str>,
     esports_family: Option<&str>,
 ) -> bool {
-    if esports_family != Some("cs2") {
-        return false;
-    }
-
-    if prev_score1.max(prev_score2) < 8 {
-        return false;
-    }
-
-    if score1.max(score2) > 1 || score1 == score2 {
+    if !is_cs2_like(esports_family, detailed) {
         return false;
     }
 
     let detail = detailed.unwrap_or("");
     let has_cs2_detail = detail.contains("mapa") || detail.contains("R:") || detail.contains("M:") || detail.contains('(');
 
-    has_cs2_detail || detail.trim().is_empty()
+    // Case 1: high round-score map → 1-0 map score (asymmetric winner)
+    let case_asymmetric = prev_score1.max(prev_score2) >= 8
+        && score1.max(score2) <= 1
+        && score1 != score2
+        && (has_cs2_detail || detail.trim().is_empty());
+
+    // Case 2: early round-score in map 3 → 1-1 map score (both teams won 1 map)
+    // feed sends e.g. 1-4 rounds → then 1-1 map score when context updates
+    let case_map3_start = score1 == 1 && score2 == 1
+        && prev_score1.max(prev_score2) > 1
+        && (prev_score1 != 1 || prev_score2 != 1)
+        && (score1 < prev_score1 || score2 < prev_score2)
+        && has_cs2_detail;
+
+    case_asymmetric || case_map3_start
 }
 
 fn is_cs2_round_rewind_hold_state(
@@ -1614,7 +1627,7 @@ fn is_cs2_round_rewind_hold_state(
     detailed: Option<&str>,
     esports_family: Option<&str>,
 ) -> bool {
-    if esports_family != Some("cs2") {
+    if !is_cs2_like(esports_family, detailed) {
         return false;
     }
 
@@ -1645,7 +1658,7 @@ fn is_cs2_legit_map_rollover(
     detailed: Option<&str>,
     esports_family: Option<&str>,
 ) -> bool {
-    if esports_family != Some("cs2") {
+    if !is_cs2_like(esports_family, detailed) {
         return false;
     }
 
@@ -1686,7 +1699,7 @@ fn is_cs2_backward_score_pending_state(
     detailed: Option<&str>,
     esports_family: Option<&str>,
 ) -> bool {
-    if esports_family != Some("cs2") {
+    if !is_cs2_like(esports_family, detailed) {
         return false;
     }
 
@@ -1920,6 +1933,7 @@ fn canonical_team_name(name: &str) -> String {
         ("quazarmpkbkcislan", "quazar"),
         ("rustecmpkbkcislan", "rustec"),
         ("teamnemesis", "nemesis"),
+        ("europeannemesis", "nemesis"),
         ("fengdacsasia", "fengda"),
         ("lynnvisioncsasia", "lynnvision"),
         ("depocsasia", "depo"),

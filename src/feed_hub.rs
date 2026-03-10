@@ -806,7 +806,7 @@ fn esports_team_signature(name: &str) -> Option<String> {
         "qualifier", "open", "closed", "playoff", "playoffs", "group", "stage",
         "pgl", "blast", "iem", "esl", "season", "cup", "masters", "summit",
         "rush", "rushb", "betboom", "bucharest", "cracovia", "south", "north",
-        "america", "europe", "final", "finals", "regional", "major", "minor",
+        "america", "europe", "european", "final", "finals", "regional", "major", "minor",
     ];
     let sponsor_prefixes = ["betclic"];
 
