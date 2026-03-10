@@ -73,11 +73,12 @@ const MANUAL_BET_DEFAULT_USD: f64 = 3.0;
 const MANUAL_BET_MAX_ODDS: f64 = 2.00;
 /// Manual/Reaction alert must be fresh (prevents betting stale/reset markets)
 const MANUAL_ALERT_MAX_AGE_SECS: i64 = 25;
-/// Block betting on generic esports keys — DISABLED: Azuro condition_id check
-/// already ensures we only bet on real Azuro markets. esports:: keys from
-/// Tipsport resolve to cs2:: via alt-key lookup → safe to bet.
-/// Re-enabled after 2026-03-09 audit: generic esports auto-bets underperform
-/// versus concrete cs2/map buckets. Keep alerts, block only the auto-bet leg.
+/// Block betting on generic esports keys unless they are promoted to a concrete
+/// sport family from hard runtime data.
+/// Recent settle audit (2026-03-10) shows explicit cs2:: score-edge is profitable,
+/// while unresolved generic esports:: auto-bets are the main current loss bucket.
+/// Keep alerts and manual review, but only auto-execute generic esports after a
+/// high-confidence promotion coming from resolved_sport / live payload sport.
 const BLOCK_GENERIC_ESPORTS_BETS: bool = true;
 /// Retry settings — jittered backoff for live market condition pauses
 /// GPT audit: max 2 retry for ConditionNotRunning; 3rd attempt is wasted latency
@@ -715,18 +716,20 @@ fn score_edge_max_odds(market_key: &str, sport: &str, cs2_map_confidence: Option
         "basketball" => 2.00,
         "cs2" => {
             if let Some(tier) = cs2_map_confidence {
-                cs2_dynamic_max_odds(tier).min(2.35)
+                // Let HIGH (3.00) and ULTRA (5.00) pass through — score-edge with 80%+ win prob
+                // is high certainty at these odds. MEDIUM (2.00) and LOW (1.60) are self-limiting.
+                cs2_dynamic_max_odds(tier)
             } else if is_map_winner {
-                AUTO_BET_MAX_ODDS_CS2_MAP.min(2.35)
+                AUTO_BET_MAX_ODDS_CS2_MAP
             } else {
                 2.25
             }
         }
         "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => {
             if let Some(tier) = cs2_map_confidence {
-                cs2_dynamic_max_odds(tier).min(2.35)
+                cs2_dynamic_max_odds(tier)
             } else if is_map_winner {
-                AUTO_BET_MAX_ODDS_CS2_MAP.min(2.35)
+                AUTO_BET_MAX_ODDS_CS2_MAP
             } else {
                 2.15
             }
@@ -2194,6 +2197,35 @@ fn classify_esports_family(
         family: None,
         confidence: "unknown",
         reason: "unclassified",
+    }
+}
+
+fn generic_esports_auto_bet_allowed(
+    match_key: &str,
+    resolved_sport: Option<&str>,
+    esports_family: Option<&str>,
+    esports_confidence: &str,
+    esports_reason: &str,
+) -> bool {
+    if !BLOCK_GENERIC_ESPORTS_BETS || !match_key.starts_with("esports::") {
+        return true;
+    }
+
+    let family = match esports_family {
+        Some(family) => family,
+        None => return false,
+    };
+
+    if esports_confidence != "high" {
+        return false;
+    }
+
+    match esports_reason {
+        "live_payload_sport" => true,
+        "resolved_sport" => resolved_sport
+            .and_then(canonicalize_esports_family)
+            .is_some_and(|resolved| resolved == family),
+        _ => false,
     }
 }
 
@@ -6296,6 +6328,15 @@ async fn main() -> Result<()> {
                                     if sport == "football" {
                                         sport_min_edge = dynamic_football_min_edge(edge.detailed_score.as_deref());
                                     }
+                                    // CS2 map_winner: lower threshold to 28% — cs2:: is historically profitable (71% WR),
+                                    // and round-level score-edge with 80%+ win prob is high-certainty.
+                                    // Keep 38% for match_winner and other sports.
+                                    if (sport == "cs2" || (sport == "esports" && edge.esports_family == Some("cs2"))) {
+                                        let is_map_winner_bet = edge.market_key.starts_with("map") && edge.market_key.ends_with("_winner");
+                                        if is_map_winner_bet {
+                                            sport_min_edge = 28.0;
+                                        }
+                                    }
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
                                     let base_stake = dynamic_base_stake(current_bankroll, sport);
                                     let score_stake_mult = score_edge_stake_multiplier(edge, sport, azuro_odds);
@@ -6337,10 +6378,42 @@ async fn main() -> Result<()> {
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
                                     }
 
-                                    let esports_identity_blocked = BLOCK_GENERIC_ESPORTS_BETS
-                                        && edge.match_key.starts_with("esports::")
-                                        && (edge.esports_family.is_none()
-                                            || matches!(edge.esports_confidence, "low" | "unknown"));
+                                    let esports_identity_allowed = generic_esports_auto_bet_allowed(
+                                        &edge.match_key,
+                                        edge.resolved_sport.as_deref(),
+                                        edge.esports_family,
+                                        edge.esports_confidence,
+                                        edge.esports_reason,
+                                    );
+                                    let esports_identity_blocked = !esports_identity_allowed;
+                                    if edge.match_key.starts_with("esports::") {
+                                        let gate_decision = if esports_identity_allowed {
+                                            "promoted"
+                                        } else {
+                                            "blocked"
+                                        };
+                                        append_ledger_audit_event("ESPORTS_PROMOTION_GATE_AUDIT", &serde_json::json!({
+                                            "match_key": edge.match_key,
+                                            "market_key": edge.market_key,
+                                            "decision": gate_decision,
+                                            "resolved_sport": edge.resolved_sport,
+                                            "esports_family": edge.esports_family,
+                                            "sport_confidence": edge.esports_confidence,
+                                            "sport_reason": edge.esports_reason,
+                                            "edge_pct": edge.edge_pct,
+                                            "odds": azuro_odds,
+                                            "score1": edge.score1,
+                                            "score2": edge.score2,
+                                        }));
+                                    }
+                                    if edge.match_key.starts_with("esports::") && esports_identity_allowed {
+                                        info!(
+                                            "✅ ESPORTS PROMOTION GATE: {} promoted to family={} via {} — auto-bet eligible",
+                                            edge.match_key,
+                                            edge.esports_family.unwrap_or("unknown"),
+                                            edge.esports_reason,
+                                        );
+                                    }
                                     let is_preferred_market = match preferred_market {
                                         "map_winner" => edge.market_key.starts_with("map") && edge.market_key.ends_with("_winner"),
                                         "set_winner" => edge.match_key.contains("::set"),
