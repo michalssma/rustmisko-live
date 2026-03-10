@@ -495,24 +495,23 @@ fn sport_score_edge_dry_run_enabled(sport: &str) -> bool {
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
-        // Keep stricter than old production, but not so strict that 28-29.9% valid map/round edges never pass.
+        // Raised 28→38%: production data shows edge<40% bucket WR=42% vs need=51% → -EV. Only edge 40-50% was profitable.
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol"
-            => (true, 28.0, 1.0, "match_or_map"),
-        // Generic esports fallback stays available, but needs a slightly cleaner edge than concrete game-specific feeds.
+            => (true, 38.0, 1.0, "match_or_map"),
+        // Generic esports: same 38% threshold, blocked regardless by BLOCK_GENERIC_ESPORTS_BETS
         "esports"
-            => (true, 30.0, 1.0, "match_or_map"),
+            => (true, 38.0, 1.0, "match_or_map"),
         // Tennis: match_winner — our tennis_model uses set+game state
-        // Raised 12→30%: same data-driven threshold as all sports
+        // Raised 30→38%: production data (131W/125L) shows edge<40% is -EV across all sports
         "tennis"
-            => (true, 30.0, 1.0, "match_winner"),
-        // Basketball: match_winner — point spread model
-        // Raised 11→30%: uniform threshold — only highest-confidence bets
+            => (true, 38.0, 1.0, "match_winner"),
+        // Basketball: match_winner — point spread model; +$4.49 P&L so keep but raise threshold
         "basketball"
-            => (true, 30.0, 1.0, "match_winner"),
-        // Football: DYNAMIC by minute — late game has stronger signal
-        // Raised 14→30%: base threshold; dynamic_football_min_edge() can override for late game
+            => (true, 38.0, 1.0, "match_winner"),
+        // Football: DISABLED — production P&L -$18.59, WR 37%, 38 bets. No strategy worked.
+        // Re-enable when we have a football-specific model with >52% WR at avg odds.
         "football"
-            => (true, 30.0, 1.0, "match_winner"),
+            => (false, 38.0, 1.0, "match_winner"),
         // New sports: alerts enabled, conservative edge thresholds
         "volleyball" | "ice-hockey" | "baseball" | "cricket" | "boxing"
             => (true, 30.0, 1.0, "match_winner"),
@@ -628,9 +627,11 @@ const AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_REF_ODDS: f64 = 1.25;
 const AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR: f64 = 0.50;
 const AUTO_BET_ODDS_ANOMALY_STAKE_CAP: f64 = 1.00;
-/// Anomaly MAX ODDS: production data shows anomaly odds>=1.70 is -EV across all sports
-/// Tennis 1.50-1.70 = 80% WR +$2.61, tennis >=1.70 = 30% WR -$6.64
-/// Esports >=1.70 = 43.8% WR -$5.61. Only safe zone is 1.50-1.70.
+/// Anomaly ODDS WINDOW: production data (256 settled bets) shows:
+/// anomaly 1.45-1.70 = 70% WR (need 61%) → +EV sweet spot
+/// anomaly <1.45 = 63% WR (need 69%) → -EV (short prices eat margin)
+/// anomaly >1.70 = historically -EV, maintained as hard cap
+const ANOMALY_MIN_ODDS: f64 = 1.45;
 const ANOMALY_MAX_ODDS: f64 = 1.70;
 /// Anomaly gets only 30% of daily budget (score-edge gets the rest)
 const ANOMALY_DAILY_LIMIT_MULT: f64 = 0.30;
@@ -7808,8 +7809,8 @@ async fn main() -> Result<()> {
                                         && anomaly_score_confirmed // SCORE-CONFIRMED: leading team = value side
                                         && anomaly_disc_ok         // DISC MINIMUM: ≥15% for auto-bet
                                         && anomaly_within_daily_limit
-                                        && azuro_odds >= AUTO_BET_MIN_ODDS
-                                        && azuro_odds <= ANOMALY_MAX_ODDS  // odds>1.70 is -EV for anomaly
+                                        && azuro_odds >= ANOMALY_MIN_ODDS  // <1.45 production WR 63% vs need 69% → -EV
+                                        && azuro_odds <= ANOMALY_MAX_ODDS  // >1.70 is -EV for anomaly
                                         && !azuro_odds_identical
                                         && market_source_count >= AUTO_BET_MIN_MARKET_SOURCES
                                         && !already_bet_this
