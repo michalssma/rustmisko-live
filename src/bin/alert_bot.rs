@@ -5664,6 +5664,9 @@ async fn main() -> Result<()> {
     // BUG #1 FIX: Also track base match keys (without ::mapN_winner suffix)
     // to prevent multiple map-winner bets on the same match (triple exposure)
     let mut already_bet_base_matches: HashSet<String> = HashSet::new();
+    // Subset of already_bet_base_matches: only entries from MAP_WINNER bets (not match_winner).
+    // Used to allow map2↔map3 sibling bets while still blocking match_winner↔map_winner crosses.
+    let mut already_bet_map_winners: HashSet<String> = HashSet::new();
     // Load from file on startup
     if Path::new(bet_history_path).exists() {
         if let Ok(contents) = std::fs::read_to_string(bet_history_path) {
@@ -5687,7 +5690,11 @@ async fn main() -> Result<()> {
                     already_bet_matches.insert(parts[0].to_string());
                     // Extract base match key (strip ::mapN_winner suffix)
                     let base_key = strip_map_winner_suffix(parts[0]);
+                    let is_map_winner_entry = base_key != parts[0];
                     already_bet_conditions.insert(scoped_condition_key(&base_key, parts[1]));
+                    if is_map_winner_entry {
+                        already_bet_map_winners.insert(base_key.clone());
+                    }
                     already_bet_base_matches.insert(base_key);
                     loaded_fresh += 1;
                 }
@@ -6211,10 +6218,14 @@ async fn main() -> Result<()> {
                                     let is_inflight = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
                                         || inflight_conditions.contains(&match_key_for_bet);
 
-                                    // BUG FIX: Also check base_match_key to prevent triple exposure
-                                    // (e.g. match_winner + map2_winner + map3_winner on same match = $9 loss)
+                                    // BUG FIX: Prevent match_winner↔map_winner cross-market overexposure.
+                                    // REFINED: map2_winner↔map3_winner sibling bets are ALLOWED when the previous bet
+                                    // was also a map-level market (different cond ID, different settlement event).
+                                    // match_cap/trim_stake guard total exposure on the base match.
+                                    let is_candidate_map_winner = match_key_for_bet != base_match_key;
                                     let base_already_bet = already_bet_base_matches.contains(&base_match_key)
-                                        && match_key_for_bet != base_match_key; // only block map-variants, not the base itself re-checking
+                                        && is_candidate_map_winner
+                                        && !already_bet_map_winners.contains(&base_match_key); // existing was match_winner → still block
 
                                     let mut scoped_cond_key = (!cond_id_str.is_empty())
                                         .then(|| scoped_condition_key(&base_match_key, &cond_id_str));
@@ -6222,8 +6233,8 @@ async fn main() -> Result<()> {
                                     let (already_bet_this, rebet_ok) = if is_inflight {
                                         (true, false) // In-flight → always block
                                     } else if base_already_bet {
-                                        // Base match already has a bet → block all map-winner variants
-                                        info!("🛡️ BASE-MATCH DEDUP: {} blocked (base {} already bet)",
+                                        // Previous was match_winner → block this map-winner (cross-market triple exposure guard)
+                                        info!("🛡️ BASE-MATCH DEDUP: {} blocked (base {} has match_winner bet, blocking map variant)",
                                             match_key_for_bet, base_match_key);
                                         (true, false)
                                     } else if scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
@@ -7112,6 +7123,10 @@ async fn main() -> Result<()> {
                                                             }
                                                             // BUG #1 FIX: Also record base match key
                                                             already_bet_base_matches.insert(base_match_key.clone());
+                                                            // Track map_winner placements for sibling-map dedup logic
+                                                            if match_key_for_bet != base_match_key {
+                                                                already_bet_map_winners.insert(base_match_key.clone());
+                                                            }
 
                                                             // === EXPOSURE TRACKING: update condition + match + sport + inflight ===
                                                             if let Some(key) = scoped_cond_key.as_ref() {
@@ -7521,9 +7536,12 @@ async fn main() -> Result<()> {
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
                                     let mut scoped_cond_key = (!cond_id_str.is_empty())
                                         .then(|| scoped_condition_key(&base_match_key, &cond_id_str));
-                                    // BUG FIX: Check base_match_key too → prevents triple exposure on same match
+                                    // BUG FIX: Prevent match_winner↔map cross-exposure.
+                                    // REFINED: map2↔map3 sibling bets allowed when previous was also map-level (match_cap guards).
+                                    let is_candidate_map_winner_anom = match_key_for_bet != base_match_key;
                                     let base_already_bet_anom = already_bet_base_matches.contains(&base_match_key)
-                                        && match_key_for_bet != base_match_key;
+                                        && is_candidate_map_winner_anom
+                                        && !already_bet_map_winners.contains(&base_match_key);
                                     let already_bet_this = base_already_bet_anom
                                         || scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
                                         || already_bet_matches.contains(&match_key_for_bet);
@@ -8206,6 +8224,10 @@ async fn main() -> Result<()> {
                                                                 already_bet_conditions.insert(key.clone());
                                                             }
                                                             already_bet_base_matches.insert(base_match_key.clone());
+                                                            // Track map_winner placements for sibling-map dedup logic
+                                                            if match_key_for_bet != base_match_key {
+                                                                already_bet_map_winners.insert(base_match_key.clone());
+                                                            }
 
                                                             // === EXPOSURE TRACKING (odds anomaly path) ===
                                                             if let Some(key) = scoped_cond_key.as_ref() {
