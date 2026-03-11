@@ -3635,11 +3635,35 @@ fn find_score_edges(
                 let map_win_prob = cs2_map_win_prob(diff, total_rounds);
                 let map_confidence_tier = cs2_confidence_tier(map_win_prob, total_rounds);
 
+                // === ACTIVE MAP FILTER: prevent cross-map edge contamination ===
+                // Round score (s1, s2) belongs to the CURRENTLY ACTIVE map only.
+                // We must NOT apply it to other map markets (past or future).
+                let active_map_num: Option<u8> = live.payload.detailed_score.as_deref()
+                    .and_then(|ds| parse_cs2_current_map(ds));
+
                 for mw in map_odds_list {
                     if !is_recent_seen_at(&mw.seen_at, now) {
                         info!("  ⏭️ {} {}-{}: MW {} skipped (stale odds)",
                             match_key, s1, s2, mw.market);
                         continue;
+                    }
+
+                    // Cross-map guard: only evaluate the market matching the active map
+                    let market_map_num: Option<u8> = mw.market.chars()
+                        .find(|c| c.is_ascii_digit())
+                        .map(|c| c as u8 - b'0');
+                    match (active_map_num, market_map_num) {
+                        (Some(active), Some(mm)) if mm != active => {
+                            info!("  ⏭️ {} {}-{}: MW {} skipped (active map={}, market map={})",
+                                match_key, s1, s2, mw.market, active, mm);
+                            continue;
+                        }
+                        (None, _) => {
+                            info!("  ⏭️ {} {}-{}: MW {} skipped (cannot determine active map)",
+                                match_key, s1, s2, mw.market);
+                            continue;
+                        }
+                        _ => {} // active map matches market map — proceed
                     }
 
                     // Resolve correct Azuro side by TEAM NAME — HARD BLOCK if ambiguous
