@@ -22,9 +22,15 @@ function Get-MatchPrefix([string]$matchKey) {
     return ($matchKey -split "::")[0]
 }
 
-function Get-MarketKey($row) {
+function Get-MarketKey($row, $betMetadata) {
     if ($row.PSObject.Properties.Name -contains "market_key" -and -not [string]::IsNullOrWhiteSpace($row.market_key)) {
         return [string]$row.market_key
+    }
+    if (($row.PSObject.Properties.Name -contains "bet_id") -and $betMetadata.ContainsKey([string]$row.bet_id)) {
+        $metaMarket = [string]$betMetadata[[string]$row.bet_id].market_key
+        if (-not [string]::IsNullOrWhiteSpace($metaMarket) -and $metaMarket -ne "unknown") {
+            return $metaMarket
+        }
     }
     $matchKey = [string]$row.match_key
     if ($matchKey -match "::([A-Za-z0-9_]+_winner)$") {
@@ -33,7 +39,19 @@ function Get-MarketKey($row) {
     return "match_winner"
 }
 
-function Get-PathName($row) {
+function Get-PathName($row, $betMetadata) {
+    if ($row.PSObject.Properties.Name -contains "path" -and -not [string]::IsNullOrWhiteSpace($row.path)) {
+        $path = [string]$row.path
+        if ($path -ne "loaded" -and $path -ne "unknown") {
+            return $path
+        }
+    }
+    if (($row.PSObject.Properties.Name -contains "bet_id") -and $betMetadata.ContainsKey([string]$row.bet_id)) {
+        $metaPath = [string]$betMetadata[[string]$row.bet_id].path
+        if (-not [string]::IsNullOrWhiteSpace($metaPath)) {
+            return $metaPath
+        }
+    }
     if ($row.PSObject.Properties.Name -contains "path" -and -not [string]::IsNullOrWhiteSpace($row.path)) {
         return [string]$row.path
     }
@@ -46,12 +64,45 @@ $rows = Get-Content $LedgerPath | ForEach-Object {
     $_ -and $_.ts -and ([datetimeoffset]::Parse($_.ts) -ge $fromTs) -and ([datetimeoffset]::Parse($_.ts) -le $toTs)
 }
 
+$betMetadata = @{}
+foreach ($row in $rows) {
+    if (-not ($row.PSObject.Properties.Name -contains "bet_id") -or [string]::IsNullOrWhiteSpace($row.bet_id)) {
+        continue
+    }
+
+    $betId = [string]$row.bet_id
+    if (-not $betMetadata.ContainsKey($betId)) {
+        $betMetadata[$betId] = [ordered]@{
+            path = ""
+            market_key = ""
+        }
+    }
+
+    if (($row.PSObject.Properties.Name -contains "path") -and -not [string]::IsNullOrWhiteSpace($row.path)) {
+        $path = [string]$row.path
+        if ($path -ne "loaded" -and $path -ne "unknown") {
+            $betMetadata[$betId].path = $path
+        } elseif ([string]::IsNullOrWhiteSpace($betMetadata[$betId].path)) {
+            $betMetadata[$betId].path = $path
+        }
+    }
+
+    if (($row.PSObject.Properties.Name -contains "market_key") -and -not [string]::IsNullOrWhiteSpace($row.market_key)) {
+        $marketKey = [string]$row.market_key
+        if ($marketKey -ne "unknown") {
+            $betMetadata[$betId].market_key = $marketKey
+        } elseif ([string]::IsNullOrWhiteSpace($betMetadata[$betId].market_key)) {
+            $betMetadata[$betId].market_key = $marketKey
+        }
+    }
+}
+
 $reportRows = @{}
 
 foreach ($row in $rows) {
     $prefix = Get-MatchPrefix ([string]$row.match_key)
-    $market = Get-MarketKey $row
-    $path = Get-PathName $row
+    $market = Get-MarketKey $row $betMetadata
+    $path = Get-PathName $row $betMetadata
     $bucketKey = "$prefix|$market|$path"
 
     if (-not $reportRows.ContainsKey($bucketKey)) {

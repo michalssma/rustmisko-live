@@ -23,7 +23,7 @@ const LOGS_DIR    = path.join(ROOT, 'logs');
 
 // ── Current system strategy (update when alert_bot tuning changes) ──────────
 const STRATEGY = {
-  updated: '2026-03-10',
+  updated: '2026-03-12',
   score_edge: {
     min_edge_default: 38,
     cs2_map_winner_min_edge: 28,
@@ -36,7 +36,7 @@ const STRATEGY = {
       low:   { label: 'LOW (<70%)',                  max_odds: 1.60 },
     },
     stakes: {
-      cs2:        { base: 3.00, note: 'Score-edge path' },
+      cs2:        { base: 3.00, note: 'Score-edge path (includes promoted esports::→CS2)' },
       football:   { base: 3.00, note: 'Score-edge path' },
       tennis:     { base: 0.50, note: 'Reduced — volatile' },
       basketball: { base: 0.50, note: 'Reduced — volatile' },
@@ -47,8 +47,13 @@ const STRATEGY = {
     min_disc_global: 28,
     tennis_min_disc: 24,
     stake_formula: '$0.50 × (1.25/odds)^1.5 (max $1.00)',
+    tennis_disc_tiers: {
+      standard: { range: '24-35%', multiplier: '1.0×' },
+      strong:   { range: '35-45%', multiplier: '1.5×' },
+      extreme:  { range: '45%+',   multiplier: '2.0×' },
+    },
     sports: {
-      tennis:     { enabled: true,  note: 'set diff ≥1, underdog 40%+' },
+      tennis:     { enabled: true,  note: 'set diff ≥1, underdog 40%+, disc-tiered staking' },
       basketball: { enabled: true,  note: 'score confirmation required' },
       football:   { enabled: false, note: 'WR=40%, net loss' },
       esports:    { enabled: false, note: 'WR=52%, net loss' },
@@ -58,8 +63,10 @@ const STRATEGY = {
     daily_loss_limit: 30,
     min_bankroll: 10,
     block_generic_esports: true,
-    promotion_gate: 'esports:: → auto-bet only if high-confidence sport family confirmed',
-    total_guards: 27,
+    promotion_gate: 'A1: Kill ALL generic esports:: | A2: Promote to CS2 model via Azuro-derived sport or team markers (medium OK)',
+    azuro_derived_sport: 'Fuzzy-matched Azuro odds reveal actual sport from match_key prefix',
+    cs2_team_markers: '45 teams (Tier 1-3) as fallback when Azuro prefix unavailable',
+    total_guards: 29,
   },
 };
 

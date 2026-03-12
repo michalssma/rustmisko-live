@@ -228,6 +228,50 @@ enum WsGateResult {
     Disabled,
 }
 
+#[derive(Debug, Clone)]
+struct LegacyWsWatchdogStatus {
+    enabled: bool,
+    newest_age_ms: Option<u64>,
+}
+
+impl LegacyWsWatchdogStatus {
+    fn is_stale(&self, stale_after_ms: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.newest_age_ms {
+            Some(age_ms) => age_ms > stale_after_ms,
+            None => true,
+        }
+    }
+
+    fn age_for_log(&self) -> i64 {
+        if !self.enabled {
+            -2
+        } else {
+            self.newest_age_ms.map(|age| age as i64).unwrap_or(-1)
+        }
+    }
+}
+
+fn legacy_ws_watchdog_status(
+    cache: &HashMap<String, WsConditionEntry>,
+    gate_enabled: bool,
+) -> LegacyWsWatchdogStatus {
+    let newest_age_ms = cache
+        .values()
+        .map(|entry| entry.updated_at.elapsed().as_millis() as u64)
+        .min();
+    LegacyWsWatchdogStatus {
+        enabled: gate_enabled,
+        newest_age_ms,
+    }
+}
+
+fn feed_signal_stale(age_ms: i64, stale_after_ms: i64) -> bool {
+    age_ms < 0 || age_ms > stale_after_ms
+}
+
 /// Check WS condition cache for pre-flight gate decision
 fn ws_gate_check(cache: &HashMap<String, WsConditionEntry>, condition_id: &str, gate_enabled: bool) -> WsGateResult {
     if !gate_enabled {
@@ -495,10 +539,10 @@ fn sport_score_edge_dry_run_enabled(sport: &str) -> bool {
 /// preferred_market: "map_winner" | "match_winner"
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
-        // Esports: prefer map_winner, but allow match_winner fallback when map market is missing.
-        // Raised 28→38%: production data shows edge<40% bucket WR=42% vs need=51% → -EV. Only edge 40-50% was profitable.
+        // Concrete esports families: prefer map_winner, but allow match_winner fallback when map market is missing.
+        // Slightly relaxed 38→35 after market identity + dedup cleanup to restore some safe throughput.
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol"
-            => (true, 38.0, 1.0, "match_or_map"),
+            => (true, 35.0, 1.0, "match_or_map"),
         // Generic esports: same 38% threshold, blocked regardless by BLOCK_GENERIC_ESPORTS_BETS
         "esports"
             => (true, 38.0, 1.0, "match_or_map"),
@@ -658,6 +702,19 @@ fn anomaly_stake_for_odds(azuro_odds: f64) -> f64 {
     (AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD * scale)
         .max(AUTO_BET_ODDS_ANOMALY_STAKE_FLOOR)
         .min(AUTO_BET_ODDS_ANOMALY_STAKE_CAP)
+}
+
+/// A3: Tennis anomaly confidence-tiered multiplier based on discrepancy size.
+/// Higher discrepancy = more confident the odds are mispriced = larger stake.
+/// Kelly basis: half-Kelly at ~4.65% bankroll for 66.7% WR at 1.55 avg odds.
+fn tennis_anomaly_disc_multiplier(discrepancy_pct: f64) -> f64 {
+    if discrepancy_pct >= 45.0 {
+        2.0  // Extreme anomaly: 2× base
+    } else if discrepancy_pct >= 35.0 {
+        1.5  // Strong anomaly: 1.5× base
+    } else {
+        1.0  // Standard anomaly (24-35%): 1× base
+    }
 }
 
 fn anomaly_min_disc_autobet(sport: &str) -> f64 {
@@ -1444,6 +1501,68 @@ fn parse_dust2_map_score(detailed: &str) -> Option<(i32, i32)> {
     None
 }
 
+fn parse_cs2_score_pair(segment: &str) -> Option<(i32, i32)> {
+    let trimmed = segment.trim();
+    let parts: Vec<&str> = trimmed.split(':').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let (Ok(a), Ok(b)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) else {
+        return None;
+    };
+    if !(0..=30).contains(&a) || !(0..=30).contains(&b) {
+        return None;
+    }
+    Some((a, b))
+}
+
+fn parse_cs2_score_segments(detailed: &str) -> (Vec<(i32, i32)>, bool) {
+    if !detailed.to_lowercase().contains("mapa") {
+        return (Vec::new(), false);
+    }
+
+    let score_area = detailed
+        .split('|')
+        .last()
+        .unwrap_or(detailed)
+        .split_once('-')
+        .map(|(_, tail)| tail)
+        .unwrap_or(detailed);
+
+    let raw_segments: Vec<&str> = score_area
+        .split(',')
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    let mut scores = Vec::new();
+    let mut trailing_incomplete = false;
+
+    for (index, segment) in raw_segments.iter().enumerate() {
+        if let Some(score) = parse_cs2_score_pair(segment) {
+            scores.push(score);
+            continue;
+        }
+
+        if index == raw_segments.len() - 1 {
+            let normalized = segment.trim();
+            if normalized.contains(':') {
+                trailing_incomplete = true;
+            }
+        }
+    }
+
+    (scores, trailing_incomplete)
+}
+
+fn has_cs2_incomplete_current_map_score(detailed: &str) -> bool {
+    let Some(current_map_num) = parse_cs2_current_map(detailed) else {
+        return false;
+    };
+    let (scores, trailing_incomplete) = parse_cs2_score_segments(detailed);
+    trailing_incomplete && (current_map_num as usize > scores.len())
+}
+
 /// Universal CS2/esports round score extractor — tries all formats.
 /// Returns Some((round1, round2)) from any source format.
 fn parse_esports_round_score(detailed: &str) -> Option<(i32, i32)> {
@@ -1761,26 +1880,13 @@ fn parse_cs2_round_score(detailed: &str) -> Option<(i32, i32)> {
         return None;
     }
 
-    // Find all X:Y patterns in the string
-    let re_scores: Vec<(i32, i32)> = detailed
-        .split(|c: char| c == ',' || c == '|' || c == '-')
-        .filter_map(|segment| {
-            let trimmed = segment.trim();
-            // Match pure "X:Y" where X and Y are 0-30 (CS2 round range)
-            let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() == 2 {
-                if let (Ok(a), Ok(b)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
-                    if a >= 0 && a <= 30 && b >= 0 && b <= 30 {
-                        return Some((a, b));
-                    }
-                }
-            }
-            None
-        })
-        .collect();
+    let (scores, trailing_incomplete) = parse_cs2_score_segments(detailed);
+    let current_map_num = parse_cs2_current_map(detailed).unwrap_or(1) as usize;
+    if trailing_incomplete && current_map_num > scores.len() {
+        return None;
+    }
 
-    // Last score = current map being played
-    re_scores.last().copied()
+    scores.last().copied()
 }
 
 /// Parse the current map number from detailed_score.
@@ -1804,28 +1910,30 @@ fn parse_cs2_current_map(detailed: &str) -> Option<u8> {
 /// Parse all completed map scores from detailed_score.
 /// "Lepší ze 3 | 3.mapa - 13:6, 9:13, 7:12" → [(13,6), (9,13)] (completed maps only, not current)
 fn parse_cs2_completed_maps(detailed: &str) -> Vec<(i32, i32)> {
-    let all_scores: Vec<(i32, i32)> = detailed
-        .split(|c: char| c == ',' || c == '|' || c == '-')
-        .filter_map(|segment| {
-            let trimmed = segment.trim();
-            let parts: Vec<&str> = trimmed.split(':').collect();
-            if parts.len() == 2 {
-                if let (Ok(a), Ok(b)) = (parts[0].trim().parse::<i32>(), parts[1].trim().parse::<i32>()) {
-                    if a >= 0 && a <= 30 && b >= 0 && b <= 30 {
-                        return Some((a, b));
-                    }
-                }
-            }
-            None
-        })
-        .collect();
+    let (all_scores, trailing_incomplete) = parse_cs2_score_segments(detailed);
 
-    // All scores except the last one (which is the current map in progress)
+    if trailing_incomplete {
+        return all_scores;
+    }
+
     if all_scores.len() > 1 {
         all_scores[..all_scores.len() - 1].to_vec()
     } else {
         Vec::new()
     }
+}
+
+fn is_cs2_incomplete_map_score_hold_state(
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if !is_cs2_like(esports_family, detailed) {
+        return false;
+    }
+
+    detailed
+        .map(has_cs2_incomplete_current_map_score)
+        .unwrap_or(false)
 }
 
 fn cs2_round_edge_max_odds_override(
@@ -1916,8 +2024,32 @@ fn strip_map_winner_suffix(key: &str) -> String {
     key.to_string()
 }
 
+fn is_map_winner_market(match_key: &str, market_key: &str) -> bool {
+    let market = market_key.trim().to_lowercase();
+    if market.starts_with("map") && market.ends_with("_winner") {
+        return true;
+    }
+    strip_map_winner_suffix(match_key) != match_key
+}
+
 fn scoped_condition_key(base_match_key: &str, condition_id: &str) -> String {
     format!("{}|{}", base_match_key, condition_id)
+}
+
+fn market_dedup_key(match_key: &str, market_key: &str) -> String {
+    let base_match_key = strip_map_winner_suffix(match_key);
+    let inferred_market = if !market_key.is_empty() {
+        market_key.to_string()
+    } else if base_match_key != match_key {
+        match_key
+            .rsplit("::")
+            .next()
+            .unwrap_or("match_winner")
+            .to_string()
+    } else {
+        "match_winner".to_string()
+    };
+    format!("{}::{}", base_match_key, inferred_market)
 }
 
 fn normalize_team_name(name: &str) -> String {
@@ -2105,8 +2237,19 @@ struct EsportsClassification {
 }
 
 const ESPORTS_CS2_MARKERS: &[&str] = &[
-    "3dmax", "themongolz", "mongolz", "ursa", "enceacademy", "hotu", "eyeballers",
-    "9ine", "oddik", "mibr", "nrg", "sharks", "redcanids", "fluxo", "imperialesports",
+    // Tier 1: confirmed from cs2:: match keys in ledger
+    "3dmax", "bebop", "kogutoslos", "lilmix", "metizport", "nemesis", "nemiga",
+    "qwentry", "ruby", "sangal", "zajezdzacze",
+    // Tier 2: well-known CS2 orgs
+    "themongolz", "mongolz", "hotu", "eyeballers", "9ine", "oddik", "mibr",
+    "nrg", "sharks", "redcanids", "fluxo", "imperialesports", "enceacademy",
+    "astralis", "furia", "heroic", "ence", "eternalfire", "havu", "sashi",
+    "fnatic", "g2esports", "liquid", "faze", "mouz", "mouznxt", "vitality",
+    "navi", "complexity", "big", "m80", "pain", "vincerenatus",
+    // Tier 3: frequent in esports:: ledger and CS2-only
+    "favbet", "aurora", "sparta", "cybershoke", "noir", "novaq",
+    "arcred", "aimclub", "groundzero", "waze", "hashiras", "rooster",
+    "betclic", "olybet", "gank",
 ];
 const ESPORTS_DOTA2_MARKERS: &[&str] = &[
     "yellowsubmarine", "runeeaters", "gaiminggladiators", "xtremegaming", "parivision",
@@ -2222,7 +2365,14 @@ fn generic_esports_auto_bet_allowed(
         None => return false,
     };
 
-    if esports_confidence != "high" {
+    // A2: CS2 promotion gate — allow medium confidence (team markers) for CS2.
+    // CS2 marker list is large enough for reliable classification.
+    // Other esports families still require high confidence.
+    let confidence_ok = match family {
+        "cs2" => matches!(esports_confidence, "high" | "medium"),
+        _ => esports_confidence == "high",
+    };
+    if !confidence_ok {
         return false;
     }
 
@@ -2231,6 +2381,8 @@ fn generic_esports_auto_bet_allowed(
         "resolved_sport" => resolved_sport
             .and_then(canonicalize_esports_family)
             .is_some_and(|resolved| resolved == family),
+        // A2: team_marker reason is valid for CS2 (medium confidence)
+        "team_marker" => family == "cs2",
         _ => false,
     }
 }
@@ -3051,7 +3203,11 @@ fn find_score_edges(
             live.payload.detailed_score.as_deref(),
             live_esports_class.family,
         );
-        if cs2_reset_hold_state || cs2_round_rewind_hold_state || cs2_map_rollover_hold_state {
+        let cs2_incomplete_map_score_hold_state = is_cs2_incomplete_map_score_hold_state(
+            live.payload.detailed_score.as_deref(),
+            live_esports_class.family,
+        );
+        if cs2_reset_hold_state || cs2_round_rewind_hold_state || cs2_map_rollover_hold_state || cs2_incomplete_map_score_hold_state {
             tracker.backward_scores.remove(*match_key);
             let suppress_duplicate = tracker.edge_cooldown.get(*match_key)
                 .map(|ts| (now - *ts).num_seconds() < 45)
@@ -3059,6 +3215,8 @@ fn find_score_edges(
             if !suppress_duplicate {
                 let hold_reason = if cs2_round_rewind_hold_state {
                     "ScoreRoundRewind"
+                } else if cs2_incomplete_map_score_hold_state {
+                    "ScoreCurrentMapPartial"
                 } else if cs2_map_rollover_hold_state {
                     "ScoreMapRolloverPending"
                 } else {
@@ -3321,6 +3479,12 @@ fn find_score_edges(
         let is_dota2 = match_key.starts_with("dota-2::");
         let is_basketball = match_key.starts_with("basketball::");
         let is_mma = match_key.starts_with("mma::");
+        // A2: Promote esports:: with classified CS2 family to CS2 probability model
+        let is_promoted_cs2 = match_key.starts_with("esports::") && live_esports_class.family == Some("cs2");
+        // Also promote dota/lol/valorant from esports:: to their native models
+        let is_promoted_dota2 = match_key.starts_with("esports::") && live_esports_class.family == Some("dota-2");
+        let is_promoted_lol = match_key.starts_with("esports::") && live_esports_class.family == Some("league-of-legends");
+        let is_promoted_valorant = match_key.starts_with("esports::") && live_esports_class.family == Some("valorant");
 
         // Football: RE-ENABLED with detailed_score minute guard.
         // Previous bug (Campbelltown loss) was caused by corrupted detailed_score prefix
@@ -3359,7 +3523,7 @@ fn find_score_edges(
                     continue;
                 }
             }
-        } else if is_dota2 {
+        } else if is_dota2 || is_promoted_dota2 {
             // Dota-2 feed can be either kill score or map score.
             // Current Tipsport live feed exposes map score like 0-1 plus "2. mapa" in detailed_score.
             let ds_lower = live.payload.detailed_score.as_deref().unwrap_or("").to_lowercase();
@@ -3379,7 +3543,7 @@ fn find_score_edges(
                     continue;
                 }
             }
-        } else if is_lol || is_valorant {
+        } else if is_lol || is_promoted_lol || is_valorant || is_promoted_valorant {
             // LoL / Valorant: Bo3/Bo5 MAP scores (same model as CS2 maps)
             // LoL: map (game) scores 0-2 in Bo3, 0-3 in Bo5
             // Valorant: map scores 0-2 in Bo3
@@ -3419,27 +3583,24 @@ fn find_score_edges(
                 }
             }
         } else {
-            // CS2: scores can be round-level or map-level
-            // But FIRST: sanity check for generic "esports::" keys.
-            // Tipsport sends e-football (FIFA) AND e-basketball (NBA 2K) under
-            // the same "esports" label. Their scores look like:
-            //   e-basketball: 36-30, 100-98 (NBA-style point scores)
-            //   e-football:   2-1, 3-0 (FIFA goal counts) → ambiguous with CS2 map scores
-            //   CS2 rounds:   12-4, 8-7 (same range as football → indistinguishable)
-            //   CS2 maps:     1-0, 2-1 (same as football goals → indistinguishable)
-            // Filter: scores > 30 are definitely NOT CS2 (basketball garbage)
-            // For scores ≤ 30, we have to trust the data source labeling.
+            // CS2 + promoted-CS2: scores can be round-level or map-level
+            // A1: Block unclassified esports:: — only allow explicit cs2:: or promoted CS2
+            if match_key.starts_with("esports::") && !is_promoted_cs2 {
+                info!("  🛑 {} A1 BLOCK: unclassified esports:: (family={:?}, confidence={}) — not CS2 promoted, skipping generic model",
+                    match_key, live_esports_class.family, live_esports_class.confidence);
+                continue;
+            }
+            // Sanity check for promoted esports:: → CS2 keys
+            // Score > 30 is definitely NOT CS2 (e-basketball garbage that slipped through)
             if match_key.starts_with("esports::") {
                 let max_s = s1.max(s2);
                 if max_s > 30 {
-                    info!("  ⏭️ {} {}-{}: esports score > 30 (e-basketball or parse garbage), skipping",
+                    info!("  ⏭️ {} {}-{}: promoted CS2 but score > 30 (e-basketball or parse garbage), skipping",
                         match_key, s1, s2);
                     continue;
                 }
-                if !matches!(live_esports_class.confidence, "high" | "medium") {
-                    info!("  ⚠️  {} is generic esports:: key (not concretely classified) — team names may not be CS2. Score {}-{}",
-                        match_key, s1, s2);
-                }
+                info!("  ✅ {} A2 PROMOTED: esports::→CS2 model (family={:?}, confidence={}, reason={})",
+                    match_key, live_esports_class.family, live_esports_class.confidence, live_esports_class.reason);
             }
             // Phase 1: CS2 match_winner from round scores
             // When live_score is round-level (max > 3), try to compute
@@ -3526,8 +3687,8 @@ fn find_score_edges(
         } else { None };
 
         // Only cross-validate for CS2/esports matches with round-level scores
-        let is_cs2_like = match_key.starts_with("cs2::") || match_key.starts_with("esports::");
-        let (cv_skip, cv_stake_mult) = if FF_CROSS_VALIDATION && is_cs2_like && s1.max(s2) > 3 {
+        let is_cs2_like_match = match_key.starts_with("cs2::") || match_key.starts_with("esports::");
+        let (cv_skip, cv_stake_mult) = if FF_CROSS_VALIDATION && is_cs2_like_match && s1.max(s2) > 3 {
             cross_validation_check(Some((s1, s2)), chance_round)
         } else {
             (false, 1.0) // non-CS2 or non-round-level → skip validation
@@ -3535,13 +3696,13 @@ fn find_score_edges(
 
         // RESYNC OBSERVABILITY: log mismatches but NO hard skip/freeze
         // cv_skip is always false now — mismatch just reduces stake to 0.5x
-        if FF_RESYNC_FREEZE && is_cs2_like && cv_stake_mult < 1.0 {
+        if FF_RESYNC_FREEZE && is_cs2_like_match && cv_stake_mult < 1.0 {
             // Record mismatch for tracking (no blocking)
             let rs = resync_freeze.entry(match_key.to_string()).or_insert_with(ResyncState::new);
             rs.record_mismatch();
             info!("  ⚠️ {} CROSS-VAL MISMATCH (hedged 0.5x): HLTV={}-{} vs Chance={:?} detailed='{}'",
                 match_key, s1, s2, chance_round, detailed);
-        } else if FF_RESYNC_FREEZE && is_cs2_like && cv_stake_mult > 1.0 {
+        } else if FF_RESYNC_FREEZE && is_cs2_like_match && cv_stake_mult > 1.0 {
             // Agreement — clear any previous mismatch state
             if resync_freeze.contains_key(&match_key.to_string()) {
                 resync_freeze.remove(&match_key.to_string());
@@ -3555,7 +3716,7 @@ fn find_score_edges(
         }
 
         // Cross-map momentum bonus (for match_winner, not map_winner)
-        let momentum_bonus = if FF_CROSS_MAP_MOMENTUM && is_cs2_like && !detailed.is_empty() {
+        let momentum_bonus = if FF_CROSS_MAP_MOMENTUM && is_cs2_like_match && !detailed.is_empty() {
             let completed = parse_cs2_completed_maps(detailed);
             cross_map_momentum_bonus(&completed, leading_side)
         } else { 0.0 };
@@ -3600,32 +3761,45 @@ fn find_score_edges(
             None
         };
         let odds_lookup_key: &str = resolved_alt_key.as_deref().unwrap_or(match_key);
-        let resolved_sport_for_odds: &str = odds_lookup_key.split("::").next().unwrap_or("");
+        let mut resolved_sport_for_odds: &str = odds_lookup_key.split("::").next().unwrap_or("");
         if resolved_alt_key.is_some() {
             info!("  🔗 {} → esports→Azuro resolved: {}", match_key, odds_lookup_key);
         }
 
-        let map_odds_list_opt: Option<&Vec<MapWinnerOdds>> = map_winners_by_match
+        let map_odds_list_opt: Option<(&str, &Vec<MapWinnerOdds>)> = map_winners_by_match
             .get(odds_lookup_key)
+            .map(|list| (odds_lookup_key, list))
             .or_else(|| {
-                map_winners_by_match.iter().find_map(|(_k, list)| {
+                map_winners_by_match.iter().find_map(|(k, list)| {
                     if list.iter().any(|mw| teams_match_loose(
                         &live.payload.team1,
                         &live.payload.team2,
                         &mw.team1,
                         &mw.team2,
                     )) {
-                        Some(list)
+                        Some((k.as_ref(), list))
                     } else {
                         None
                     }
                 })
             });
 
+        // Azuro-derived sport from map_winner lookup (backfill before map-winner uses it)
+        if let Some((mw_key, _)) = map_odds_list_opt {
+            if match_key.starts_with("esports::") && resolved_sport_for_odds == "esports" {
+                let mw_prefix = mw_key.split("::").next().unwrap_or("");
+                if mw_prefix != "esports" && !mw_prefix.is_empty() && canonicalize_esports_family(mw_prefix).is_some() {
+                    info!("  🔬 {} AZURO-DERIVED SPORT (map_winner): fuzzy match reveals sport='{}' from key '{}'",
+                        match_key, mw_prefix, mw_key);
+                    resolved_sport_for_odds = mw_key.split("::").next().unwrap_or("esports");
+                }
+            }
+        }
+
         // === STEP 1: Check MAP WINNER edges FIRST (highest priority) ===
         if max_score > 3 && diff >= 3 {
             // This is a round-level score within a CS2 map
-            if let Some(map_odds_list) = map_odds_list_opt {
+            if let Some((_, map_odds_list)) = map_odds_list_opt {
                 // CS2 map win probability: based on (diff, total_rounds)
                 // Half-switch at round 13: CT→T or T→CT — changes momentum
                 // Early game (total ≤ 12): high variance, half-switch coming
@@ -3773,6 +3947,45 @@ fn find_score_edges(
             continue;
         }
 
+        // Root-cause safety gate: CS2 round-level score is reliable for active-map
+        // markets, but not for whole-series match_winner. Recent realized PnL shows
+        // this fallback is structurally mispriced, so disable it until a dedicated
+        // series-state model is reworked and revalidated.
+        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref())
+            && leading_maps.max(losing_maps) > 3
+        {
+            info!(
+                "  🛑 {} {}-{}: CS2 round-level score cannot safely drive match_winner — skipping fallback edge",
+                match_key, s1, s2
+            );
+            if should_audit_esports_score_decision(
+                match_key,
+                live_esports_class.family,
+                live_esports_class.confidence,
+            ) {
+                append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                    "match_key": match_key,
+                    "path": "score_model",
+                    "decision": "blocked_candidate",
+                    "reason_code": "RoundScoreMatchWinnerDisabled",
+                    "reason_codes": ["RoundScoreMatchWinnerDisabled"],
+                    "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                    "esports_family": live_esports_class.family,
+                    "sport_confidence": live_esports_class.confidence,
+                    "sport_reason": live_esports_class.reason,
+                    "team1": live.payload.team1,
+                    "team2": live.payload.team2,
+                    "raw_score1": raw_s1,
+                    "raw_score2": raw_s2,
+                    "score1": s1,
+                    "score2": s2,
+                    "live_status": live.payload.status,
+                    "detailed_score": live.payload.detailed_score,
+                }));
+            }
+            continue;
+        }
+
         // Get current Azuro odds for match winner
         let azuro = match azuro_by_match.get(odds_lookup_key).copied().or_else(|| {
             azuro_by_match.values().find(|item| {
@@ -3804,6 +4017,17 @@ fn find_score_edges(
         if !is_recent_seen_at(&azuro.seen_at, now) {
             info!("  ⏭️ {} {}-{}: azuro match_winner stale, skipping", match_key, s1, s2);
             continue;
+        }
+
+        // Azuro-derived sport: when fuzzy match found Azuro odds, extract
+        // sport from the Azuro item's match_key prefix. More reliable than team markers.
+        if match_key.starts_with("esports::") && resolved_sport_for_odds == "esports" {
+            let azuro_prefix = azuro.match_key.split("::").next().unwrap_or("");
+            if azuro_prefix != "esports" && !azuro_prefix.is_empty() && canonicalize_esports_family(azuro_prefix).is_some() {
+                info!("  🔬 {} AZURO-DERIVED SPORT: fuzzy match reveals sport='{}' from Azuro key '{}'",
+                    match_key, azuro_prefix, &azuro.match_key);
+                resolved_sport_for_odds = azuro.match_key.split("::").next().unwrap_or("esports");
+            }
         }
 
         // Resolve correct Azuro side by TEAM NAME — HARD BLOCK if ambiguous
@@ -4064,11 +4288,47 @@ fn rewrite_pending_claims_file(active_bets: &[ActiveBet], pending_claims_path: &
         use std::io::Write;
         for bet in active_bets {
             let tid = bet.token_id.as_deref().unwrap_or("?");
-            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 tid, bet.bet_id, bet.match_key,
-                bet.value_team, bet.amount_usd, bet.odds);
+                bet.value_team, bet.amount_usd, bet.odds,
+                bet.team1, bet.team2, bet.market_key);
         }
     }
+}
+
+/// Extract display-friendly team names: prefer real names, fallback to match_key parts
+fn display_teams(bet: &ActiveBet) -> (String, String) {
+    let t1 = if !bet.team1.is_empty() && bet.team1 != "?" {
+        bet.team1.clone()
+    } else {
+        match_key_team_parts(&bet.match_key).map(|(a, _)| a).unwrap_or_else(|| "?".to_string())
+    };
+    let t2 = if !bet.team2.is_empty() && bet.team2 != "?" {
+        bet.team2.clone()
+    } else {
+        match_key_team_parts(&bet.match_key).map(|(_, b)| b).unwrap_or_else(|| "?".to_string())
+    };
+    (t1, t2)
+}
+
+/// Resolve display name for a bet: prefer value_team, fallback to match_key parsing, then tokenId
+fn bet_display_name(bet: &ActiveBet) -> String {
+    if !bet.value_team.is_empty() && bet.value_team != "?" {
+        return bet.value_team.clone();
+    }
+    // Derive from match_key: "tennis::annli_vs_gibsontalia" → "annli vs gibsontalia"
+    if let Some(tail) = bet.match_key.split("::").nth(1) {
+        return tail.replace("_vs_", " vs ").replace('_', " ");
+    }
+    format!("#{}", bet.token_id.as_deref().unwrap_or("?"))
+}
+
+fn display_sport(bet: &ActiveBet) -> String {
+    bet.match_key.split("::").next().unwrap_or("?").to_uppercase()
+}
+
+fn display_market(bet: &ActiveBet) -> &str {
+    if bet.market_key.is_empty() || bet.market_key == "unknown" { "match_winner" } else { &bet.market_key }
 }
 
 fn should_count_loss_streak(bet: &ActiveBet) -> bool {
@@ -4171,25 +4431,80 @@ fn reconcile_active_bets_with_executor_snapshot(
         needs_rewrite = true;
     }
 
+    let (ledger_meta_by_bet_id, ledger_meta_by_token_id) = load_ledger_bet_metadata();
+    for bet in active_bets.iter_mut() {
+        if enrich_active_bet_from_ledger_metadata(
+            bet,
+            &ledger_meta_by_bet_id,
+            &ledger_meta_by_token_id,
+        ) {
+            needs_rewrite = true;
+        }
+    }
+
     let local_tids: HashSet<String> = active_bets.iter()
         .filter_map(|b| b.token_id.clone())
         .collect();
     for (tid, team, odds, amount, match_key, bet_id) in &onchain_enriched {
-        if !local_tids.contains(tid) && !team.is_empty() {
+        if !local_tids.contains(tid) {
+            let ledger_meta = ledger_meta_by_token_id.get(tid)
+                .or_else(|| ledger_meta_by_bet_id.get(bet_id));
+            let (eff_team, eff_t1, eff_t2, eff_market_key, eff_condition_id, eff_outcome_id, eff_graph_bet_id) =
+                if let Some(meta) = ledger_meta {
+                    (
+                        if !meta.value_team.is_empty() { meta.value_team.clone() } else { format!("{} vs {}", meta.team1, meta.team2) },
+                        meta.team1.clone(),
+                        meta.team2.clone(),
+                        meta.market_key.clone(),
+                        meta.condition_id.clone(),
+                        meta.outcome_id.clone(),
+                        meta.graph_bet_id.clone(),
+                    )
+                } else if !team.is_empty() {
+                    (
+                        team.clone(),
+                        team.clone(),
+                        "?".to_string(),
+                        market_from_match_key(match_key),
+                        String::new(),
+                        String::new(),
+                        None,
+                    )
+                } else if let Some((t1, t2)) = match_key_team_parts(match_key) {
+                    (
+                        format!("{} vs {}", t1, t2),
+                        t1,
+                        t2,
+                        market_from_match_key(match_key),
+                        String::new(),
+                        String::new(),
+                        None,
+                    )
+                } else {
+                    (
+                        format!("Bet #{}", tid),
+                        "?".to_string(),
+                        "?".to_string(),
+                        market_from_match_key(match_key),
+                        String::new(),
+                        String::new(),
+                        None,
+                    )
+                };
             active_bets.push(ActiveBet {
                 alert_id: 0,
                 bet_id: if !bet_id.is_empty() { bet_id.clone() } else { format!("onchain_{}", tid) },
                 match_key: match_key.clone(),
-                market_key: "unknown".to_string(),
-                team1: team.clone(),
-                team2: "?".to_string(),
-                value_team: team.clone(),
+                market_key: eff_market_key,
+                team1: eff_t1,
+                team2: eff_t2,
+                value_team: eff_team,
                 amount_usd: *amount,
                 odds: *odds,
                 placed_at: "onchain".to_string(),
-                condition_id: String::new(),
-                outcome_id: String::new(),
-                graph_bet_id: None,
+                condition_id: eff_condition_id,
+                outcome_id: eff_outcome_id,
+                graph_bet_id: eff_graph_bet_id,
                 token_id: Some(tid.clone()),
                 path: "onchain".to_string(),
             });
@@ -4271,6 +4586,15 @@ struct ExecutorHealthResponse {
     #[serde(rename = "toolkitAvailable")]
     toolkit_available: Option<bool>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedHubHealthResponse {
+    #[allow(dead_code)]
+    ok: Option<bool>,
+    gql_age_ms: Option<i64>,
+    ws_age_ms: Option<i64>,
+    ws_event_age_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4427,6 +4751,11 @@ fn match_prefix_from_match_key(match_key: &str) -> String {
     match_key.split("::").next().unwrap_or("unknown").to_string()
 }
 
+fn is_missing_display_field(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == "?" || trimmed.eq_ignore_ascii_case("unknown")
+}
+
 #[derive(Debug, Default, Clone)]
 struct LedgerRecoveryStats {
     recovered: usize,
@@ -4434,6 +4763,336 @@ struct LedgerRecoveryStats {
     stale_12h: usize,
     stale_24h: usize,
     oldest_age_hours: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct LedgerBetMetadata {
+    match_key: String,
+    market_key: String,
+    team1: String,
+    team2: String,
+    value_team: String,
+    placed_at: String,
+    path: String,
+    alert_id: Option<u32>,
+    condition_id: String,
+    outcome_id: String,
+    graph_bet_id: Option<String>,
+    token_id: Option<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RuntimeAuditSummary {
+    placed: usize,
+    accepted: usize,
+    bet_failed: usize,
+    won: usize,
+    lost: usize,
+    fail_reasons: Vec<(String, usize)>,
+}
+
+impl RuntimeAuditSummary {
+    fn has_data(&self) -> bool {
+        self.placed > 0 || self.accepted > 0 || self.bet_failed > 0 || self.won > 0 || self.lost > 0
+    }
+}
+
+fn load_ledger_bet_metadata() -> (HashMap<String, LedgerBetMetadata>, HashMap<String, LedgerBetMetadata>) {
+    let mut by_bet_id = HashMap::new();
+    let mut by_token_id = HashMap::new();
+    let ledger_path = "data/ledger.jsonl";
+    if !Path::new(ledger_path).exists() {
+        return (by_bet_id, by_token_id);
+    }
+
+    let Ok(contents) = std::fs::read_to_string(ledger_path) else {
+        return (by_bet_id, by_token_id);
+    };
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        if event != "PLACED" && event != "ON_CHAIN_ACCEPTED" {
+            continue;
+        }
+        let Some(bet_id) = entry.get("bet_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if bet_id.is_empty() {
+            continue;
+        }
+
+        let match_key = entry.get("match_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if match_key.is_empty() {
+            continue;
+        }
+
+        let (fallback_team1, fallback_team2) = match_key_team_parts(&match_key)
+            .unwrap_or_else(|| ("?".to_string(), "?".to_string()));
+        let team1 = entry.get("team1")
+            .and_then(|v| v.as_str())
+            .filter(|v| !is_missing_display_field(v))
+            .unwrap_or(&fallback_team1)
+            .to_string();
+        let team2 = entry.get("team2")
+            .and_then(|v| v.as_str())
+            .filter(|v| !is_missing_display_field(v))
+            .unwrap_or(&fallback_team2)
+            .to_string();
+        let value_team = entry.get("value_team")
+            .and_then(|v| v.as_str())
+            .filter(|v| !is_missing_display_field(v))
+            .or_else(|| entry.get("leading_team").and_then(|v| v.as_str()).filter(|v| !is_missing_display_field(v)))
+            .unwrap_or(&team1)
+            .to_string();
+        let market_key = entry.get("market_key")
+            .and_then(|v| v.as_str())
+            .filter(|v| !is_missing_display_field(v))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| market_from_match_key(&match_key));
+        let token_id = sanitize_token_id(
+            entry.get("token_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        );
+        let placed_at = entry.get("ts")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let path = entry.get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let metadata = LedgerBetMetadata {
+            match_key,
+            market_key,
+            team1,
+            team2,
+            value_team,
+            placed_at,
+            path,
+            alert_id: entry.get("alert_id")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            condition_id: entry.get("condition_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            outcome_id: entry.get("outcome_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            graph_bet_id: entry.get("graph_bet_id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string()),
+            token_id: token_id.clone(),
+        };
+        by_bet_id.insert(bet_id.to_string(), metadata.clone());
+        if let Some(tid) = token_id {
+            by_token_id.insert(tid, metadata);
+        }
+    }
+
+    (by_bet_id, by_token_id)
+}
+
+fn enrich_active_bet_from_ledger_metadata(
+    bet: &mut ActiveBet,
+    by_bet_id: &HashMap<String, LedgerBetMetadata>,
+    by_token_id: &HashMap<String, LedgerBetMetadata>,
+) -> bool {
+    let metadata = bet.token_id.as_ref()
+        .and_then(|tid| by_token_id.get(tid))
+        .or_else(|| by_bet_id.get(&bet.bet_id));
+    let Some(metadata) = metadata else {
+        return false;
+    };
+
+    let mut changed = false;
+    if bet.match_key.is_empty() && !metadata.match_key.is_empty() {
+        bet.match_key = metadata.match_key.clone();
+        changed = true;
+    }
+    if is_missing_display_field(&bet.market_key) && !metadata.market_key.is_empty() {
+        bet.market_key = metadata.market_key.clone();
+        changed = true;
+    }
+    if is_missing_display_field(&bet.team1) && !metadata.team1.is_empty() {
+        bet.team1 = metadata.team1.clone();
+        changed = true;
+    }
+    if is_missing_display_field(&bet.team2) && !metadata.team2.is_empty() {
+        bet.team2 = metadata.team2.clone();
+        changed = true;
+    }
+    if is_missing_display_field(&bet.value_team) && !metadata.value_team.is_empty() {
+        bet.value_team = metadata.value_team.clone();
+        changed = true;
+    }
+    if (bet.placed_at.is_empty() || bet.placed_at == "loaded" || bet.placed_at == "onchain")
+        && !metadata.placed_at.is_empty()
+    {
+        bet.placed_at = metadata.placed_at.clone();
+        changed = true;
+    }
+    if (bet.path.is_empty() || bet.path == "loaded" || bet.path == "onchain")
+        && !metadata.path.is_empty()
+    {
+        bet.path = metadata.path.clone();
+        changed = true;
+    }
+    if bet.alert_id == 0 {
+        if let Some(alert_id) = metadata.alert_id {
+            bet.alert_id = alert_id;
+            changed = true;
+        }
+    }
+    if bet.condition_id.is_empty() && !metadata.condition_id.is_empty() {
+        bet.condition_id = metadata.condition_id.clone();
+        changed = true;
+    }
+    if bet.outcome_id.is_empty() && !metadata.outcome_id.is_empty() {
+        bet.outcome_id = metadata.outcome_id.clone();
+        changed = true;
+    }
+    if bet.graph_bet_id.is_none() && metadata.graph_bet_id.is_some() {
+        bet.graph_bet_id = metadata.graph_bet_id.clone();
+        changed = true;
+    }
+    if bet.token_id.is_none() && metadata.token_id.is_some() {
+        bet.token_id = metadata.token_id.clone();
+        changed = true;
+    }
+    changed
+}
+
+#[derive(Debug, Clone)]
+struct PendingTelegramEntry {
+    line: String,
+    amount: f64,
+    is_live: bool,
+}
+
+fn build_pending_telegram_entry(
+    token_id: &str,
+    status: &str,
+    team: &str,
+    odds: f64,
+    amount: f64,
+    payout: f64,
+    match_key: Option<&str>,
+    ledger_meta_by_token_id: &HashMap<String, LedgerBetMetadata>,
+    live_match_keys: &HashSet<String>,
+) -> PendingTelegramEntry {
+    let meta = ledger_meta_by_token_id.get(token_id);
+    let effective_match_key = match_key
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .or_else(|| meta.map(|m| m.match_key.clone()).filter(|v| !v.is_empty()));
+    let is_live = status == "pending"
+        && effective_match_key
+            .as_ref()
+            .map(|key| live_match_keys.contains(key))
+            .unwrap_or(false);
+
+    let mut detail_parts: Vec<String> = Vec::new();
+    if let Some(meta) = meta {
+        if !meta.path.is_empty() {
+            detail_parts.push(meta.path.clone());
+        }
+        if let Ok(placed) = DateTime::parse_from_rfc3339(&meta.placed_at) {
+            let age_hours = (Utc::now() - placed.with_timezone(&Utc)).num_hours();
+            if age_hours >= 24 {
+                detail_parts.push(format!("{}d STALE", age_hours / 24));
+            } else if age_hours >= 1 {
+                detail_parts.push(format!("{}h", age_hours));
+            } else {
+                let age_mins = (Utc::now() - placed.with_timezone(&Utc)).num_minutes().max(0);
+                detail_parts.push(format!("{}m", age_mins));
+            }
+        }
+    }
+
+    let detail_suffix = if detail_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", detail_parts.join(" · "))
+    };
+    let display_name = if !team.is_empty() {
+        team.to_string()
+    } else if !token_id.is_empty() {
+        format!("#{}", &token_id[..token_id.len().min(8)])
+    } else {
+        "?".to_string()
+    };
+
+    PendingTelegramEntry {
+        line: format!(
+            "  \u{2022} {} @ {:.2} ${:.2}{}{}\n",
+            display_name,
+            odds,
+            amount,
+            if payout > 0.0 { format!(" → ${:.2}", payout) } else { String::new() },
+            detail_suffix
+        ),
+        amount,
+        is_live,
+    }
+}
+
+fn summarize_recent_runtime(hours: i64) -> RuntimeAuditSummary {
+    let mut summary = RuntimeAuditSummary::default();
+    let ledger_path = "data/ledger.jsonl";
+    if !Path::new(ledger_path).exists() {
+        return summary;
+    }
+
+    let Ok(contents) = std::fs::read_to_string(ledger_path) else {
+        return summary;
+    };
+
+    let cutoff = Utc::now() - chrono::Duration::hours(hours);
+    let mut fail_reason_counts: HashMap<String, usize> = HashMap::new();
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ts) = entry.get("ts").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(parsed_ts) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        if parsed_ts.with_timezone(&Utc) < cutoff {
+            continue;
+        }
+        match entry.get("event").and_then(|v| v.as_str()).unwrap_or("") {
+            "PLACED" => summary.placed += 1,
+            "ON_CHAIN_ACCEPTED" => summary.accepted += 1,
+            "BET_FAILED" => {
+                summary.bet_failed += 1;
+                if let Some(reason_code) = entry.get("reason_code").and_then(|v| v.as_str()) {
+                    *fail_reason_counts.entry(reason_code.to_string()).or_insert(0) += 1;
+                }
+            }
+            "WON" => summary.won += 1,
+            "LOST" => summary.lost += 1,
+            _ => {}
+        }
+    }
+
+    let mut fail_reasons: Vec<(String, usize)> = fail_reason_counts.into_iter().collect();
+    fail_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    fail_reasons.truncate(3);
+    summary.fail_reasons = fail_reasons;
+    summary
 }
 
 fn recover_unresolved_accepts_from_ledger(
@@ -5760,7 +6419,7 @@ async fn main() -> Result<()> {
     let mut blacklisted_matches: HashMap<String, std::time::Instant> = HashMap::new();
     const MATCH_BLACKLIST_TTL_SECS: u64 = 600; // 10 min — match-level cooldown (raised from 300s: 3x CondNR on same match within 16min)
 
-    // === DEDUP: track already-bet match keys + condition IDs (persisted across restarts) ===
+    // === DEDUP: track already-bet market scopes + condition IDs (persisted across restarts) ===
     let bet_history_path = "data/bet_history.txt";
     let mut already_bet_matches: HashSet<String> = HashSet::new();
     let mut already_bet_conditions: HashSet<String> = HashSet::new();
@@ -5790,10 +6449,11 @@ async fn main() -> Result<()> {
                     if !is_fresh {
                         continue;
                     }
-                    already_bet_matches.insert(parts[0].to_string());
+                    let history_market_key = parts.get(5).copied().unwrap_or("");
+                    already_bet_matches.insert(market_dedup_key(parts[0], history_market_key));
                     // Extract base match key (strip ::mapN_winner suffix)
                     let base_key = strip_map_winner_suffix(parts[0]);
-                    let is_map_winner_entry = base_key != parts[0];
+                    let is_map_winner_entry = is_map_winner_market(parts[0], history_market_key);
                     already_bet_conditions.insert(scoped_condition_key(&base_key, parts[1]));
                     if is_map_winner_entry {
                         already_bet_map_winners.insert(base_key.clone());
@@ -5809,11 +6469,13 @@ async fn main() -> Result<()> {
 
     // === PENDING CLAIMS: persist token IDs for bets waiting to be claimed ===
     let pending_claims_path = "data/pending_claims.txt";
-    // Format per line: tokenId|betId|matchKey|valueTeam|amountUsd|odds|timestamp
+    // Format per line: tokenId|betId|matchKey|valueTeam|amountUsd|odds|team1|team2|marketKey
     // Load on startup → add to active_bets for auto-claim monitoring
+    let (ledger_meta_by_bet_id, ledger_meta_by_token_id) = load_ledger_bet_metadata();
     if Path::new(pending_claims_path).exists() {
         if let Ok(contents) = std::fs::read_to_string(pending_claims_path) {
             let mut seen_bet_ids: HashSet<String> = HashSet::new();
+            let mut rewrite_pending_claims_on_startup = false;
             for line in contents.lines() {
                 let parts: Vec<&str> = line.split('|').collect();
                 if parts.len() >= 6 {
@@ -5829,6 +6491,26 @@ async fn main() -> Result<()> {
                     let value_team = parts[3].to_string();
                     let amount_usd: f64 = parts[4].parse().unwrap_or(2.0);
                     let odds: f64 = parts[5].parse().unwrap_or(1.5);
+                    // Extended fields (v2 format): team1|team2|market_key
+                    let loaded_team1 = parts.get(6).unwrap_or(&"").to_string();
+                    let loaded_team2 = parts.get(7).unwrap_or(&"").to_string();
+                    let loaded_market = parts.get(8).unwrap_or(&"unknown").to_string();
+                    // Fallback: derive teams from match_key if not stored
+                    let (fb_t1, fb_t2) = match_key_team_parts(&match_key)
+                        .unwrap_or_else(|| (value_team.clone(), "?".to_string()));
+                    let team1 = if !is_missing_display_field(&loaded_team1) { loaded_team1 } else { fb_t1 };
+                    let team2 = if !is_missing_display_field(&loaded_team2) { loaded_team2 } else { fb_t2 };
+                    let market_key = if !is_missing_display_field(&loaded_market) {
+                        loaded_market
+                    } else {
+                        market_from_match_key(&match_key)
+                    };
+                    if is_missing_display_field(parts.get(6).copied().unwrap_or(""))
+                        || is_missing_display_field(parts.get(7).copied().unwrap_or(""))
+                        || is_missing_display_field(parts.get(8).copied().unwrap_or(""))
+                    {
+                        rewrite_pending_claims_on_startup = true;
+                    }
                     // "?" means tokenId not yet discovered — set to None so PATH B will discover it
                     // Also treat tokenId < 1000 as bogus (false positive from recursive extraction)
                     let token_id = if token_id_raw == "?" || token_id_raw.is_empty() {
@@ -5843,13 +6525,13 @@ async fn main() -> Result<()> {
                     } else {
                         Some(token_id_raw)
                     };
-                    active_bets.push(ActiveBet {
+                    let mut restored_bet = ActiveBet {
                         alert_id: 0,
                         bet_id: bet_id.clone(),
                         match_key: match_key.clone(),
-                        market_key: "unknown".to_string(),
-                        team1: value_team.clone(),
-                        team2: "?".to_string(),
+                        market_key,
+                        team1,
+                        team2,
                         value_team: value_team.clone(),
                         amount_usd,
                         odds,
@@ -5859,8 +6541,20 @@ async fn main() -> Result<()> {
                         graph_bet_id: None,
                         token_id,
                         path: "loaded".to_string(),
-                    });
+                    };
+                    if enrich_active_bet_from_ledger_metadata(
+                        &mut restored_bet,
+                        &ledger_meta_by_bet_id,
+                        &ledger_meta_by_token_id,
+                    ) {
+                        rewrite_pending_claims_on_startup = true;
+                    }
+                    active_bets.push(restored_bet);
                 }
+            }
+            if rewrite_pending_claims_on_startup {
+                rewrite_pending_claims_file(&active_bets, pending_claims_path);
+                info!("🧹 Rewrote pending_claims.txt on startup after normalizing stale team/market fields");
             }
             info!("📋 Loaded {} pending claims from file", active_bets.len());
         }
@@ -6100,16 +6794,110 @@ async fn main() -> Result<()> {
                 let already_alerted: HashSet<String> = sent_alerts.iter()
                     .map(|a| a.match_key.clone()).collect();
 
-                // === WATCHDOG: check for feed-hub timeout ===
-                if let Some(last_good) = last_good_data {
+                let watchdog_stale_after_ms = (WATCHDOG_TIMEOUT_SECS * 1000) as i64;
+                let health_watchdog = match client.get(format!("{}/health", feed_hub_url)).send().await {
+                    Ok(resp) => match resp.json::<FeedHubHealthResponse>().await {
+                        Ok(health) => {
+                            let legacy_ws_status = {
+                                let cache_r = ws_condition_cache.read().await;
+                                legacy_ws_watchdog_status(&cache_r, ws_state_gate_enabled)
+                            };
+                            let gql_age_ms = health.gql_age_ms.unwrap_or(-1);
+                            let shadow_ok_age_ms = health.ws_age_ms.unwrap_or(-1);
+                            let shadow_event_age_ms = health.ws_event_age_ms.unwrap_or(-1);
+                            let gql_stale = feed_signal_stale(gql_age_ms, watchdog_stale_after_ms);
+                            let shadow_ok_stale = feed_signal_stale(shadow_ok_age_ms, watchdog_stale_after_ms);
+                            let shadow_event_stale = feed_signal_stale(shadow_event_age_ms, watchdog_stale_after_ms);
+                            let legacy_ws_stale = legacy_ws_status.is_stale(watchdog_stale_after_ms as u64);
+                            let all_signals_stale = gql_stale
+                                && shadow_ok_stale
+                                && shadow_event_stale
+                                && (!legacy_ws_status.enabled || legacy_ws_stale);
+                            let any_signal_fresh = !gql_stale
+                                || !shadow_ok_stale
+                                || !shadow_event_stale
+                                || (legacy_ws_status.enabled && !legacy_ws_stale);
+                            Some((
+                                any_signal_fresh,
+                                all_signals_stale,
+                                gql_age_ms,
+                                shadow_ok_age_ms,
+                                shadow_event_age_ms,
+                                legacy_ws_status.age_for_log(),
+                            ))
+                        }
+                        Err(e) => {
+                            warn!("Feed-hub /health JSON error: {}", e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!("Feed-hub /health request error: {}", e);
+                        None
+                    }
+                };
+
+                let mut watchdog_refreshed_from_health = false;
+                if let Some((any_signal_fresh, all_signals_stale, gql_age_ms, shadow_ok_age_ms, shadow_event_age_ms, legacy_ws_age_ms)) = health_watchdog {
+                    if any_signal_fresh {
+                        last_good_data = Some(std::time::Instant::now());
+                        watchdog_refreshed_from_health = true;
+                        if safe_mode {
+                            safe_mode = false;
+                            let _ = tg_send_message(&client, &token, chat_id,
+                                "✅ Feed-hub telemetry čerstvá. Auto-bety obnoveny.").await;
+                            log_event("SAFE_MODE_OFF", &serde_json::json!({
+                                "reason": "telemetry_fresh",
+                                "gql_age_ms": gql_age_ms,
+                                "shadow_ok_age_ms": shadow_ok_age_ms,
+                                "shadow_event_age_ms": shadow_event_age_ms,
+                                "legacy_ws_age_ms": legacy_ws_age_ms,
+                            }));
+                        }
+                    } else if all_signals_stale {
+                        if let Some(last_good) = last_good_data {
+                            if last_good.elapsed().as_secs() > WATCHDOG_TIMEOUT_SECS && !safe_mode {
+                                safe_mode = true;
+                                let elapsed = last_good.elapsed().as_secs();
+                                warn!(
+                                    "⚠️ SAFE MODE: all feed signals stale for {}s > {}s threshold (gql={}ms shadow_ok={}ms shadow_event={}ms legacy_ws={}ms)",
+                                    elapsed,
+                                    WATCHDOG_TIMEOUT_SECS,
+                                    gql_age_ms,
+                                    shadow_ok_age_ms,
+                                    shadow_event_age_ms,
+                                    legacy_ws_age_ms,
+                                );
+                                let _ = tg_send_message(&client, &token, chat_id,
+                                    &format!(
+                                        "⚠️ <b>SAFE MODE ACTIVATED</b>\n\nVšechny feed signály jsou staré {}s.\nGQL={} ms\nShadow OK={} ms\nShadow event={} ms\nLegacy WS={} ms\n\nAuto-bety POZASTAVENY. Alerty stále fungují.",
+                                        elapsed,
+                                        gql_age_ms,
+                                        shadow_ok_age_ms,
+                                        shadow_event_age_ms,
+                                        legacy_ws_age_ms,
+                                    )
+                                ).await;
+                                log_event("SAFE_MODE_ON", &serde_json::json!({
+                                    "elapsed_secs": elapsed,
+                                    "reason": "all_signals_stale",
+                                    "gql_age_ms": gql_age_ms,
+                                    "shadow_ok_age_ms": shadow_ok_age_ms,
+                                    "shadow_event_age_ms": shadow_event_age_ms,
+                                    "legacy_ws_age_ms": legacy_ws_age_ms,
+                                }));
+                            }
+                        }
+                    }
+                } else if let Some(last_good) = last_good_data {
                     if last_good.elapsed().as_secs() > WATCHDOG_TIMEOUT_SECS && !safe_mode {
                         safe_mode = true;
                         let elapsed = last_good.elapsed().as_secs();
-                        warn!("⚠️ SAFE MODE: Feed-hub silent for {}s > {}s threshold", elapsed, WATCHDOG_TIMEOUT_SECS);
+                        warn!("⚠️ SAFE MODE: feed-hub telemetry unavailable for {}s > {}s threshold", elapsed, WATCHDOG_TIMEOUT_SECS);
                         let _ = tg_send_message(&client, &token, chat_id,
-                            &format!("⚠️ <b>SAFE MODE ACTIVATED</b>\n\nFeed-hub neodpovídá {}s.\nAuto-bety POZASTAVENY.\nAlerty stále fungují.\n\nZkontroluj Chrome tab + Tampermonkey.", elapsed)
+                            &format!("⚠️ <b>SAFE MODE ACTIVATED</b>\n\nFeed-hub telemetry neodpovídá {}s.\nAuto-bety POZASTAVENY.\nAlerty stále fungují.\n\nZkontroluj feed-hub + Chrome tab + Tampermonkey.", elapsed)
                         ).await;
-                        log_event("SAFE_MODE_ON", &serde_json::json!({"elapsed_secs": elapsed}));
+                        log_event("SAFE_MODE_ON", &serde_json::json!({"elapsed_secs": elapsed, "reason": "telemetry_unavailable"}));
                     }
                 }
 
@@ -6118,13 +6906,14 @@ async fn main() -> Result<()> {
                     Ok(resp) => {
                         match resp.json::<StateResponse>().await {
                             Ok(state) => {
-                                // === WATCHDOG: feed-hub is alive ===
-                                last_good_data = Some(std::time::Instant::now());
-                                if safe_mode {
+                                if !watchdog_refreshed_from_health {
+                                    last_good_data = Some(std::time::Instant::now());
+                                }
+                                if safe_mode && !watchdog_refreshed_from_health {
                                     safe_mode = false;
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         "✅ Feed-hub ONLINE. Auto-bety obnoveny.").await;
-                                    log_event("SAFE_MODE_OFF", &serde_json::json!({}));
+                                    log_event("SAFE_MODE_OFF", &serde_json::json!({"reason": "state_fallback"}));
                                 }
 
                                 // === DAILY DATE RESET (midnight UTC) ===
@@ -6339,16 +7128,17 @@ async fn main() -> Result<()> {
                                     let mut cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
                                     let match_key_for_bet = edge.match_key.clone();
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
+                                    let bet_market_dedup_key = market_dedup_key(&match_key_for_bet, &edge.market_key);
 
                                     // === RE-BET LOGIC: check if we already bet, and if re-bet is allowed ===
                                     let is_inflight = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
-                                        || inflight_conditions.contains(&match_key_for_bet);
+                                        || inflight_conditions.contains(&bet_market_dedup_key);
 
                                     // BUG FIX: Prevent match_winner↔map_winner cross-market overexposure.
                                     // REFINED: map2_winner↔map3_winner sibling bets are ALLOWED when the previous bet
                                     // was also a map-level market (different cond ID, different settlement event).
                                     // match_cap/trim_stake guard total exposure on the base match.
-                                    let is_candidate_map_winner = match_key_for_bet != base_match_key;
+                                    let is_candidate_map_winner = is_map_winner_market(&match_key_for_bet, &edge.market_key);
                                     let base_already_bet = already_bet_base_matches.contains(&base_match_key)
                                         && is_candidate_map_winner
                                         && !already_bet_map_winners.contains(&base_match_key); // existing was match_winner → still block
@@ -6364,7 +7154,7 @@ async fn main() -> Result<()> {
                                             match_key_for_bet, base_match_key);
                                         (true, false)
                                     } else if scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
-                                        || already_bet_matches.contains(&match_key_for_bet) {
+                                        || already_bet_matches.contains(&bet_market_dedup_key) {
                                         // Already bet → check if re-bet is allowed (only when FF enabled)
                                         let can_rebet = FF_REBET_ENABLED && !cond_id_str.is_empty() && {
                                             let cond_exp_rb = scoped_cond_key.as_ref()
@@ -6996,7 +7786,7 @@ async fn main() -> Result<()> {
                                         if let Some(key) = scoped_cond_key.as_ref() {
                                             inflight_conditions.insert(key.clone());
                                         }
-                                        inflight_conditions.insert(match_key_for_bet.clone());
+                                        inflight_conditions.insert(bet_market_dedup_key.clone());
 
                                         info!("🤖 AUTO-BET #{}: {} @ {:.2} ${:.2} edge={:.1}%",
                                             aid, leading_team, azuro_odds, stake, edge.edge_pct);
@@ -7046,7 +7836,7 @@ async fn main() -> Result<()> {
                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                 inflight_conditions.remove(key);
                                             }
-                                            inflight_conditions.remove(&match_key_for_bet);
+                                            inflight_conditions.remove(&bet_market_dedup_key);
                                             let _ = tg_send_message(&client, &token, chat_id,
                                                 &format!(
                                                     "⏰ <b>AUTO-BET #{} TTL EXPIRED</b>\n\
@@ -7090,7 +7880,7 @@ async fn main() -> Result<()> {
                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                 inflight_conditions.remove(key);
                                             }
-                                            inflight_conditions.remove(&match_key_for_bet);
+                                            inflight_conditions.remove(&bet_market_dedup_key);
                                             break;
                                         }
                                         let send_ts = Utc::now();
@@ -7263,7 +8053,7 @@ async fn main() -> Result<()> {
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 inflight_conditions.remove(key);
                                                             }
-                                                            inflight_conditions.remove(&match_key_for_bet);
+                                                            inflight_conditions.remove(&bet_market_dedup_key);
                                                             break; // exit retry loop
                                                         } else if is_rejected {
                                                             error!("❌ AUTO-BET #{} REJECTED: state={} (cond={}, match={})",
@@ -7289,7 +8079,7 @@ async fn main() -> Result<()> {
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 inflight_conditions.remove(key);
                                                             }
-                                                            inflight_conditions.remove(&match_key_for_bet);
+                                                            inflight_conditions.remove(&bet_market_dedup_key);
                                                             break; // exit retry loop
                                                         } else {
                                                             auto_bet_count += 1;
@@ -7308,14 +8098,14 @@ async fn main() -> Result<()> {
                                                             let accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
 
                                                             // === DEDUP: record bet to prevent duplicates ===
-                                                            already_bet_matches.insert(match_key_for_bet.clone());
+                                                            already_bet_matches.insert(bet_market_dedup_key.clone());
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 already_bet_conditions.insert(key.clone());
                                                             }
                                                             // BUG #1 FIX: Also record base match key
                                                             already_bet_base_matches.insert(base_match_key.clone());
                                                             // Track map_winner placements for sibling-map dedup logic
-                                                            if match_key_for_bet != base_match_key {
+                                                                if is_map_winner_market(&match_key_for_bet, &edge.market_key) {
                                                                 already_bet_map_winners.insert(base_match_key.clone());
                                                             }
 
@@ -7345,15 +8135,15 @@ async fn main() -> Result<()> {
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 inflight_conditions.remove(key);
                                                             }
-                                                            inflight_conditions.remove(&match_key_for_bet);
+                                                            inflight_conditions.remove(&bet_market_dedup_key);
                                                             // Persist to file
                                                             if let Ok(mut f) = std::fs::OpenOptions::new()
                                                                 .create(true).append(true)
                                                                 .open(bet_history_path) {
                                                                 use std::io::Write;
-                                                                let _ = writeln!(f, "{}|{}|{}|{}|{}",
+                                                                let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
                                                                     match_key_for_bet, cond_id_str,
-                                                                    leading_team, accepted_odds, Utc::now().to_rfc3339());
+                                                                    leading_team, accepted_odds, Utc::now().to_rfc3339(), edge.market_key);
                                                             }
 
                                                             let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
@@ -7381,11 +8171,11 @@ async fn main() -> Result<()> {
                                                                     .create(true).append(true)
                                                                     .open(pending_claims_path) {
                                                                     use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}",
+                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                                                                         token_to_write,
                                                                         bet_id, edge.match_key,
                                                                         leading_team, stake, accepted_odds,
-                                                                        Utc::now().to_rfc3339());
+                                                                        edge.team1, edge.team2, edge.market_key);
                                                                 }
                                                                 // === LEDGER: BET PLACED ===
                                                                 ledger_write("PLACED", &serde_json::json!({
@@ -7606,7 +8396,7 @@ async fn main() -> Result<()> {
                                                     Err(e) => {
                                                         // Remove from inflight on parse error too
                                                         inflight_conditions.remove(&cond_id_str);
-                                                        inflight_conditions.remove(&match_key_for_bet);
+                                                        inflight_conditions.remove(&bet_market_dedup_key);
                                                         let _ = tg_send_message(&client, &token, chat_id,
                                                             &format!(
                                                                 "❌ <b>AUTO-BET #{} RESPONSE ERROR</b>\n\
@@ -7624,7 +8414,7 @@ async fn main() -> Result<()> {
                                             Err(e) => {
                                                 // Remove from inflight on executor error
                                                 inflight_conditions.remove(&cond_id_str);
-                                                inflight_conditions.remove(&match_key_for_bet);
+                                                inflight_conditions.remove(&bet_market_dedup_key);
                                                 let _ = tg_send_message(&client, &token, chat_id,
                                                     &format!(
                                                         "❌ <b>AUTO-BET #{} EXECUTOR OFFLINE</b>\n\
@@ -7725,17 +8515,21 @@ async fn main() -> Result<()> {
                                     let mut cond_id_str = anomaly.condition_id.as_deref().unwrap_or("").to_string();
                                     let match_key_for_bet = anomaly.match_key.clone();
                                     let base_match_key = strip_map_winner_suffix(&match_key_for_bet);
+                                    let bet_market_dedup_key = market_dedup_key(&match_key_for_bet, &anomaly.market_key);
                                     let mut scoped_cond_key = (!cond_id_str.is_empty())
                                         .then(|| scoped_condition_key(&base_match_key, &cond_id_str));
+                                    let is_inflight_anom = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
+                                        || inflight_conditions.contains(&bet_market_dedup_key);
                                     // BUG FIX: Prevent match_winner↔map cross-exposure.
                                     // REFINED: map2↔map3 sibling bets allowed when previous was also map-level (match_cap guards).
-                                    let is_candidate_map_winner_anom = match_key_for_bet != base_match_key;
+                                    let is_candidate_map_winner_anom = is_map_winner_market(&match_key_for_bet, &anomaly.market_key);
                                     let base_already_bet_anom = already_bet_base_matches.contains(&base_match_key)
                                         && is_candidate_map_winner_anom
                                         && !already_bet_map_winners.contains(&base_match_key);
-                                    let already_bet_this = base_already_bet_anom
+                                    let already_bet_this = is_inflight_anom
+                                        || base_already_bet_anom
                                         || scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
-                                        || already_bet_matches.contains(&match_key_for_bet);
+                                        || already_bet_matches.contains(&bet_market_dedup_key);
                                     if base_already_bet_anom {
                                         info!("🛡️ BASE-MATCH DEDUP (anomaly): {} blocked (base {} already bet)",
                                             match_key_for_bet, base_match_key);
@@ -7818,6 +8612,18 @@ async fn main() -> Result<()> {
                                             AUTO_BET_ODDS_ANOMALY_STAKE_BASE_USD, AUTO_BET_ODDS_ANOMALY_REF_ODDS,
                                             (AUTO_BET_ODDS_ANOMALY_REF_ODDS / azuro_odds).powf(1.5));
                                         old_stake
+                                    };
+                                    // A3: Tennis anomaly gets confidence-tiered multiplier
+                                    let anomaly_raw_stake = if anomaly_sport == "tennis" {
+                                        let disc_mult = tennis_anomaly_disc_multiplier(anomaly.discrepancy_pct);
+                                        if disc_mult > 1.0 {
+                                            info!("🎾 TENNIS DISC TIER: {} disc={:.1}% → mult={:.1}× (${:.2} → ${:.2})",
+                                                anomaly.match_key, anomaly.discrepancy_pct, disc_mult,
+                                                anomaly_raw_stake, anomaly_raw_stake * disc_mult);
+                                        }
+                                        (anomaly_raw_stake * disc_mult).min(AUTO_BET_ODDS_ANOMALY_STAKE_CAP * 2.0)
+                                    } else {
+                                        anomaly_raw_stake
                                     };
                                     let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
                                         inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds,
@@ -8154,6 +8960,11 @@ async fn main() -> Result<()> {
                                             // Don't mark inflight — we never sent it
                                         } else {
 
+                                        if let Some(key) = scoped_cond_key.as_ref() {
+                                            inflight_conditions.insert(key.clone());
+                                        }
+                                        inflight_conditions.insert(bet_market_dedup_key.clone());
+
                                         let decision_instant = std::time::Instant::now();
                                         let decision_ts_b = Utc::now();
                                         let amount_raw = (stake * 1e6) as u64;
@@ -8182,7 +8993,7 @@ async fn main() -> Result<()> {
                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                 inflight_conditions.remove(key);
                                             }
-                                            inflight_conditions.remove(&match_key_for_bet);
+                                            inflight_conditions.remove(&bet_market_dedup_key);
                                             let _ = tg_send_message(&client, &token, chat_id,
                                                 &format!(
                                                     "⏰ <b>AUTO-BET #{} TTL EXPIRED</b>\n\
@@ -8217,7 +9028,7 @@ async fn main() -> Result<()> {
                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                 inflight_conditions.remove(key);
                                             }
-                                            inflight_conditions.remove(&match_key_for_bet);
+                                            inflight_conditions.remove(&bet_market_dedup_key);
                                             break;
                                         }
                                         let send_ts_b = Utc::now();
@@ -8375,7 +9186,7 @@ async fn main() -> Result<()> {
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 inflight_conditions.remove(key);
                                                             }
-                                                            inflight_conditions.remove(&match_key_for_bet);
+                                                            inflight_conditions.remove(&bet_market_dedup_key);
                                                             break;
                                                         } else if is_rejected {
                                                             error!("❌ AUTO-BET ODDS #{} REJECTED: state={} (cond={}, match={})",
@@ -8394,7 +9205,7 @@ async fn main() -> Result<()> {
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 inflight_conditions.remove(key);
                                                             }
-                                                            inflight_conditions.remove(&match_key_for_bet);
+                                                            inflight_conditions.remove(&bet_market_dedup_key);
                                                             break;
                                                         } else {
                                                             auto_bet_count += 1;
@@ -8412,13 +9223,13 @@ async fn main() -> Result<()> {
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
                                                             let accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
 
-                                                            already_bet_matches.insert(match_key_for_bet.clone());
+                                                            already_bet_matches.insert(bet_market_dedup_key.clone());
                                                             if let Some(key) = scoped_cond_key.as_ref() {
                                                                 already_bet_conditions.insert(key.clone());
                                                             }
                                                             already_bet_base_matches.insert(base_match_key.clone());
                                                             // Track map_winner placements for sibling-map dedup logic
-                                                            if match_key_for_bet != base_match_key {
+                                                            if is_map_winner_market(&match_key_for_bet, &anomaly.market_key) {
                                                                 already_bet_map_winners.insert(base_match_key.clone());
                                                             }
 
@@ -8434,9 +9245,9 @@ async fn main() -> Result<()> {
                                                                 .create(true).append(true)
                                                                 .open(bet_history_path) {
                                                                 use std::io::Write;
-                                                                let _ = writeln!(f, "{}|{}|{}|{}|{}",
+                                                                let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
                                                                     match_key_for_bet, cond_id_str,
-                                                                    value_team, accepted_odds, Utc::now().to_rfc3339());
+                                                                    value_team, accepted_odds, Utc::now().to_rfc3339(), anomaly.market_key);
                                                             }
 
                                                             let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
@@ -8463,11 +9274,11 @@ async fn main() -> Result<()> {
                                                                     .create(true).append(true)
                                                                     .open(pending_claims_path) {
                                                                     use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}",
+                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                                                                         token_to_write,
                                                                         bet_id, anomaly.match_key,
                                                                         value_team, stake, accepted_odds,
-                                                                        Utc::now().to_rfc3339());
+                                                                        anomaly.team1, anomaly.team2, anomaly.market_key);
                                                                 }
                                                                 // === LEDGER: BET PLACED ===
                                                                 ledger_write("PLACED", &serde_json::json!({
@@ -9126,14 +9937,17 @@ async fn main() -> Result<()> {
                                             serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string(),
                                         );
                                     }
+                                    let (dt1, dt2) = display_teams(bet);
                                     let loss_msg = format!(
                                         "❌ <b>PROHRA</b>\n\n\
+                                         🏷️ <b>{}</b> | {}\n\
                                          {} vs {}\n\
                                          Sázka: <b>{}</b> @ {:.2} — ${:.2}\n\
                                          Výsledek: <b>PROHRA</b> — -${:.2}",
-                                        bet.team1,
-                                        bet.team2,
-                                        bet.value_team,
+                                        display_sport(bet),
+                                        display_market(bet),
+                                        dt1, dt2,
+                                        if !bet.value_team.is_empty() && bet.value_team != "?" { &bet.value_team } else { &dt1 },
                                         bet.odds,
                                         bet.amount_usd,
                                         bet.amount_usd
@@ -9271,14 +10085,20 @@ async fn main() -> Result<()> {
                                 }
                                 // NOTE: daily_wagered is already incremented at PLACED time (BUG FIX: removed double-count)
                                 // Notify about loss immediately
+                                let (dt1, dt2) = display_teams(bet);
                                 let loss_msg = format!(
                                     "❌ <b>PROHRA #{}</b>\n\n\
+                                     🏷️ <b>{}</b> | {}\n\
                                      {} vs {}\n\
                                      Sázka: <b>{}</b> @ {:.2} — ${:.2}\n\
                                      Výsledek: <b>PROHRA</b> — -${:.2}\n\n\
                                      📊 Session: vsazeno ${:.2}, vráceno ${:.2}",
-                                    bet.alert_id, bet.team1, bet.team2,
-                                    bet.value_team, bet.odds, bet.amount_usd,
+                                    bet.alert_id,
+                                    display_sport(bet),
+                                    display_market(bet),
+                                    dt1, dt2,
+                                    if !bet.value_team.is_empty() && bet.value_team != "?" { &bet.value_team } else { &dt1 },
+                                    bet.odds, bet.amount_usd,
                                     bet.amount_usd,
                                     total_wagered, total_returned
                                 );
@@ -9486,9 +10306,10 @@ async fn main() -> Result<()> {
                         use std::io::Write;
                         for bet in &active_bets {
                             let tid = bet.token_id.as_deref().unwrap_or("?");
-                            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+                            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                                 tid, bet.bet_id, bet.match_key,
-                                bet.value_team, bet.amount_usd, bet.odds);
+                                bet.value_team, bet.amount_usd, bet.odds,
+                                bet.team1, bet.team2, bet.market_key);
                         }
                     }
                 }
@@ -9622,6 +10443,16 @@ async fn main() -> Result<()> {
                 }
 
                 // Active bets — try subgraph first for real-time data
+                let (_, ledger_meta_by_token_id) = load_ledger_bet_metadata();
+                let live_match_keys: HashSet<String> = match client.get(format!("{}/state", feed_hub_url)).send().await {
+                    Ok(resp) => match resp.json::<StateResponse>().await {
+                        Ok(state) => state.live.iter().map(|item| item.match_key.clone()).collect(),
+                        Err(_) => HashSet::new(),
+                    },
+                    Err(_) => HashSet::new(),
+                };
+                let mut executor_pending_entries: Vec<PendingTelegramEntry> = Vec::new();
+                let mut executor_pending_available = false;
                 let subgraph_bets: Option<serde_json::Value> = if executor_ok {
                     match client.get(format!("{}/my-bets", executor_url)).send().await {
                         Ok(r) => r.json::<serde_json::Value>().await.ok(),
@@ -9656,6 +10487,30 @@ async fn main() -> Result<()> {
                             session_start,
                             INFLIGHT_TTL_SECS,
                         );
+
+                        executor_pending_available = true;
+                        for b in bets_arr.iter().filter(|b| {
+                            let st = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            st == "pending" || st == "claimable"
+                        }) {
+                            let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("");
+                            let status = b.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            let team = b.get("team").and_then(|v| v.as_str()).unwrap_or("");
+                            let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            let match_key = b.get("matchKey").and_then(|v| v.as_str());
+                            executor_pending_entries.push(build_pending_telegram_entry(
+                                tid,
+                                status,
+                                team,
+                                odds,
+                                amount,
+                                0.0,
+                                match_key,
+                                &ledger_meta_by_token_id,
+                                &live_match_keys,
+                            ));
+                        }
                     }
                 }
 
@@ -9671,12 +10526,52 @@ async fn main() -> Result<()> {
                     msg.push_str("🎰 Pending sázek: 0\n");
                 } else {
                     // On-chain verified pending (truth)
-                    if !onchain_bets.is_empty() {
-                        let total_onchain: f64 = onchain_bets.iter().map(|b| b.amount_usd).sum();
-                        msg.push_str(&format!("🎰 Pending sázek: <b>{}</b> (ve hře: ${:.2})\n",
-                            onchain_bets.len(), total_onchain));
-                        for b in &onchain_bets {
-                            msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
+                    if executor_pending_available {
+                        let active_entries: Vec<&PendingTelegramEntry> = executor_pending_entries.iter()
+                            .filter(|entry| entry.is_live)
+                            .collect();
+                        let settlement_entries: Vec<&PendingTelegramEntry> = executor_pending_entries.iter()
+                            .filter(|entry| !entry.is_live)
+                            .collect();
+                        let active_total: f64 = active_entries.iter().map(|entry| entry.amount).sum();
+
+                        if !active_entries.is_empty() {
+                            msg.push_str(&format!("🎮 Aktivní bety: <b>{}</b> (ve hře: ${:.2})\n",
+                                active_entries.len(), active_total));
+                            for entry in &active_entries {
+                                msg.push_str(&entry.line);
+                            }
+                        }
+                        if !settlement_entries.is_empty() {
+                            msg.push_str(&format!("⏳ Čeká na settlement: <b>{}</b>\n",
+                                settlement_entries.len()));
+                            for entry in &settlement_entries {
+                                msg.push_str(&entry.line);
+                            }
+                        }
+                    } else if !onchain_bets.is_empty() {
+                        let live_cache_bets: Vec<&&ActiveBet> = onchain_bets.iter()
+                            .filter(|b| !b.match_key.is_empty() && live_match_keys.contains(&b.match_key))
+                            .collect();
+                        let settlement_cache_bets: Vec<&&ActiveBet> = onchain_bets.iter()
+                            .filter(|b| b.match_key.is_empty() || !live_match_keys.contains(&b.match_key))
+                            .collect();
+                        let total_live_cache: f64 = live_cache_bets.iter().map(|b| b.amount_usd).sum();
+                        if !live_cache_bets.is_empty() {
+                            msg.push_str(&format!("🎮 Aktivní bety: <b>{}</b> (ve hře: ${:.2}) [local cache]\n",
+                                live_cache_bets.len(), total_live_cache));
+                            for b in &live_cache_bets {
+                                let dn = bet_display_name(b);
+                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", dn, b.odds, b.amount_usd));
+                            }
+                        }
+                        if !settlement_cache_bets.is_empty() {
+                            msg.push_str(&format!("⏳ Čeká na settlement: <b>{}</b> [local cache]\n",
+                                settlement_cache_bets.len()));
+                            for b in &settlement_cache_bets {
+                                let dn = bet_display_name(b);
+                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", dn, b.odds, b.amount_usd));
+                            }
                         }
                     }
                     // In-flight unconfirmed (not yet on-chain, NOT counted in exposure)
@@ -9690,8 +10585,9 @@ async fn main() -> Result<()> {
                                 }
                                 Err(_) => b.placed_at.clone(),
                             };
+                            let dn = bet_display_name(b);
                             msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2} ({})\n",
-                                b.value_team, b.odds, b.amount_usd, age_str));
+                                dn, b.odds, b.amount_usd, age_str));
                         }
                     }
                 }
@@ -9805,67 +10701,163 @@ async fn main() -> Result<()> {
                                 }
 
                                 // === Commands ===
-                                if text == "/status" {
-                                    let mut status_msg = String::new();
+                                if text == "/status" || text == "/portfolio" {
+                                    // Combined elegant status + portfolio in one message
+                                    let mut msg = String::from("📊 <b>STATUS</b>\n\n");
+                                    let uptime_mins = (Utc::now() - session_start).num_minutes();
+                                    msg.push_str(&format!("⏱️ Session: {}h {}min\n", uptime_mins / 60, uptime_mins % 60));
 
-                                    // Feed Hub status
-                                    match client.get(format!("{}/health", feed_hub_url)).send().await {
-                                        Ok(r) => {
-                                            let health = r.text().await.unwrap_or_default();
-                                            match client.get(format!("{}/state", feed_hub_url)).send().await {
-                                                Ok(sr) => {
-                                                    match sr.json::<StateResponse>().await {
-                                                        Ok(s) => {
-                                                            let azuro_count = s.odds.iter().filter(|o| o.payload.bookmaker.starts_with("azuro_")).count();
-                                                            let market_count = s.odds.iter().filter(|o| !o.payload.bookmaker.starts_with("azuro_")).count();
-                                                            status_msg.push_str(&format!(
-                                                                "📊 <b>Status</b>\n\n\
-                                                                 Feed Hub: {}\n\
-                                                                 Connections: {}\n\
-                                                                 Live matches: {}\n\
-                                                                 Azuro odds: {}\n\
-                                                                 Market odds: {}\n\
-                                                                 Fused: {}\n",
-                                                                health, s.connections, s.live_items,
-                                                                azuro_count, market_count, s.fused_ready
-                                                            ));
-                                                        }
-                                                        Err(_) => status_msg.push_str("Feed Hub /state error\n"),
+                                    // === WALLET ===
+                                    match client.get(format!("{}/balance", executor_url)).send().await {
+                                        Ok(resp) => {
+                                            match resp.json::<serde_json::Value>().await {
+                                                Ok(b) => {
+                                                    let bal = b.get("betToken").and_then(|v| v.as_str()).unwrap_or("?");
+                                                    let nat = b.get("native").and_then(|v| v.as_str()).unwrap_or("?");
+                                                    msg.push_str(&format!("💰 <b>{} USDT</b> ({} MATIC)\n", bal, &nat[..nat.len().min(6)]));
+                                                    if let Ok(parsed_bal) = bal.parse::<f64>() {
+                                                        if parsed_bal > 0.0 { current_bankroll = parsed_bal; }
                                                     }
                                                 }
-                                                Err(_) => status_msg.push_str(&format!("Feed Hub health: {} (state err)\n", health)),
-                                            }
-                                        }
-                                        Err(e) => status_msg.push_str(&format!("❌ Feed Hub offline: {}\n", e)),
-                                    };
-
-                                    // Executor status
-                                    match client.get(format!("{}/health", executor_url)).send().await {
-                                        Ok(resp) => {
-                                            match resp.json::<ExecutorHealthResponse>().await {
-                                                Ok(h) => {
-                                                    status_msg.push_str(&format!(
-                                                        "\n🔧 <b>Executor</b>\n\
-                                                         Wallet: <code>{}</code>\n\
-                                                         Balance: {} USDT\n\
-                                                         Allowance: {}\n",
-                                                        h.wallet.as_deref().unwrap_or("?"),
-                                                        h.balance.as_deref().unwrap_or("?"),
-                                                        h.relayer_allowance.as_deref().unwrap_or("?"),
-                                                    ));
+                                                Err(_) => {
+                                                    match client.get(format!("{}/health", executor_url)).send().await {
+                                                        Ok(r) => {
+                                                            if let Ok(h) = r.json::<ExecutorHealthResponse>().await {
+                                                                msg.push_str(&format!("💰 <b>{} USDT</b>\n",
+                                                                    h.balance.as_deref().unwrap_or("?")));
+                                                            }
+                                                        }
+                                                        Err(_) => msg.push_str("💰 ❌ executor offline\n"),
+                                                    }
                                                 }
-                                                Err(_) => status_msg.push_str("\n⚠️ Executor: nevalidní odpověď\n"),
                                             }
                                         }
-                                        Err(_) => status_msg.push_str("\n❌ Executor OFFLINE\n"),
+                                        Err(_) => msg.push_str("💰 ❌ executor offline\n"),
+                                    }
+
+                                    // === ON-CHAIN BETS ===
+                                    if let Ok(resp) = client.get(format!("{}/my-bets", executor_url)).send().await {
+                                        if let Ok(mb) = resp.json::<serde_json::Value>().await {
+                                            let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let won = mb.get("alreadyPaid").and_then(|v| v.as_u64())
+                                                .or_else(|| mb.get("won").and_then(|v| v.as_u64())).unwrap_or(0);
+                                            let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let pending_count = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
+                                            msg.push_str(&format!(
+                                                "📋 Azuro: {} total | ✅{} ❌{} | ⏳{} | 💰Claim: {}\n",
+                                                total, won, lost, pending_count, redeemable
+                                            ));
+                                            if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
+                                                inflight_wagered_total = reconcile_active_bets_with_executor_snapshot(
+                                                    &mut active_bets, bets_arr, pending_claims_path,
+                                                    session_start, INFLIGHT_TTL_SECS,
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // === PENDING BETS LIST ===
+                                    let onchain_bets: Vec<&ActiveBet> = active_bets.iter()
+                                        .filter(|b| b.token_id.is_some()).collect();
+                                    let inflight_bets_view: Vec<&ActiveBet> = active_bets.iter()
+                                        .filter(|b| b.token_id.is_none()).collect();
+
+                                    if onchain_bets.is_empty() && inflight_bets_view.is_empty() {
+                                        msg.push_str("\n🎰 Žádné pending sázky\n");
+                                    } else {
+                                        if !onchain_bets.is_empty() {
+                                            let total_onchain: f64 = onchain_bets.iter().map(|b| b.amount_usd).sum();
+                                            msg.push_str(&format!("\n🎰 <b>Pending ({})</b> — ${:.2}\n",
+                                                onchain_bets.len(), total_onchain));
+                                            for b in &onchain_bets {
+                                                let dn = bet_display_name(b);
+                                                let sport_tag = b.match_key.split("::").next().unwrap_or("");
+                                                msg.push_str(&format!("  \u{2022} {} <i>{}</i> @{:.2} ${:.2}\n",
+                                                    dn, sport_tag, b.odds, b.amount_usd));
+                                            }
+                                        }
+                                        if !inflight_bets_view.is_empty() {
+                                            msg.push_str(&format!("\n✈️ <b>In-flight ({})</b>\n", inflight_bets_view.len()));
+                                            for b in &inflight_bets_view {
+                                                let age_str = match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
+                                                    Ok(placed) => {
+                                                        let secs = (Utc::now() - placed.with_timezone(&Utc)).num_seconds();
+                                                        format!("{}s", secs)
+                                                    }
+                                                    Err(_) => b.placed_at.clone(),
+                                                };
+                                                let dn = bet_display_name(b);
+                                                msg.push_str(&format!("  \u{2022} {} @{:.2} ${:.2} ({})\n",
+                                                    dn, b.odds, b.amount_usd, age_str));
+                                            }
+                                        }
+                                    }
+
+                                    // === P/L ===
+                                    let daily_pnl = daily_returned - daily_wagered;
+                                    let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
+                                    msg.push_str(&format!("\n{} <b>P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
+                                    msg.push_str(&format!("   Vsazeno ${:.2} | Vráceno ${:.2}\n", daily_wagered, daily_returned));
+                                    let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
+                                    let effective_daily_limit = {
+                                        let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
+                                        daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac))
                                     };
+                                    let lim_tag = if daily_limit_override.is_some() { " ⚡" } else { "" };
+                                    msg.push_str(&format!("   Loss: ${:.2} / ${:.2}{}\n", daily_net_loss, effective_daily_limit, lim_tag));
+                                    msg.push_str(&format!("   Auto-bets: {}\n", auto_bet_count));
 
-                                    status_msg.push_str(&format!(
-                                        "\nAlerts: {} (cooldown {}s)\nAktivní bety: {}",
-                                        sent_alerts.len(), ALERT_COOLDOWN_SECS, active_bets.len()
-                                    ));
+                                    let runtime_audit = summarize_recent_runtime(24);
+                                    if runtime_audit.has_data() {
+                                        msg.push_str(&format!(
+                                            "🧪 24h: P{} A{} F{} W{} L{}\n",
+                                            runtime_audit.placed,
+                                            runtime_audit.accepted,
+                                            runtime_audit.bet_failed,
+                                            runtime_audit.won,
+                                            runtime_audit.lost,
+                                        ));
+                                        if !runtime_audit.fail_reasons.is_empty() {
+                                            let fail_line = runtime_audit.fail_reasons.iter()
+                                                .map(|(reason, count)| format!("{} {}", reason, count))
+                                                .collect::<Vec<_>>()
+                                                .join(" | ");
+                                            msg.push_str(&format!("🧱 Fail 24h: {}\n", fail_line));
+                                        }
+                                    }
 
-                                    let _ = tg_send_message(&client, &token, chat_id, &status_msg).await;
+                                    // === SYSTEM ===
+                                    {
+                                        let cache_r = ws_condition_cache.read().await;
+                                        let cache_size = cache_r.len();
+                                        let newest_age_ms = cache_r.values()
+                                            .map(|e| e.updated_at.elapsed().as_millis())
+                                            .min()
+                                            .unwrap_or(0);
+                                        let ws_status = if !ws_state_gate_enabled {
+                                            "OFF".to_string()
+                                        } else if cache_size == 0 {
+                                            "ON (no data)".to_string()
+                                        } else {
+                                            format!("ON ({} conds, {}ms)", cache_size, newest_age_ms)
+                                        };
+                                        msg.push_str(&format!("\n🔌 WS: {} | Alerts: {}\n",
+                                            ws_status, sent_alerts.len()));
+                                    }
+                                    match client.get(format!("{}/state", feed_hub_url)).send().await {
+                                        Ok(resp) => {
+                                            if let Ok(state) = resp.json::<StateResponse>().await {
+                                                let azuro_count = state.odds.iter().filter(|o| o.payload.bookmaker.starts_with("azuro_")).count();
+                                                let market_count = state.odds.iter().filter(|o| !o.payload.bookmaker.starts_with("azuro_")).count();
+                                                msg.push_str(&format!("📡 Feed: {} live | Azuro {} | Market {}\n",
+                                                    state.live_items, azuro_count, market_count));
+                                            }
+                                        }
+                                        Err(_) => msg.push_str("📡 Feed-hub: ❌ offline\n"),
+                                    }
+
+                                    let _ = tg_send_message(&client, &token, chat_id, &msg).await;
 
                                 } else if text == "/odds" {
                                     match client.get(format!("{}/state", feed_hub_url)).send().await {
@@ -9913,6 +10905,14 @@ async fn main() -> Result<()> {
                                 } else if text == "/bets" || text == "/mybets" || text == "/my-bets" {
                                     // Show on-chain bets (real-time) with enriched metadata
                                     let mut bets_msg = String::from("🎰 <b>SÁZKY</b>\n\n");
+                                    let (_, ledger_meta_by_token_id) = load_ledger_bet_metadata();
+                                    let live_match_keys: HashSet<String> = match client.get(format!("{}/state", feed_hub_url)).send().await {
+                                        Ok(resp) => match resp.json::<StateResponse>().await {
+                                            Ok(state) => state.live.iter().map(|item| item.match_key.clone()).collect(),
+                                            Err(_) => HashSet::new(),
+                                        },
+                                        Err(_) => HashSet::new(),
+                                    };
 
                                     // On-chain bets from executor
                                     match client.get(format!("{}/my-bets", executor_url)).send().await {
@@ -9942,7 +10942,7 @@ async fn main() -> Result<()> {
                                                             })
                                                             .collect();
                                                         if !pending_bets.is_empty() {
-                                                            bets_msg.push_str(&format!("📋 <b>Pending/Claimable ({}):</b>\n", pending_bets.len()));
+                                                            let mut pending_entries: Vec<PendingTelegramEntry> = Vec::new();
                                                             for b in pending_bets.iter().take(40) {
                                                                 let tid = b.get("tokenId").and_then(|v| v.as_str()).unwrap_or("?");
                                                                 let status = b.get("status").and_then(|v| v.as_str()).unwrap_or("?");
@@ -9950,19 +10950,38 @@ async fn main() -> Result<()> {
                                                                 let odds = b.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                                                 let amount = b.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                                                 let payout = b.get("payoutUsd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                                                let emoji = if status == "claimable" { "💰" } else { "⏳" };
-                                                                if !team.is_empty() {
-                                                                    bets_msg.push_str(&format!(
-                                                                        "{} {} @ {:.2} ${:.2}{}\n",
-                                                                        emoji, team, odds, amount,
-                                                                        if payout > 0.0 { format!(" → ${:.2}", payout) } else { String::new() }
-                                                                    ));
-                                                                } else {
-                                                                    bets_msg.push_str(&format!(
-                                                                        "{} #{}{}\n",
-                                                                        emoji, &tid[..tid.len().min(8)],
-                                                                        if payout > 0.0 { format!(" → ${:.2}", payout) } else { String::new() }
-                                                                    ));
+                                                                let match_key = b.get("matchKey").and_then(|v| v.as_str());
+                                                                pending_entries.push(build_pending_telegram_entry(
+                                                                    tid,
+                                                                    status,
+                                                                    team,
+                                                                    odds,
+                                                                    amount,
+                                                                    payout,
+                                                                    match_key,
+                                                                    &ledger_meta_by_token_id,
+                                                                    &live_match_keys,
+                                                                ));
+                                                            }
+
+                                                            let active_entries: Vec<&PendingTelegramEntry> = pending_entries.iter()
+                                                                .filter(|entry| entry.is_live)
+                                                                .collect();
+                                                            let settlement_entries: Vec<&PendingTelegramEntry> = pending_entries.iter()
+                                                                .filter(|entry| !entry.is_live)
+                                                                .collect();
+                                                            let active_total: f64 = active_entries.iter().map(|entry| entry.amount).sum();
+
+                                                            if !active_entries.is_empty() {
+                                                                bets_msg.push_str(&format!("🎮 <b>Aktivní bety ({})</b> — ${:.2}\n", active_entries.len(), active_total));
+                                                                for entry in &active_entries {
+                                                                    bets_msg.push_str(&entry.line);
+                                                                }
+                                                            }
+                                                            if !settlement_entries.is_empty() {
+                                                                bets_msg.push_str(&format!("⏳ <b>Čeká na settlement ({})</b>\n", settlement_entries.len()));
+                                                                for entry in &settlement_entries {
+                                                                    bets_msg.push_str(&entry.line);
                                                                 }
                                                             }
                                                         }
@@ -10144,8 +11163,7 @@ async fn main() -> Result<()> {
                                          CS2 + Tennis + Football + Basketball\n\
                                          Match + Map Winner | Auto-bet + Auto-claim\n\n\
                                          <b>Commands:</b>\n\
-                                         /status — systém + feed-hub + executor\n\
-                                         /portfolio — wallet + P/L + report\n\
+                                         /status — kompletní přehled systému + portfolio\n\
                                          /bets — sázky ze subgraphu (live) + lokální\n\
                                          /odds — aktuální odds anomálie\n\
                                          /nabidka — vypnout manuální alerty (tichý mód)\n\
@@ -10164,142 +11182,6 @@ async fn main() -> Result<()> {
                                          Auto-claim: každých 60s, safety-net každých 5min.\n\
                                          Portfolio report: každých 30 min.", lim_h)
                                     ).await;
-
-                                } else if text == "/portfolio" {
-                                    // On-demand portfolio report — same logic as ticker
-                                    let mut msg = String::from("📊 <b>PORTFOLIO</b>\n\n");
-                                    let uptime_mins = (Utc::now() - session_start).num_minutes();
-                                    msg.push_str(&format!("⏱️ Session: {}h {}min\n\n", uptime_mins / 60, uptime_mins % 60));
-
-                                    // Live balance
-                                    match client.get(format!("{}/balance", executor_url)).send().await {
-                                        Ok(resp) => {
-                                            match resp.json::<serde_json::Value>().await {
-                                                Ok(b) => {
-                                                    let bal = b.get("betToken").and_then(|v| v.as_str()).unwrap_or("?");
-                                                    let nat = b.get("native").and_then(|v| v.as_str()).unwrap_or("?");
-                                                    let wallet = b.get("wallet").and_then(|v| v.as_str()).unwrap_or("?");
-                                                    msg.push_str(&format!("💰 <b>{} USDT</b> ({} MATIC)\n", bal, &nat[..nat.len().min(6)]));
-                                                    msg.push_str(&format!("🔑 <code>{}</code>\n", wallet));
-                                                }
-                                                Err(_) => {
-                                                    match client.get(format!("{}/health", executor_url)).send().await {
-                                                        Ok(r) => {
-                                                            if let Ok(h) = r.json::<ExecutorHealthResponse>().await {
-                                                                msg.push_str(&format!("💰 <b>{} USDT</b>\n🔑 <code>{}</code>\n",
-                                                                    h.balance.as_deref().unwrap_or("?"),
-                                                                    h.wallet.as_deref().unwrap_or("?")));
-                                                            }
-                                                        }
-                                                        Err(_) => msg.push_str("❌ Executor offline\n"),
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(_) => msg.push_str("❌ Executor offline\n"),
-                                    }
-
-                                    // On-chain summary + reconcile
-                                    if let Ok(resp) = client.get(format!("{}/my-bets", executor_url)).send().await {
-                                        if let Ok(mb) = resp.json::<serde_json::Value>().await {
-                                            let total = mb.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            // executor returns "alreadyPaid" (settled+claimed wins); keep fallback for older schemas
-                                            let won = mb.get("alreadyPaid")
-                                                .and_then(|v| v.as_u64())
-                                                .or_else(|| mb.get("won").and_then(|v| v.as_u64()))
-                                                .unwrap_or(0);
-                                            let lost = mb.get("lost").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            let pending_count = mb.get("pending").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            let redeemable = mb.get("claimable").and_then(|v| v.as_u64()).unwrap_or(0);
-                                            msg.push_str(&format!(
-                                                "\n📋 Azuro bety: {} total | ✅{} ❌{} | ⏳{} | 💰 Claim: {}\n",
-                                                total, won, lost, pending_count, redeemable
-                                            ));
-
-                                            // Reconcile active_bets from on-chain pending data (same as ticker)
-                                            if let Some(bets_arr) = mb.get("bets").and_then(|v| v.as_array()) {
-                                                inflight_wagered_total = reconcile_active_bets_with_executor_snapshot(
-                                                    &mut active_bets,
-                                                    bets_arr,
-                                                    pending_claims_path,
-                                                    session_start,
-                                                    INFLIGHT_TTL_SECS,
-                                                );
-                                            }
-                                        }
-                                    }
-
-                                    // Split display: on-chain vs in-flight
-                                    let onchain_bets: Vec<&ActiveBet> = active_bets.iter()
-                                        .filter(|b| b.token_id.is_some())
-                                        .collect();
-                                    let inflight_bets_view: Vec<&ActiveBet> = active_bets.iter()
-                                        .filter(|b| b.token_id.is_none())
-                                        .collect();
-
-                                    if onchain_bets.is_empty() && inflight_bets_view.is_empty() {
-                                        msg.push_str("\n🎰 Žádné pending sázky\n");
-                                    } else {
-                                        if !onchain_bets.is_empty() {
-                                            let total_onchain: f64 = onchain_bets.iter().map(|b| b.amount_usd).sum();
-                                            msg.push_str(&format!("\n🎰 <b>On-chain pending ({})</b> — ve hře: ${:.2}\n",
-                                                onchain_bets.len(), total_onchain));
-                                            for b in &onchain_bets {
-                                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2}\n", b.value_team, b.odds, b.amount_usd));
-                                            }
-                                        }
-                                        if !inflight_bets_view.is_empty() {
-                                            msg.push_str(&format!("\n✈️ <b>In-flight ({})</b> — neověřeno on-chain\n",
-                                                inflight_bets_view.len()));
-                                            for b in &inflight_bets_view {
-                                                let age_str = match chrono::DateTime::parse_from_rfc3339(&b.placed_at) {
-                                                    Ok(placed) => {
-                                                        let secs = (Utc::now() - placed.with_timezone(&Utc)).num_seconds();
-                                                        format!("{}s ago", secs)
-                                                    }
-                                                    Err(_) => b.placed_at.clone(),
-                                                };
-                                                msg.push_str(&format!("  \u{2022} {} @ {:.2} ${:.2} ({})\n",
-                                                    b.value_team, b.odds, b.amount_usd, age_str));
-                                            }
-                                        }
-                                    }
-
-                                    // WS gate diagnostics
-                                    {
-                                        let cache_r = ws_condition_cache.read().await;
-                                        let cache_size = cache_r.len();
-                                        let newest_age_ms = cache_r.values()
-                                            .map(|e| e.updated_at.elapsed().as_millis())
-                                            .min()
-                                            .unwrap_or(0);
-                                        let ws_status = if !ws_state_gate_enabled {
-                                            "OFF".to_string()
-                                        } else if cache_size == 0 {
-                                            "ON (no data)".to_string()
-                                        } else {
-                                            format!("ON ({} conds, newest {}ms)", cache_size, newest_age_ms)
-                                        };
-                                        msg.push_str(&format!("\n🔌 WS gate: {}\n", ws_status));
-                                        msg.push_str(&format!("  ✅ active={} | 🚫 not_active={} | ⏳ stale={} | ❓ nodata={}\n",
-                                            ws_gate_active_count, ws_gate_not_active_count,
-                                            ws_gate_stale_fallback_count, ws_gate_nodata_fallback_count));
-                                    }
-
-                                    let daily_pnl = daily_returned - daily_wagered;
-                                    let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
-                                    msg.push_str(&format!("\n{} <b>Daily P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
-                                    msg.push_str(&format!("Vsazeno: ${:.2} | Vráceno: ${:.2}\n", daily_wagered, daily_returned));
-                                    let daily_net_loss = (daily_wagered - daily_returned).max(0.0);
-                                    let effective_daily_limit = {
-                                        let (_, _, _, dl_frac, _) = get_exposure_caps(start_of_day_bankroll);
-                                        daily_limit_override.unwrap_or_else(|| DAILY_LOSS_LIMIT_USD.min(start_of_day_bankroll * dl_frac))
-                                    };
-                                    let lim_override_tag2 = if daily_limit_override.is_some() { " ⚡override" } else { "" };
-                                    msg.push_str(&format!("Loss limit: ${:.2} / ${:.2}{}\n", daily_net_loss, effective_daily_limit, lim_override_tag2));
-                                    msg.push_str(&format!("Auto-bets dnes: {}\n", auto_bet_count));
-
-                                    let _ = tg_send_message(&client, &token, chat_id, &msg).await;
 
                                 // === YES reply: place bet ===
                                 } else if let Some((mut aid, amount, parsed_opposite_side)) = parse_bet_reply(text) {
@@ -10387,13 +11269,14 @@ async fn main() -> Result<()> {
                                         // don't allow re-betting same condition/base match from stale alert messages.
                                         let manual_base_match_key = strip_map_winner_suffix(&anomaly.match_key);
                                         let manual_dedup_base = already_bet_base_matches.contains(&manual_base_match_key)
-                                            && anomaly.match_key != manual_base_match_key;
+                                            && is_map_winner_market(&anomaly.match_key, &anomaly.market_key);
                                         let manual_scoped_condition = scoped_condition_key(&manual_base_match_key, &condition_id);
+                                        let manual_market_dedup_key = market_dedup_key(&anomaly.match_key, &anomaly.market_key);
                                         let manual_dedup = already_bet_conditions.contains(&manual_scoped_condition)
-                                            || already_bet_matches.contains(&anomaly.match_key)
+                                            || already_bet_matches.contains(&manual_market_dedup_key)
                                             || manual_dedup_base
                                             || inflight_conditions.contains(&manual_scoped_condition)
-                                            || inflight_conditions.contains(&anomaly.match_key);
+                                            || inflight_conditions.contains(&manual_market_dedup_key);
                                         if manual_dedup {
                                             let _ = tg_send_message(&client, &token, chat_id,
                                                 &format!(
@@ -10482,6 +11365,13 @@ async fn main() -> Result<()> {
 
                                                             // Don't track dry-run bets as active
                                                             if !is_dry_run {
+                                                                already_bet_matches.insert(manual_market_dedup_key.clone());
+                                                                already_bet_conditions.insert(manual_scoped_condition.clone());
+                                                                already_bet_base_matches.insert(manual_base_match_key.clone());
+                                                                if is_map_winner_market(&anomaly.match_key, &anomaly.market_key) {
+                                                                    already_bet_map_winners.insert(manual_base_match_key.clone());
+                                                                }
+
                                                                 active_bets.push(ActiveBet {
                                                                     alert_id: aid,
                                                                     bet_id: bet_id.to_string(),
@@ -10505,12 +11395,20 @@ async fn main() -> Result<()> {
                                                                     .create(true).append(true)
                                                                     .open(pending_claims_path) {
                                                                     use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}",
+                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
                                                                         token_to_write,
                                                                         bet_id, anomaly.match_key,
                                                                         value_team, amount, accepted_odds,
-                                                                        Utc::now().to_rfc3339());
+                                                                        anomaly.team1, anomaly.team2, anomaly.market_key);
                                                                 }
+                                                                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                                                                        .create(true).append(true)
+                                                                        .open(bet_history_path) {
+                                                                        use std::io::Write;
+                                                                        let _ = writeln!(f, "{}|{}|{}|{}|{}|{}",
+                                                                        anomaly.match_key, condition_id,
+                                                                        value_team, accepted_odds, Utc::now().to_rfc3339(), anomaly.market_key);
+                                                                    }
                                                                 // === LEDGER: BET PLACED (bet-command) ===
                                                                 ledger_write("PLACED", &serde_json::json!({
                                                                     "alert_id": aid, "bet_id": bet_id,
