@@ -925,7 +925,12 @@ fn dynamic_base_stake(bankroll: f64, sport: &str) -> f64 {
     let base = bankroll * per_bet_frac * 0.9;
     // Data-collection / guarded sports: keep them in the cheap-information regime.
     if sport == "tennis" || sport == "basketball" || sport == "football" || sport == "esports" {
-        base.min(AUTO_BET_STAKE_LOW_USD)
+        let capped = base.min(AUTO_BET_STAKE_LOW_USD);
+        if bankroll >= MIN_BANKROLL_USD {
+            capped.max(MIN_EXECUTABLE_STAKE_USD)
+        } else {
+            capped
+        }
     } else {
         base
     }
@@ -2359,18 +2364,18 @@ mod football_parser_tests {
 
     // === football_auto_bet_guard ===
     #[test]
-    fn guard_single_goal_from_minute_85() {
+    fn guard_single_goal_from_minute_83() {
         assert!(football_auto_bet_guard(1, Some(90)));
-        assert!(football_auto_bet_guard(1, Some(85)));
-        assert!(!football_auto_bet_guard(1, Some(84)));
+        assert!(football_auto_bet_guard(1, Some(83)));
+        assert!(!football_auto_bet_guard(1, Some(82)));
         assert!(!football_auto_bet_guard(1, Some(45)));
         assert!(!football_auto_bet_guard(0, Some(90)));
     }
 
     #[test]
-    fn guard_two_goals_needs_minute_68() {
-        assert!(!football_auto_bet_guard(2, Some(67)));
-        assert!(football_auto_bet_guard(2, Some(68)));
+    fn guard_two_goals_needs_minute_66() {
+        assert!(!football_auto_bet_guard(2, Some(65)));
+        assert!(football_auto_bet_guard(2, Some(66)));
         assert!(football_auto_bet_guard(2, Some(85)));
     }
 
@@ -2554,6 +2559,14 @@ mod strategy_hotfix_tests {
         assert_eq!(get_sport_exposure_cap("football", bankroll), 25.0);
         assert_eq!(get_sport_exposure_cap("esports", bankroll), 10.0);
         assert_eq!(dynamic_base_stake(bankroll, "football"), 0.50);
+        assert_eq!(dynamic_base_stake(bankroll, "esports"), 0.50);
+    }
+
+    #[test]
+    fn micro_bankroll_low_stake_sports_stay_executable() {
+        let bankroll = 9.64;
+        assert_eq!(dynamic_base_stake(bankroll, "football"), 0.50);
+        assert_eq!(dynamic_base_stake(bankroll, "tennis"), 0.50);
         assert_eq!(dynamic_base_stake(bankroll, "esports"), 0.50);
     }
 
@@ -3685,10 +3698,10 @@ fn football_auto_bet_guard(goal_diff: i32, minute: Option<i32>) -> bool {
     match goal_diff {
         diff if diff >= 4 => minute >= 45,
         3 => minute >= 58,
-        2 => minute >= 68,
-        // 1-goal lead from minute 85: at 85'+ the win probability is ~88-92%.
-        // 2026-03-14 audit: 76 SportGuardBlocked, vast majority 1-goal late game.
-        1 => minute >= 85,
+        2 => minute >= 66,
+        // 1-goal lead from minute 83: still late-only, but avoids missing a narrow
+        // band of safe closeouts before the final stoppage-time phase.
+        1 => minute >= 83,
         _ => false,
     }
 }
