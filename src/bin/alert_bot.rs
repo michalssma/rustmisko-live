@@ -592,6 +592,35 @@ fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     }
 }
 
+fn cs2_closeout_match_state(score1: i32, score2: i32, azuro_odds: f64, market_key: &str, sport: &str) -> bool {
+    if market_key != "match_winner" {
+        return false;
+    }
+
+    if !matches!(sport, "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol") {
+        return false;
+    }
+
+    let hi = score1.max(score2);
+    let lo = score1.min(score2);
+    hi >= 10 && (hi - lo) >= 6 && azuro_odds <= 1.40
+}
+
+fn effective_cs2_score_edge_min_edge(
+    base_min_edge: f64,
+    sport: &str,
+    market_key: &str,
+    score1: i32,
+    score2: i32,
+    azuro_odds: f64,
+) -> f64 {
+    if cs2_closeout_match_state(score1, score2, azuro_odds, market_key, sport) {
+        base_min_edge.min(18.0)
+    } else {
+        base_min_edge
+    }
+}
+
 /// Dynamic football edge threshold based on match minute.
 /// Late game: odds adjust slowly → lower threshold is safe.
 /// Returns adjusted min_edge_pct for football specifically.
@@ -855,6 +884,21 @@ fn score_edge_min_odds(sport: &str, market_key: &str) -> f64 {
             if is_map_winner { 1.50 } else { 1.55 }
         }
         _ => AUTO_BET_MIN_ODDS,
+    }
+}
+
+fn effective_score_edge_min_odds(
+    sport: &str,
+    market_key: &str,
+    score1: i32,
+    score2: i32,
+    azuro_odds: f64,
+) -> f64 {
+    let base = score_edge_min_odds(sport, market_key);
+    if cs2_closeout_match_state(score1, score2, azuro_odds, market_key, sport) {
+        base.min(1.25)
+    } else {
+        base
     }
 }
 
@@ -2473,9 +2517,12 @@ mod threshold_relax_tests {
 #[cfg(test)]
 mod strategy_hotfix_tests {
     use super::{
+        cs2_closeout_match_state,
         count_pending_slots,
         cross_market_base_dedup_block,
         dynamic_base_stake,
+        effective_cs2_score_edge_min_edge,
+        effective_score_edge_min_odds,
         executable_stake_floor,
         get_sport_config,
         get_sport_exposure_cap,
@@ -2517,6 +2564,22 @@ mod strategy_hotfix_tests {
         assert_eq!(min_edge, 33.0);
         assert_eq!(mult, 1.0);
         assert_eq!(preferred_market, "match_or_map");
+    }
+
+    #[test]
+    fn cs2_closeout_override_is_narrow_and_targeted() {
+        assert!(cs2_closeout_match_state(11, 4, 1.30, "match_winner", "cs2"));
+        assert!(!cs2_closeout_match_state(8, 4, 1.30, "match_winner", "cs2"));
+        assert!(!cs2_closeout_match_state(11, 4, 1.65, "match_winner", "cs2"));
+        assert!(!cs2_closeout_match_state(11, 4, 1.30, "map2_winner", "cs2"));
+    }
+
+    #[test]
+    fn cs2_closeout_override_relaxes_min_edge_and_min_odds_only_for_safe_closeouts() {
+        assert_eq!(effective_cs2_score_edge_min_edge(33.0, "cs2", "match_winner", 11, 4, 1.30), 18.0);
+        assert_eq!(effective_score_edge_min_odds("cs2", "match_winner", 11, 4, 1.30), 1.25);
+        assert_eq!(effective_cs2_score_edge_min_edge(33.0, "cs2", "match_winner", 8, 4, 1.30), 33.0);
+        assert_eq!(effective_score_edge_min_odds("cs2", "match_winner", 8, 4, 1.30), 1.55);
     }
 
     #[test]
@@ -9380,6 +9443,14 @@ async fn main() -> Result<()> {
                                             azuro_odds,
                                         );
                                     }
+                                    sport_min_edge = effective_cs2_score_edge_min_edge(
+                                        sport_min_edge,
+                                        sport,
+                                        &edge.market_key,
+                                        edge.score1,
+                                        edge.score2,
+                                        azuro_odds,
+                                    );
                                     // CS2 map_winner: further relaxed to 24% for the cleanest live score signal.
                                     if let Some(cs2_min_edge) = cs2_map_winner_min_edge(
                                         sport,
@@ -9569,7 +9640,13 @@ async fn main() -> Result<()> {
                                     };
 
                                     // Safer score-edge corridor: fewer bets, but avoid drifting into high-variance odds regimes.
-                                    let effective_min_odds = score_edge_min_odds(sport, &edge.market_key);
+                                    let effective_min_odds = effective_score_edge_min_odds(
+                                        sport,
+                                        &edge.market_key,
+                                        edge.score1,
+                                        edge.score2,
+                                        azuro_odds,
+                                    );
                                     let base_max_odds = score_edge_max_odds(&edge.market_key, sport, edge.cs2_map_confidence);
                                     let effective_max_odds = cs2_round_edge_max_odds_override(
                                         sport,
