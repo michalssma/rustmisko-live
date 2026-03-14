@@ -51,8 +51,12 @@ const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches
 /// After a CS2 score rewind/jump glitch, suppress further score-edge bets on that match
 /// long enough for the corrupted branch to die out.
 const CS2_SCORE_GLITCH_QUARANTINE_SECS: i64 = 20 * 60;
-const CS2_SCORE_DISTRUST_LOCK_SECS: i64 = 3 * 60 * 60;
-const CS2_SCORE_DISTRUST_DECAY_SECS: i64 = 15 * 60;
+/// Reduced 3h → 45min: Tipsport score glitches are transient; 3h was killing
+/// entire CS2 matches (624 blocks on 2026-03-14). 45min lets the glitch window
+/// pass while still protecting against genuinely corrupt score state.
+const CS2_SCORE_DISTRUST_LOCK_SECS: i64 = 45 * 60;
+/// Decay raised 15min → 20min: slightly wider to still accumulate repeat offenders
+const CS2_SCORE_DISTRUST_DECAY_SECS: i64 = 20 * 60;
 const CS2_SCORE_DISTRUST_LOCK_THRESHOLD: u8 = 3;
 /// === AUTO-BET CONFIG ===
 const AUTO_BET_ENABLED: bool = true;
@@ -121,7 +125,7 @@ const CONDITION_MAX_AGE_MS: u64 = 4000;
 /// Base chain poll cadence is much slower than Polygon WS/GQL cadence.
 /// Tightened 120s→30s: still allows Base bets, but cuts truly stale conditions.
 const CONDITION_MAX_AGE_MS_BASE: u64 = 30_000;
-const CS2_ROUND_MATCH_WINNER_MIN_ROUNDS: i32 = 10;
+const CS2_ROUND_MATCH_WINNER_MIN_ROUNDS: i32 = 8;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
 /// ROLLBACK: set to 999_999 to effectively disable pipeline budget
 const PIPELINE_BUDGET_MS: u64 = 1200;
@@ -803,8 +807,9 @@ fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64, f64) {
 fn score_edge_max_odds(market_key: &str, sport: &str, cs2_map_confidence: Option<&'static str>) -> f64 {
     let is_map_winner = market_key.starts_with("map") && market_key.ends_with("_winner");
     match sport {
-        // Football containment: stop chasing weak comeback and late-chaos prices.
-        "football" => 2.05,
+        // Football corridor widened 2.05 → 2.35: late-game match_winner naturally
+        // drifts above 2.05; 2026-03-14 audit showed 75 OddsAboveMax blocks on football.
+        "football" => 2.35,
         // Tennis audit: 1.90-2.09 was materially negative while 1.60-1.89 stayed positive.
         // Keep tennis as a low-stake data-collection sport, but stop auto-betting the weak upper band.
         "tennis" => 1.90,
@@ -861,9 +866,10 @@ fn get_sport_exposure_cap(sport: &str, bankroll: f64) -> f64 {
         "cs2" => 0.40,
         "esports" => 0.10,
         "valorant" | "dota-2" | "league-of-legends" | "lol" => 0.20,
-        // Football remains observational until guarded live sample turns sustainably positive.
-        "football" => 0.10,
-        "tennis" | "basketball" => 0.10,
+        // Football promoted 0.10 → 0.25: guard evolution (1-goal@85', 2-goal@68')
+        // opens significant new volume; cap must match to not throttle valid signals.
+        "football" => 0.25,
+        "tennis" | "basketball" => 0.15,
         _ => 0.10, // conservative for new sports
     };
     bankroll * frac
@@ -2309,16 +2315,18 @@ mod football_parser_tests {
 
     // === football_auto_bet_guard ===
     #[test]
-    fn guard_blocks_single_goal_always() {
-        assert!(!football_auto_bet_guard(1, Some(90)));
+    fn guard_single_goal_from_minute_85() {
+        assert!(football_auto_bet_guard(1, Some(90)));
+        assert!(football_auto_bet_guard(1, Some(85)));
+        assert!(!football_auto_bet_guard(1, Some(84)));
         assert!(!football_auto_bet_guard(1, Some(45)));
         assert!(!football_auto_bet_guard(0, Some(90)));
     }
 
     #[test]
-    fn guard_two_goals_needs_minute_72() {
-        assert!(!football_auto_bet_guard(2, Some(71)));
-        assert!(football_auto_bet_guard(2, Some(72)));
+    fn guard_two_goals_needs_minute_68() {
+        assert!(!football_auto_bet_guard(2, Some(67)));
+        assert!(football_auto_bet_guard(2, Some(68)));
         assert!(football_auto_bet_guard(2, Some(85)));
     }
 
@@ -2417,18 +2425,18 @@ mod threshold_relax_tests {
 
     #[test]
     fn cs2_round_match_winner_needs_all_variant3_guards() {
-        // Standard path: map lead + ≥72% + ≥10 rounds + odds ≤2.80
-        assert!(cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.25)));
+        // Standard path: map lead + ≥68% + ≥8 rounds + odds ≤2.80
+        assert!(cs2_round_match_winner_guard(1, 0, false, 0.68, 8, Some(2.25)));
         assert!(cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.80)));
         assert!(cs2_round_match_winner_guard(1, 1, true, 0.80, 10, Some(1.80)));
         // M:0-0 without extreme dominance → blocked
         assert!(!cs2_round_match_winner_guard(0, 0, false, 0.80, 10, Some(1.80)));
         // 1-1 tied without decider flag → blocked
         assert!(!cs2_round_match_winner_guard(1, 1, false, 0.80, 10, Some(1.80)));
-        // prob below 72% → blocked
-        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.71, 10, Some(1.80)));
-        // rounds below 10 → blocked
-        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 9, Some(1.80)));
+        // prob below 68% → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.67, 10, Some(1.80)));
+        // rounds below 8 → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 7, Some(1.80)));
         // odds above 2.80 → blocked
         assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.81)));
         // no odds → blocked
@@ -2494,9 +2502,9 @@ mod strategy_hotfix_tests {
     }
 
     #[test]
-    fn football_and_generic_esports_stay_in_low_exposure_mode() {
+    fn football_and_generic_esports_exposure_caps() {
         let bankroll = 100.0;
-        assert_eq!(get_sport_exposure_cap("football", bankroll), 10.0);
+        assert_eq!(get_sport_exposure_cap("football", bankroll), 25.0);
         assert_eq!(get_sport_exposure_cap("esports", bankroll), 10.0);
         assert_eq!(dynamic_base_stake(bankroll, "football"), 0.50);
         assert_eq!(dynamic_base_stake(bankroll, "esports"), 0.50);
@@ -3614,8 +3622,10 @@ fn football_auto_bet_guard(goal_diff: i32, minute: Option<i32>) -> bool {
     match goal_diff {
         diff if diff >= 4 => minute >= 45,
         3 => minute >= 58,
-        2 => minute >= 72,
-        1 => false,
+        2 => minute >= 68,
+        // 1-goal lead from minute 85: at 85'+ the win probability is ~88-92%.
+        // 2026-03-14 audit: 76 SportGuardBlocked, vast majority 1-goal late game.
+        1 => minute >= 85,
         _ => false,
     }
 }
@@ -3652,9 +3662,10 @@ fn cs2_round_match_winner_guard(
     let odds_ok = azuro_odds.is_some_and(|odds| odds <= CS2_ROUND_MATCH_WINNER_MAX_ODDS);
     let has_map_lead = map_lead > map_lose;
     let is_decider = allow_tied_decider && map_lead == map_lose && map_lead == 1;
-    // Standard path: map lead or 1-1 decider + ≥72% + ≥10 rounds + odds ≤ 2.80
+    // Standard path: map lead or 1-1 decider + ≥68% + ≥8 rounds + odds ≤ 2.80
+    // 2026-03-14 audit: 148 RoundScoreMatchWinnerDisabled/day. Relaxed from 72%/10r.
     let standard = (has_map_lead || is_decider)
-        && expected_prob >= 0.72
+        && expected_prob >= 0.68
         && round_total >= CS2_ROUND_MATCH_WINNER_MIN_ROUNDS
         && odds_ok;
     // First-map domination: M:0-0 but map is essentially won (≥90% + ≥20 rounds)
@@ -4214,7 +4225,9 @@ fn find_score_edges(
         if cs2_reset_hold_state || cs2_round_rewind_hold_state || cs2_map_rollover_hold_state || cs2_incomplete_map_score_hold_state {
             if cs2_round_rewind_hold_state {
                 mark_cs2_glitch_quarantine(tracker, match_key, now);
-                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+                // Reduced 3→1: single rewind is common Tipsport noise, not systematic corruption.
+                // Needs 3 separate events within decay window to trigger lock.
+                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 1);
                 if let Some(lock_until) = distrust_lock_until {
                     info!(
                         "  ⛔ {} CS2 distrust lock active until {} after round rewind",
@@ -4302,7 +4315,8 @@ fn find_score_edges(
         if backward_score_jump {
             if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref()) {
                 mark_cs2_glitch_quarantine(tracker, match_key, now);
-                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+                // Reduced 3→2: backward jump is more suspicious than rewind but still not instant-lock worthy.
+                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 2);
                 if let Some(lock_until) = distrust_lock_until {
                     info!(
                         "  ⛔ {} CS2 distrust lock active until {} after backward score jump",
@@ -4478,7 +4492,8 @@ fn find_score_edges(
             );
         if cs2_forward_spike {
             mark_cs2_glitch_quarantine(tracker, match_key, now);
-            let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+            // Reduced 3→2: forward spike is suspicious but let it accumulate rather than instant-lock.
+            let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 2);
             info!(
                 "  ⏭️ {} CS2 forward spike {}-{} -> {}-{} ({}s) — skipping edge eval",
                 match_key,
