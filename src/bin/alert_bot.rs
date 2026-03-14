@@ -58,6 +58,7 @@ const CS2_SCORE_DISTRUST_LOCK_SECS: i64 = 45 * 60;
 /// Decay raised 15min → 20min: slightly wider to still accumulate repeat offenders
 const CS2_SCORE_DISTRUST_DECAY_SECS: i64 = 20 * 60;
 const CS2_SCORE_DISTRUST_LOCK_THRESHOLD: u8 = 3;
+const CS2_SCORE_DISTRUST_STABLE_RELEASE_EVENTS: u8 = 2;
 /// === AUTO-BET CONFIG ===
 const AUTO_BET_ENABLED: bool = true;
 /// Base stake per auto-bet in USD
@@ -1178,6 +1179,7 @@ struct Cs2DistrustState {
     points: u8,
     last_event_at: chrono::DateTime<Utc>,
     locked_until: Option<chrono::DateTime<Utc>>,
+    stable_progress_events: u8,
 }
 
 impl Cs2DistrustState {
@@ -1186,15 +1188,18 @@ impl Cs2DistrustState {
             points: 0,
             last_event_at: now,
             locked_until: None,
+            stable_progress_events: 0,
         }
     }
 
     fn record_event(&mut self, now: DateTime<Utc>, points: u8) -> (u8, Option<DateTime<Utc>>) {
         if (now - self.last_event_at).num_seconds() > CS2_SCORE_DISTRUST_DECAY_SECS {
             self.points = 0;
+            self.stable_progress_events = 0;
         }
 
         self.last_event_at = now;
+        self.stable_progress_events = 0;
         self.points = self.points.saturating_add(points);
 
         if self.points >= CS2_SCORE_DISTRUST_LOCK_THRESHOLD {
@@ -1206,6 +1211,24 @@ impl Cs2DistrustState {
         }
 
         (self.points, self.locked_until.filter(|until| now < *until))
+    }
+
+    fn observe_stable_progress(&mut self, now: DateTime<Utc>) -> bool {
+        if self.active_lock_until(now).is_none() {
+            return false;
+        }
+
+        self.last_event_at = now;
+        self.stable_progress_events = self.stable_progress_events.saturating_add(1);
+
+        if self.stable_progress_events < CS2_SCORE_DISTRUST_STABLE_RELEASE_EVENTS {
+            return false;
+        }
+
+        self.points = self.points.min(CS2_SCORE_DISTRUST_LOCK_THRESHOLD.saturating_sub(1));
+        self.locked_until = None;
+        self.stable_progress_events = 0;
+        true
     }
 
     fn active_lock_until(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -1855,7 +1878,7 @@ fn has_cs2_incomplete_current_map_score(detailed: &str) -> bool {
         return false;
     };
     let (scores, trailing_incomplete) = parse_cs2_score_segments(detailed);
-    trailing_incomplete && (current_map_num as usize > scores.len())
+    trailing_incomplete && (current_map_num as usize > scores.len()) && scores.is_empty()
 }
 
 /// Universal CS2/esports round score extractor — tries all formats.
@@ -2264,7 +2287,7 @@ fn is_cs2_incomplete_map_score_hold_state(
 
 #[cfg(test)]
 mod cs2_map_parser_tests {
-    use super::{parse_cs2_current_map, parse_dust2_current_map};
+    use super::{has_cs2_incomplete_current_map_score, parse_cs2_current_map, parse_dust2_current_map};
 
     #[test]
     fn dust2_map_one_is_detected_from_round_and_map_score() {
@@ -2289,6 +2312,13 @@ mod cs2_map_parser_tests {
         assert_eq!(parse_dust2_current_map("R:0-0 M:0-0"), None);
         assert_eq!(parse_cs2_current_map("Za 3 minuty"), None);
         assert_eq!(parse_cs2_current_map("Lepší ze 3 | 3. mapa"), Some(3));
+    }
+
+    #[test]
+    fn partial_current_map_holds_only_without_usable_series_context() {
+        assert!(has_cs2_incomplete_current_map_score("Lepší ze 3 | 1.mapa - 2:"));
+        assert!(!has_cs2_incomplete_current_map_score("Lepší ze 3 | 2.mapa - 13:8, 2:"));
+        assert!(!has_cs2_incomplete_current_map_score("Lepší ze 3 | 3.mapa - 13:8, 9:13, 7:"));
     }
 }
 
@@ -2535,6 +2565,7 @@ mod strategy_hotfix_tests {
         is_cs2_terminal_map_score,
         locked_exposure_total,
         mark_cs2_glitch_quarantine,
+        relax_cs2_distrust_on_stable_progress,
         record_cs2_distrust_event,
         refresh_active_bet_from_onchain_pending,
         score_edge_max_odds,
@@ -2866,6 +2897,48 @@ mod strategy_hotfix_tests {
         assert_eq!(points_after_second, 3);
         let until = second_lock.expect("lock set");
         assert!(until >= now + Duration::seconds(CS2_SCORE_DISTRUST_LOCK_SECS - 1));
+    }
+
+    #[test]
+    fn cs2_distrust_lock_releases_after_two_stable_progress_updates() {
+        let now = Utc::now();
+        let mut tracker = ScoreTracker::new();
+
+        record_cs2_distrust_event(&mut tracker, "esports::alliance_vs_nexus", now, 2);
+        let (_, second_lock) = record_cs2_distrust_event(
+            &mut tracker,
+            "esports::alliance_vs_nexus",
+            now + Duration::seconds(5),
+            1,
+        );
+        assert!(second_lock.is_some());
+
+        assert!(!relax_cs2_distrust_on_stable_progress(
+            &mut tracker,
+            "esports::alliance_vs_nexus",
+            now + Duration::seconds(15),
+            true,
+            4,
+            2,
+            5,
+            2,
+        ));
+        assert!(relax_cs2_distrust_on_stable_progress(
+            &mut tracker,
+            "esports::alliance_vs_nexus",
+            now + Duration::seconds(25),
+            true,
+            5,
+            2,
+            6,
+            2,
+        ));
+
+        let active_lock = tracker
+            .cs2_distrust_state
+            .get("esports::alliance_vs_nexus")
+            .and_then(|state| state.active_lock_until(now + Duration::seconds(25)));
+        assert!(active_lock.is_none());
     }
 
     #[test]
@@ -3787,6 +3860,32 @@ fn record_cs2_distrust_event(
         .record_event(now, points)
 }
 
+fn relax_cs2_distrust_on_stable_progress(
+    tracker: &mut ScoreTracker,
+    match_key: &str,
+    now: DateTime<Utc>,
+    score_changed: bool,
+    prev_s1: i32,
+    prev_s2: i32,
+    s1: i32,
+    s2: i32,
+) -> bool {
+    if !score_changed {
+        return false;
+    }
+
+    let monotonic_progress = s1 >= prev_s1 && s2 >= prev_s2 && (s1 > prev_s1 || s2 > prev_s2);
+    if !monotonic_progress || is_cs2_terminal_map_score(s1, s2) {
+        return false;
+    }
+
+    tracker
+        .cs2_distrust_state
+        .get_mut(match_key)
+        .map(|state| state.observe_stable_progress(now))
+        .unwrap_or(false)
+}
+
 fn blocked_score_edge_reason_codes(
     auto_bet_enabled: bool,
     sport_auto_allowed: bool,
@@ -4495,6 +4594,17 @@ fn find_score_edges(
 
         tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
 
+        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref())
+            && relax_cs2_distrust_on_stable_progress(tracker, match_key, now, score_changed, prev_s1, prev_s2, s1, s2)
+        {
+            info!(
+                "  ✅ {} {}-{}: CS2 distrust lock released after stable score progression",
+                match_key,
+                s1,
+                s2
+            );
+        }
+
         if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref()) {
             if let Some(lock_until) = tracker
                 .cs2_distrust_state
@@ -4709,20 +4819,12 @@ fn find_score_edges(
             && is_cs2_terminal_map_score(s1, s2)
         {
             mark_cs2_glitch_quarantine(tracker, match_key, now);
-            let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 2);
             info!(
-                "  ⏭️ {} {}-{}: terminal CS2 map score — likely settled map/rollover, skipping edge eval",
+                "  ⏭️ {} {}-{}: terminal CS2 map score — likely settled map/rollover, skipping edge eval without distrust penalty",
                 match_key,
                 s1,
                 s2
             );
-            if let Some(lock_until) = distrust_lock_until {
-                info!(
-                    "  ⛔ {} CS2 distrust lock active until {} after terminal map score",
-                    match_key,
-                    lock_until.to_rfc3339()
-                );
-            }
             if should_audit_esports_score_decision(
                 match_key,
                 live_esports_class.family,
@@ -4731,7 +4833,7 @@ fn find_score_edges(
                 append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
                     "match_key": match_key,
                     "path": "score_model",
-                    "decision": "blocked_candidate",
+                    "decision": "hold_candidate",
                     "reason_code": "ScoreTerminalMapState",
                     "reason_codes": ["ScoreTerminalMapState"],
                     "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
