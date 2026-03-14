@@ -13,6 +13,7 @@ data/bet_count_daily.txt
 data/bet_history.txt
 data/daily_pnl.json
 data/nft_model.json
+data/*.bak_*
 temp/
 nul
 .claude/
