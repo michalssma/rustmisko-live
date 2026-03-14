@@ -105,6 +105,15 @@ $procs = @(
         LogOut  = Join-Path $ROOT 'logs\executor.log'
         LogErr  = Join-Path $ROOT 'logs\executor_err.log'
     },
+    @{
+        Id      = 'dashboard'
+        Name    = 'node'
+        Exe     = 'node'
+        Args    = @((Join-Path $ROOT 'dashboard\server.js'))
+        WorkDir = Join-Path $ROOT 'dashboard'
+        LogOut  = Join-Path $ROOT 'logs\dashboard.log'
+        LogErr  = Join-Path $ROOT 'logs\dashboard_err.log'
+    }
 )
 
 # ── Per-process state ─────────────────────────────────────────────────────────
@@ -122,6 +131,11 @@ function Test-Alive([hashtable]$proc) {
     if ($proc.Id -eq 'executor') {
         $hit = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
                Where-Object { $_.CommandLine -match 'executor\\index\.js' }
+        return ($null -ne $hit -and @($hit).Count -gt 0)
+    }
+    if ($proc.Id -eq 'dashboard') {
+        $hit = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape((Join-Path $ROOT 'dashboard\server.js')) }
         return ($null -ne $hit -and @($hit).Count -gt 0)
     }
     if ($proc.Id -eq 'night-watch') {
@@ -181,7 +195,7 @@ if (Is-NightWatchEnabled) {
 }
 
 Write-WD 'INFO' "Watchdog started. interval=${CHECK_SEC}s backoff=${MAX_CONSECUTIVE}x->${COOLDOWN_MIN}min log-cap=${MAX_LOG_LINES}lines"
-$watchList = @('feed-hub', 'alert-bot', 'executor')
+$watchList = @('feed-hub', 'alert-bot', 'executor', 'dashboard')
 if (Is-NightWatchEnabled) {
     $watchList += 'night-watch'
 }

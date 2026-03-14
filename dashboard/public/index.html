@@ -66,6 +66,8 @@
           <span id="pending-summary" class="pending-summary">0 betů • $0.00</span>
           <span class="chevron-r">▶</span>
         </div>
+        <div id="recent-bet-summary" class="recent-bet-summary">Bez čerstvého bet eventu</div>
+        <div id="ops-audit-summary" class="ops-audit-summary">Drift 24h: 0 • Football containment: 0 bloků</div>
       </div>
 
       <!-- Loss limit bar (clickable → adjust limit) -->
@@ -169,15 +171,15 @@
       </div>
 
       <div class="card">
-        <div class="card-header">Auto-bet</div>
+        <div class="card-header">NO BET</div>
         <div class="toggle-row">
-          <span id="autobet-label" class="toggle-label">ENABLED</span>
+          <span id="autobet-label" class="toggle-label">LIVE BET ON</span>
           <label class="toggle-switch">
             <input type="checkbox" id="autobet-toggle" onchange="toggleAutobet()" checked>
             <span class="toggle-thumb"></span>
           </label>
         </div>
-        <div style="padding:0 14px 10px;font-size:11px;color:var(--muted)">ON = alert-bot beží. OFF = alert-bot zastaven.</div>
+        <div style="padding:0 14px 10px;font-size:11px;color:var(--muted)">ON = alert-bot běží, ale nesází. OFF = live auto-bet povolen. Start/stop procesu je v kartě Procesy.</div>
       </div>
 
       <div class="card">

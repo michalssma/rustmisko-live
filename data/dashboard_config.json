@@ -1,5 +1,6 @@
 {
   "autobet_enabled": true,
+  "no_bet_mode": false,
   "sport_focus": [
     "all"
   ],

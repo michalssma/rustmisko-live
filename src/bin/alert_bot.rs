@@ -14,7 +14,7 @@
 //!   $env:EXECUTOR_URL="http://127.0.0.1:3030"  # Node.js sidecar
 //!   cargo run --bin alert_bot
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,12 @@ const CASHOUT_MIN_PROFIT_PCT: f64 = 3.0;
 const MIN_SCORE_EDGE_PCT: f64 = 5.0;
 /// Score edge cooldown per match (seconds)
 const SCORE_EDGE_COOLDOWN_SECS: i64 = 60; // 60s — reduced spam, still catches score changes
+/// After a CS2 score rewind/jump glitch, suppress further score-edge bets on that match
+/// long enough for the corrupted branch to die out.
+const CS2_SCORE_GLITCH_QUARANTINE_SECS: i64 = 20 * 60;
+const CS2_SCORE_DISTRUST_LOCK_SECS: i64 = 3 * 60 * 60;
+const CS2_SCORE_DISTRUST_DECAY_SECS: i64 = 15 * 60;
+const CS2_SCORE_DISTRUST_LOCK_THRESHOLD: u8 = 3;
 /// === AUTO-BET CONFIG ===
 const AUTO_BET_ENABLED: bool = true;
 /// Base stake per auto-bet in USD
@@ -55,6 +61,9 @@ const AUTO_BET_STAKE_USD: f64 = 3.0;
 /// Tennis/basketball score-edge: activated at $0.50 (was paper-trading $0.00)
 /// Data shows tennis anomaly 1.50-1.70 is profitable; score-edge with 30% min is even stricter
 const AUTO_BET_STAKE_LOW_USD: f64 = 0.50;
+/// Smallest stake we consider executable in the current Azuro setup.
+/// Historical ledger contains multiple accepted bets at exactly $0.50.
+const MIN_EXECUTABLE_STAKE_USD: f64 = 0.50;
 /// Minimum Azuro odds to auto-bet (skip heavy favorites, prevents massive risk/reward leakage)
 /// Raised 1.40→1.70: at 59% WR break-even is 1/0.59=1.695 — below 1.70 is systematically -EV
 const AUTO_BET_MIN_ODDS: f64 = 1.70;
@@ -65,6 +74,11 @@ const AUTO_BET_MAX_ODDS: f64 = 3.00;
 const AUTO_BET_MAX_ODDS_CS2_MAP: f64 = 3.00;
 /// Lowered 2.5→1.5: map-level bets are correlated within same series, limiting max multiplier reduces double-exposure risk (KRU map2+map3 = $2.88 at 2.5x)
 const SCORE_EDGE_STAKE_MAX_MULT: f64 = 1.5;
+/// Startup-loaded bets without token_id get only a short grace window before they stop
+/// consuming pending slots / inflight exposure unless executor truth confirms them.
+const STARTUP_UNVERIFIED_GRACE_SECS: i64 = 90;
+const ACCEPTED_ODDS_DRIFT_ALERT_ABS: f64 = 0.15;
+const ACCEPTED_ODDS_DRIFT_ALERT_REL_PCT: f64 = 8.0;
 const ESPORTS_MAPLEVEL_MATCH_EDGE_MIN_PCT: f64 = 16.0;
 const ESPORTS_MAPLEVEL_MATCH_MAX_ODDS: f64 = 1.65;
 /// Manual/Reaction default stake in USD
@@ -107,6 +121,7 @@ const CONDITION_MAX_AGE_MS: u64 = 4000;
 /// Base chain poll cadence is much slower than Polygon WS/GQL cadence.
 /// Tightened 120s→30s: still allows Base bets, but cuts truly stale conditions.
 const CONDITION_MAX_AGE_MS_BASE: u64 = 30_000;
+const CS2_ROUND_MATCH_WINNER_MIN_ROUNDS: i32 = 10;
 /// Max total pipeline time for live bets; drop if exceeded (condition likely paused)
 /// ROLLBACK: set to 999_999 to effectively disable pipeline budget
 const PIPELINE_BUDGET_MS: u64 = 1200;
@@ -130,12 +145,16 @@ const AUTO_BET_MIN_MARKET_SOURCES: usize = 2;
 const MAX_ODDS_AGE_SECS: i64 = 20;
 /// Maximum concurrent pending bets (inflight guard)
 const MAX_CONCURRENT_PENDING: usize = 8;
+/// Relaxed 2.25→2.80: with map lead + ≥72% prob the edge is real, 2.25 was
+/// cutting off too many legitimate MW signals (768 blocks/day).
+const CS2_ROUND_MATCH_WINNER_MAX_ODDS: f64 = 2.80;
+const ANOMALY_SOURCE_SKIP_LOG_COOLDOWN_SECS: i64 = 120;
 /// Loss streak cooldown: consecutive LOST count to trigger pause
 const LOSS_STREAK_PAUSE_THRESHOLD: usize = 4;
 /// Loss streak pause duration (seconds)
 const LOSS_STREAK_PAUSE_SECS: u64 = 180;
 /// Minimum bankroll to allow auto-bet (skip if below)
-const MIN_BANKROLL_USD: f64 = 10.0;
+const MIN_BANKROLL_USD: f64 = 5.0;
 /// Periodic ledger-based recovery cadence for unresolved accepted bets.
 const LEDGER_RECONCILE_EVERY_CLAIM_TICKS: u32 = 5;
 /// Unresolved accepted bets older than this should be surfaced explicitly.
@@ -540,9 +559,10 @@ fn sport_score_edge_dry_run_enabled(sport: &str) -> bool {
 fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
     match sport {
         // Concrete esports families: prefer map_winner, but allow match_winner fallback when map market is missing.
-        // Slightly relaxed 38→35 after market identity + dedup cleanup to restore some safe throughput.
+        // Gentle throughput nudge: 35→33 keeps the corridor conservative while letting through
+        // only the stronger fallback candidates that were recently missing by a narrow margin.
         "cs2" | "valorant" | "dota-2" | "league-of-legends" | "lol"
-            => (true, 35.0, 1.0, "match_or_map"),
+            => (true, 33.0, 1.0, "match_or_map"),
         // Generic esports: same 38% threshold, blocked regardless by BLOCK_GENERIC_ESPORTS_BETS
         "esports"
             => (true, 38.0, 1.0, "match_or_map"),
@@ -550,13 +570,15 @@ fn get_sport_config(sport: &str) -> (bool, f64, f64, &'static str) {
         // Raised 30→38%: production data (131W/125L) shows edge<40% is -EV across all sports
         "tennis"
             => (true, 38.0, 1.0, "match_winner"),
-        // Basketball: match_winner — point spread model; +$4.49 P&L so keep but raise threshold
+        // Basketball: match_winner — point spread model; +$4.49 P&L, relaxed 38→35% with tiered guard
         "basketball"
-            => (true, 38.0, 1.0, "match_winner"),
-        // Football: DISABLED — production P&L -$18.59, WR 37%, 38 bets. No strategy worked.
-        // Re-enable when we have a football-specific model with >52% WR at avg odds.
+            => (true, 35.0, 1.0, "match_winner"),
+        // Football: containment mode.
+        // Dynamic edge threshold via dynamic_football_min_edge (24-30% by minute).
+        // Guard requires: goal_diff≥2 @ minute≥72, OR goal_diff≥3 @ minute≥58,
+        // OR goal_diff≥4 @ minute≥45.
         "football"
-            => (false, 38.0, 1.0, "match_winner"),
+            => (true, 28.0, 1.0, "match_winner"),
         // New sports: alerts enabled, conservative edge thresholds
         "volleyball" | "ice-hockey" | "baseball" | "cricket" | "boxing"
             => (true, 30.0, 1.0, "match_winner"),
@@ -573,28 +595,43 @@ fn dynamic_football_min_edge(detailed_score: Option<&str>) -> f64 {
     let ds = detailed_score.unwrap_or("");
     if let Some(minute) = parse_football_minute_static(ds) {
         match minute {
-            0..=45 => 28.0,    // First half football remains too noisy for aggressive live edge betting
-            46..=60 => 26.0,   // Early second half: require materially larger model-vs-market gap
-            61..=75 => 24.0,   // Only strong late-game edges are allowed through
-            76..=85 => 22.0,   // Very late game can relax slightly, but not below observed safe band
-            _ => 22.0,         // 86+: keep late-game selective instead of auto-trusting the clock
+            0..=55 => 30.0,
+            56..=69 => 28.0,
+            70..=80 => 26.0,
+            81..=90 => 24.0,
+            _ => 24.0,
         }
     } else {
-        28.0 // No minute info: treat football as high uncertainty and keep it alert-first
+        30.0 // No minute info: treat football as high uncertainty and keep it alert-first
     }
 }
 
 /// Static version of parse_football_minute for use in dynamic_football_min_edge
 fn parse_football_minute_static(detailed: &str) -> Option<i64> {
-    // Pattern 1: "NN.min"
+    // Pattern 1: "NN.min" or "NN+N.min" (stoppage time)
     if let Some(min_idx) = detailed.find(".min") {
         let before = &detailed[..min_idx];
-        let digits: String = before.chars().rev()
+        // First: grab trailing digits (the immediate number before .min)
+        let trailing_digits: String = before.chars().rev()
             .take_while(|c| c.is_ascii_digit())
             .collect::<String>()
             .chars().rev().collect();
-        if let Ok(min) = digits.parse::<i64>() {
-            return Some(min);
+        if trailing_digits.is_empty() { /* fall through to next pattern */ }
+        else {
+            let trailing_num: i64 = trailing_digits.parse().unwrap_or(0);
+            // Check for stoppage time: "NN+N.min" → before the trailing digits there's a '+'
+            let prefix = &before[..before.len() - trailing_digits.len()];
+            if prefix.ends_with('+') {
+                // Parse the base minute before '+'
+                let base_str: String = prefix[..prefix.len()-1].chars().rev()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .chars().rev().collect();
+                if let Ok(base) = base_str.parse::<i64>() {
+                    return Some(base + trailing_num);
+                }
+            }
+            return Some(trailing_num);
         }
     }
     // Pattern 2: "<Nmin"
@@ -766,10 +803,11 @@ fn get_exposure_caps(bankroll: f64) -> (f64, f64, f64, f64, f64) {
 fn score_edge_max_odds(market_key: &str, sport: &str, cs2_map_confidence: Option<&'static str>) -> f64 {
     let is_map_winner = market_key.starts_with("map") && market_key.ends_with("_winner");
     match sport {
-        // Football score-edge produced multiple guarded, high-edge candidates in the 2.21-2.34 band.
-        // Keep the cap conservative, but wide enough to not miss the safest late-score windows.
-        "football" => 2.35,
-        "tennis" => 2.10,
+        // Football containment: stop chasing weak comeback and late-chaos prices.
+        "football" => 2.05,
+        // Tennis audit: 1.90-2.09 was materially negative while 1.60-1.89 stayed positive.
+        // Keep tennis as a low-stake data-collection sport, but stop auto-betting the weak upper band.
+        "tennis" => 1.90,
         "basketball" => 2.00,
         "cs2" => {
             if let Some(tier) = cs2_map_confidence {
@@ -804,9 +842,8 @@ fn score_edge_max_odds(market_key: &str, sport: &str, cs2_map_confidence: Option
 fn score_edge_min_odds(sport: &str, market_key: &str) -> f64 {
     let is_map_winner = market_key.starts_with("map") && market_key.ends_with("_winner");
     match sport {
-        // Football was missing guarded late-game entries purely because the global floor of 1.70 was too high.
-        // 1.55 still avoids ultra-short prices while allowing strong 1.58-1.69 score edges through.
-        "football" => 1.55,
+        // Football containment: drop the weak 1.55-1.64 band and keep only safer live entries.
+        "football" => 1.65,
         // Production observations: esports score-edge is healthier in the 1.50-1.70 band.
         // Keep match_winner a touch stricter than map_winner, because map edges are backed by round-level state.
         "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => {
@@ -820,8 +857,12 @@ fn score_edge_min_odds(sport: &str, market_key: &str) -> f64 {
 /// Returns max total wagered per sport per day as fraction of bankroll
 fn get_sport_exposure_cap(sport: &str, bankroll: f64) -> f64 {
     let frac = match sport {
-        "cs2" | "esports" | "valorant" | "dota-2" | "league-of-legends" | "lol" => 0.40,
-        "football" => 0.25,
+        // Keep explicit CS2 wide enough to scale once signals are proven, but clamp unresolved generic esports.
+        "cs2" => 0.40,
+        "esports" => 0.10,
+        "valorant" | "dota-2" | "league-of-legends" | "lol" => 0.20,
+        // Football remains observational until guarded live sample turns sustainably positive.
+        "football" => 0.10,
         "tennis" | "basketball" => 0.10,
         _ => 0.10, // conservative for new sports
     };
@@ -832,12 +873,25 @@ fn get_sport_exposure_cap(sport: &str, bankroll: f64) -> f64 {
 fn dynamic_base_stake(bankroll: f64, sport: &str) -> f64 {
     let (per_bet_frac, _, _, _, _) = get_exposure_caps(bankroll);
     let base = bankroll * per_bet_frac * 0.9;
-    // Data-collection sports: cap at $1
-    if sport == "tennis" || sport == "basketball" {
+    // Data-collection / guarded sports: keep them in the cheap-information regime.
+    if sport == "tennis" || sport == "basketball" || sport == "football" || sport == "esports" {
         base.min(AUTO_BET_STAKE_LOW_USD)
     } else {
         base
     }
+}
+
+fn executable_stake_floor(bankroll: f64) -> f64 {
+    if bankroll >= MIN_BANKROLL_USD {
+        MIN_EXECUTABLE_STAKE_USD
+    } else {
+        0.0
+    }
+}
+
+fn stake_below_executable_floor(raw_stake: f64, bankroll: f64) -> bool {
+    let floor = executable_stake_floor(bankroll);
+    floor > 0.0 && raw_stake > 0.0 && raw_stake < floor
 }
 
 /// Stake Trimmer: min(calculated_stake, per_bet, cond_left, match_left, daily_left, inflight_left, sport_left)
@@ -881,7 +935,10 @@ fn trim_stake(
     }
 
     let (per_bet_frac, per_cond_frac, per_match_frac, _, inflight_frac) = get_exposure_caps(bankroll);
-    let per_bet_cap = bankroll * per_bet_frac;
+    let min_executable_stake = executable_stake_floor(bankroll);
+    // Micro bankrolls were getting stuck at e.g. $9.64 * 5% = $0.48.
+    // Keep condition/match/daily caps strict, but let per-bet cap reach the smallest executable size.
+    let per_bet_cap = (bankroll * per_bet_frac).max(min_executable_stake);
     let per_cond_cap = bankroll * per_cond_frac;
     let per_match_cap = bankroll * per_match_frac;
 
@@ -924,7 +981,7 @@ fn trim_stake(
         .min(sport_room);
 
     // OBSERVABILITY: log trim_stake evaluation for every bet attempt
-    if final_stake < boosted_stake * 0.99 || final_stake < 0.50 {
+    if final_stake < boosted_stake * 0.99 || final_stake < min_executable_stake {
         tracing::debug!(
             "📊 TRIM_STAKE: raw={:.2} boosted={:.2} final={:.2} | caps: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} path_daily_lim={:.2} path={}",
             calculated_stake, boosted_stake, final_stake,
@@ -933,9 +990,9 @@ fn trim_stake(
         );
     }
 
-    // IMPORTANT: When a potentially valid bet (>= $0.50) gets trimmed to $0,
+    // IMPORTANT: When a potentially valid bet gets trimmed below executable size,
     // log a full cap breakdown at INFO so we can root-cause “SCORE placed=0”.
-    if calculated_stake >= 0.50 && final_stake < 0.50 {
+    if boosted_stake >= min_executable_stake && final_stake < min_executable_stake {
         tracing::info!(
             "🛡️ TRIM_TO_ZERO: raw={:.2} boosted={:.2} final={:.2} | rooms: bet={:.2} cond={:.2} match={:.2} daily={:.2} inflight={:.2} sport={:.2} | inflight_total={:.2} sport_exp={:.2} cond_exp={:.2} match_exp={:.2} daily_loss={:.2} | sod_br={:.2} cur_br={:.2} eff_daily_lim={:.2} path_daily_lim={:.2} sport={} path={}",
             calculated_stake,
@@ -961,7 +1018,7 @@ fn trim_stake(
         );
     }
 
-    if final_stake < 0.50 { 0.0 } else { final_stake }
+    if final_stake < min_executable_stake { 0.0 } else { final_stake }
 }
 
 /// Cross-validation result for HLTV vs Chance score comparison.
@@ -1058,6 +1115,46 @@ impl BackwardScoreState {
         }
 
         self.seen_count >= 2
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Cs2DistrustState {
+    points: u8,
+    last_event_at: chrono::DateTime<Utc>,
+    locked_until: Option<chrono::DateTime<Utc>>,
+}
+
+impl Cs2DistrustState {
+    fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            points: 0,
+            last_event_at: now,
+            locked_until: None,
+        }
+    }
+
+    fn record_event(&mut self, now: DateTime<Utc>, points: u8) -> (u8, Option<DateTime<Utc>>) {
+        if (now - self.last_event_at).num_seconds() > CS2_SCORE_DISTRUST_DECAY_SECS {
+            self.points = 0;
+        }
+
+        self.last_event_at = now;
+        self.points = self.points.saturating_add(points);
+
+        if self.points >= CS2_SCORE_DISTRUST_LOCK_THRESHOLD {
+            let locked_until = now + chrono::Duration::seconds(CS2_SCORE_DISTRUST_LOCK_SECS);
+            self.locked_until = Some(match self.locked_until {
+                Some(existing) if existing > locked_until => existing,
+                _ => locked_until,
+            });
+        }
+
+        (self.points, self.locked_until.filter(|until| now < *until))
+    }
+
+    fn active_lock_until(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.locked_until.filter(|until| now < *until)
     }
 }
 
@@ -1243,6 +1340,20 @@ struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
     message_reaction: Option<TgMessageReaction>,
+    callback_query: Option<TgCallbackQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgCallbackQuery {
+    id: String,
+    from: TgUser,
+    data: Option<String>,
+    message: Option<TgMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUser {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1284,22 +1395,121 @@ struct SentAlert {
 // Telegram helpers
 // ====================================================================
 
-async fn tg_send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) -> Result<i64> {
+/// Send message with inline keyboard buttons.
+/// `keyboard` is a Vec of rows, each row is Vec of (label, callback_data).
+async fn tg_send_message_with_keyboard(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    keyboard: Vec<Vec<(&str, &str)>>,
+) -> Result<i64> {
     if token.trim().is_empty() || chat_id == 0 {
         return Ok(0);
     }
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let rows: Vec<Vec<serde_json::Value>> = keyboard.iter().map(|row| {
+        row.iter().map(|(label, data)| {
+            serde_json::json!({ "text": label, "callback_data": data })
+        }).collect()
+    }).collect();
     let body = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": true,
+        "reply_markup": { "inline_keyboard": rows },
+    });
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return Err(anyhow!("Telegram sendMessage failed: {}", e)),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("Telegram sendMessage failed: {} — {}", status, body));
+    }
+    let resp_json: serde_json::Value = resp.json().await.unwrap_or_default();
+    Ok(resp_json["result"]["message_id"].as_i64().unwrap_or(0))
+}
+
+async fn tg_edit_message_with_keyboard(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    keyboard: Vec<Vec<(&str, &str)>>,
+) -> Result<i64> {
+    if token.trim().is_empty() || chat_id == 0 || message_id == 0 {
+        return Ok(0);
+    }
+    let url = format!("https://api.telegram.org/bot{}/editMessageText", token);
+    let rows: Vec<Vec<serde_json::Value>> = keyboard.iter().map(|row| {
+        row.iter().map(|(label, data)| {
+            serde_json::json!({ "text": label, "callback_data": data })
+        }).collect()
+    }).collect();
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true,
+        "reply_markup": { "inline_keyboard": rows },
+    });
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => return Err(anyhow!("Telegram editMessageText failed: {}", e)),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if body.contains("message is not modified") {
+            return Ok(message_id);
+        }
+        return Err(anyhow!("Telegram editMessageText failed: {} — {}", status, body));
+    }
+    Ok(message_id)
+}
+
+/// Answer callback query (removes "loading" spinner on button)
+async fn tg_answer_callback_query(client: &reqwest::Client, token: &str, callback_id: &str, text: Option<&str>) {
+    let url = format!("https://api.telegram.org/bot{}/answerCallbackQuery", token);
+    let mut body = serde_json::json!({ "callback_query_id": callback_id });
+    if let Some(t) = text {
+        body["text"] = serde_json::json!(t);
+    }
+    let _ = client.post(&url).json(&body).send().await;
+}
+
+async fn tg_send_message(client: &reqwest::Client, token: &str, chat_id: i64, text: &str) -> Result<i64> {
+    if token.trim().is_empty() || chat_id == 0 {
+        return Ok(0);
+    }
+    let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+    let persistent_menu = serde_json::json!({
+        "keyboard": [
+            [{ "text": "/status" }, { "text": "/menu" }],
+            [{ "text": "/prehled" }, { "text": "/bets" }],
+            [{ "text": "/claim" }, { "text": "/help" }]
+        ],
+        "resize_keyboard": true,
+        "is_persistent": true,
+        "input_field_placeholder": "Vyber příkaz nebo napiš YES $5"
+    });
+    let body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": true,
+        "reply_markup": persistent_menu,
     });
     let resp = match client.post(&url).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
             warn!("Telegram sendMessage request failed: {}", e);
-            return Ok(0);
+            return Err(anyhow!("Telegram sendMessage request failed: {}", e));
         }
     };
     if !resp.status().is_success() {
@@ -1307,13 +1517,13 @@ async fn tg_send_message(client: &reqwest::Client, token: &str, chat_id: i64, te
         let body = resp.text().await.unwrap_or_default();
         warn!("Telegram sendMessage failed: {} — {}", status, body);
         // Non-fatal: keep bot running even if Telegram is misconfigured.
-        return Ok(0);
+        return Err(anyhow!("Telegram sendMessage failed: {} — {}", status, body));
     }
     let resp_json: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             warn!("Telegram sendMessage JSON parse failed: {}", e);
-            return Ok(0);
+            return Err(anyhow!("Telegram sendMessage JSON parse failed: {}", e));
         }
     };
     let msg_id = resp_json["result"]["message_id"].as_i64().unwrap_or(0);
@@ -1325,7 +1535,7 @@ async fn tg_get_updates(client: &reqwest::Client, token: &str, offset: i64) -> R
         return Ok(TgUpdatesResponse { ok: false, result: vec![] });
     }
     let url = format!(
-        "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=5&allowed_updates=[\"message\",\"message_reaction\"]",
+        "https://api.telegram.org/bot{}/getUpdates?offset={}&timeout=5&allowed_updates=[\"message\",\"message_reaction\",\"callback_query\"]",
         token, offset
     );
     let resp = match client.get(&url).send().await {
@@ -1388,6 +1598,10 @@ struct ScoreTracker {
     edge_cooldown: HashMap<String, chrono::DateTime<Utc>>,
     /// match_key → transient lower score waiting for second confirmation
     backward_scores: HashMap<String, BackwardScoreState>,
+    /// match_key → quarantine-until after CS2 feed glitch / rewind
+    cs2_glitch_quarantine_until: HashMap<String, chrono::DateTime<Utc>>,
+    /// match_key → distrust score / lock after repeated or severe CS2 score anomalies
+    cs2_distrust_state: HashMap<String, Cs2DistrustState>,
 }
 
 impl ScoreTracker {
@@ -1396,6 +1610,8 @@ impl ScoreTracker {
             prev_scores: HashMap::new(),
             edge_cooldown: HashMap::new(),
             backward_scores: HashMap::new(),
+            cs2_glitch_quarantine_until: HashMap::new(),
+            cs2_distrust_state: HashMap::new(),
         }
     }
 
@@ -1405,6 +1621,10 @@ impl ScoreTracker {
         self.prev_scores.retain(|_, (_, _, ts)| *ts > cutoff);
         self.edge_cooldown.retain(|_, ts| *ts > cutoff);
         self.backward_scores.retain(|_, state| state.first_seen_at > cutoff);
+        self.cs2_glitch_quarantine_until.retain(|_, ts| *ts > cutoff);
+        self.cs2_distrust_state.retain(|_, state| {
+            state.last_event_at > cutoff || state.locked_until.is_some_and(|until| until > cutoff)
+        });
     }
 }
 
@@ -1499,6 +1719,26 @@ fn parse_dust2_map_score(detailed: &str) -> Option<(i32, i32)> {
         }
     }
     None
+}
+
+/// Derive the currently active CS2 map from Dust2.us score context.
+/// Example: "R:8-6 M:0-0" -> map1, "R:4-0 M:1-1" -> map3.
+/// Conservative by design: requires visible round progress and only returns
+/// plausible map numbers.
+fn parse_dust2_current_map(detailed: &str) -> Option<u8> {
+    let (round1, round2) = parse_dust2_round_score(detailed)?;
+    let (map1, map2) = parse_dust2_map_score(detailed)?;
+
+    if round1 == 0 && round2 == 0 {
+        return None;
+    }
+
+    let active_map = map1 + map2 + 1;
+    if !(1..=5).contains(&active_map) {
+        return None;
+    }
+
+    Some(active_map as u8)
 }
 
 fn parse_cs2_score_pair(segment: &str) -> Option<(i32, i32)> {
@@ -1847,6 +2087,33 @@ fn is_cs2_backward_score_pending_state(
     total_drop > 0 && total_drop <= 2
 }
 
+fn is_cs2_forward_spike_state(
+    prev_score1: i32,
+    prev_score2: i32,
+    score1: i32,
+    score2: i32,
+    elapsed_secs: i64,
+    detailed: Option<&str>,
+    esports_family: Option<&str>,
+) -> bool {
+    if !is_cs2_like(esports_family, detailed) {
+        return false;
+    }
+
+    if elapsed_secs > 180 || prev_score1.max(prev_score2) <= 3 || score1.max(score2) <= 3 {
+        return false;
+    }
+
+    let delta1 = score1 - prev_score1;
+    let delta2 = score2 - prev_score2;
+    let mixed_direction = (delta1 > 0 && delta2 < 0) || (delta2 > 0 && delta1 < 0);
+    if !mixed_direction {
+        return false;
+    }
+
+    delta1.abs() + delta2.abs() >= 6 || (delta1.abs() >= 3 && delta2.abs() >= 3)
+}
+
 /// Esports anomaly guard: is the match "in-progress" enough to trust odds anomaly?
 /// Returns true if match has progressed past early-game noise zone.
 /// Logic: map_diff ≥ 1 (someone won a map) OR round_total ≥ 5 (current map in progress).
@@ -1892,6 +2159,10 @@ fn parse_cs2_round_score(detailed: &str) -> Option<(i32, i32)> {
 /// Parse the current map number from detailed_score.
 /// "Lepší ze 3 | 3.mapa - 13:6, 9:13, 7:12" → Some(3)
 fn parse_cs2_current_map(detailed: &str) -> Option<u8> {
+    if let Some(active_map) = parse_dust2_current_map(detailed) {
+        return Some(active_map);
+    }
+
     // Look for "N.mapa" pattern
     for segment in detailed.split('|') {
         let trimmed = segment.trim().to_lowercase();
@@ -1936,6 +2207,604 @@ fn is_cs2_incomplete_map_score_hold_state(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+mod cs2_map_parser_tests {
+    use super::{parse_cs2_current_map, parse_dust2_current_map};
+
+    #[test]
+    fn dust2_map_one_is_detected_from_round_and_map_score() {
+        assert_eq!(parse_dust2_current_map("R:8-6 M:0-0"), Some(1));
+        assert_eq!(parse_cs2_current_map("R:8-6 M:0-0"), Some(1));
+    }
+
+    #[test]
+    fn dust2_map_three_is_detected_from_series_score() {
+        assert_eq!(parse_dust2_current_map("R:4-0 M:1-1"), Some(3));
+        assert_eq!(parse_cs2_current_map("R:4-0 M:1-1"), Some(3));
+    }
+
+    #[test]
+    fn tipsport_explicit_map_label_still_wins() {
+        assert_eq!(parse_cs2_current_map("Lepší ze 3 | 3.mapa - 13:6, 9:13, 7:12"), Some(3));
+        assert_eq!(parse_cs2_current_map("Lepší ze 3 | 2.mapa - 13:6, 4:8"), Some(2));
+    }
+
+    #[test]
+    fn no_active_map_without_round_progress() {
+        assert_eq!(parse_dust2_current_map("R:0-0 M:0-0"), None);
+        assert_eq!(parse_cs2_current_map("Za 3 minuty"), None);
+        assert_eq!(parse_cs2_current_map("Lepší ze 3 | 3. mapa"), Some(3));
+    }
+}
+
+#[cfg(test)]
+mod football_parser_tests {
+    use super::{
+        cs2_round_edge_max_odds_override,
+        dynamic_football_min_edge,
+        football_auto_bet_guard,
+        parse_football_minute_static,
+    };
+
+    // === parse_football_minute_static ===
+    #[test]
+    fn parses_nn_min_pattern() {
+        assert_eq!(parse_football_minute_static("78.min 2:0"), Some(78));
+        assert_eq!(parse_football_minute_static("45.min"), Some(45));
+        assert_eq!(parse_football_minute_static("5.min 0:0"), Some(5));
+        assert_eq!(parse_football_minute_static("90.min 1:1"), Some(90));
+    }
+
+    #[test]
+    fn parses_stoppage_time() {
+        assert_eq!(parse_football_minute_static("2.pol. - 90+4.min (0:1, 0:0)"), Some(94));
+        assert_eq!(parse_football_minute_static("45+3.min (1:1)"), Some(48));
+        assert_eq!(parse_football_minute_static(".pol. - 45+3.min (1:1)"), Some(48));
+        assert_eq!(parse_football_minute_static("90+1.min"), Some(91));
+    }
+
+    #[test]
+    fn parses_lt_nmin_pattern() {
+        assert_eq!(parse_football_minute_static("<80min"), Some(80));
+        assert_eq!(parse_football_minute_static("<45min"), Some(45));
+    }
+
+    #[test]
+    fn parses_half_markers() {
+        assert_eq!(parse_football_minute_static("1.pol"), Some(25));
+        assert_eq!(parse_football_minute_static("2.pol"), Some(65));
+    }
+
+    #[test]
+    fn returns_none_for_no_minute() {
+        assert_eq!(parse_football_minute_static(""), None);
+        assert_eq!(parse_football_minute_static("Za 3 minuty"), None);
+        assert_eq!(parse_football_minute_static("Prestávka"), None);
+    }
+
+    #[test]
+    fn real_feed_formats() {
+        // Real detailed_score strings from live feed-hub (2026-03-13)
+        assert_eq!(parse_football_minute_static("2.pol. - 90+4.min (0:1, 0:0)"), Some(94));
+        assert_eq!(parse_football_minute_static("2.pol. - 52.min (4:0, 1:1)"), Some(52));
+        assert_eq!(parse_football_minute_static(".pol. - 14.min (0:0)"), Some(14));
+        assert_eq!(parse_football_minute_static(".pol. - 77.min (1:1, 2:0)02"), Some(77));
+        assert_eq!(parse_football_minute_static("Přestávka (1:1)"), None);  // halftime = no minute
+        assert_eq!(parse_football_minute_static(".pol. - 82.min (0:0, 0:0)"), Some(82));
+        assert_eq!(parse_football_minute_static(".pol. - 45+3.min (1:1)"), Some(48));
+        assert_eq!(parse_football_minute_static("(0:2, 1:1)"), None);  // no minute info
+        assert_eq!(parse_football_minute_static("Za 7 minut"), None);  // pre-match
+    }
+
+    // === dynamic_football_min_edge ===
+    #[test]
+    fn football_dynamic_edge_tiers() {
+        assert_eq!(dynamic_football_min_edge(Some("30.min 1:0")), 30.0);
+        assert_eq!(dynamic_football_min_edge(Some("60.min 2:0")), 28.0);
+        assert_eq!(dynamic_football_min_edge(Some("75.min 3:1")), 26.0);
+        assert_eq!(dynamic_football_min_edge(Some("85.min 2:0")), 24.0);
+        assert_eq!(dynamic_football_min_edge(Some("90.min 2:0")), 24.0);
+        assert_eq!(dynamic_football_min_edge(None), 30.0);
+    }
+
+    // === football_auto_bet_guard ===
+    #[test]
+    fn guard_blocks_single_goal_always() {
+        assert!(!football_auto_bet_guard(1, Some(90)));
+        assert!(!football_auto_bet_guard(1, Some(45)));
+        assert!(!football_auto_bet_guard(0, Some(90)));
+    }
+
+    #[test]
+    fn guard_two_goals_needs_minute_72() {
+        assert!(!football_auto_bet_guard(2, Some(71)));
+        assert!(football_auto_bet_guard(2, Some(72)));
+        assert!(football_auto_bet_guard(2, Some(85)));
+    }
+
+    #[test]
+    fn guard_three_goals_needs_minute_58_or_four_goals_45() {
+        assert!(!football_auto_bet_guard(3, Some(57)));
+        assert!(football_auto_bet_guard(3, Some(58)));
+        assert!(!football_auto_bet_guard(4, Some(44)));
+        assert!(football_auto_bet_guard(4, Some(45)));
+    }
+
+    #[test]
+    fn guard_no_minute_blocks() {
+        assert!(!football_auto_bet_guard(3, None));
+        assert!(!football_auto_bet_guard(2, None));
+    }
+
+    #[test]
+    fn cs2_medium_map_override_unlocks_staged_map_states_only() {
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "map2_winner", Some("MEDIUM"), 35.5, 9, 1),
+            Some(2.20)
+        );
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "map2_winner", Some("MEDIUM"), 41.5, 8, 1),
+            Some(2.30)
+        );
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "map2_winner", Some("MEDIUM"), 34.2, 12, 7),
+            Some(2.10)
+        );
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "map2_winner", Some("MEDIUM"), 35.5, 7, 3),
+            None
+        );
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "map2_winner", Some("LOW"), 35.5, 9, 1),
+            None
+        );
+        assert_eq!(
+            cs2_round_edge_max_odds_override("cs2", "match_winner", Some("MEDIUM"), 35.5, 9, 1),
+            Some(2.90)
+        );
+    }
+}
+
+#[cfg(test)]
+mod basketball_guard_tests {
+    #[test]
+    fn tiered_guard_logic() {
+        // Tier 3: total >= 140, diff >= 10
+        assert!(check_bball(80, 60)); // total=140, diff=20
+        assert!(check_bball(75, 65)); // total=140, diff=10
+        assert!(!check_bball(74, 65)); // total=139, diff=9 — fails all tiers
+
+        // Tier 2: total >= 100, diff >= 15
+        assert!(check_bball(58, 42)); // total=100, diff=16
+        assert!(!check_bball(55, 42)); // total=97, diff=13 — close but no
+
+        // Tier 1: total >= 60, diff >= 20
+        assert!(check_bball(40, 20)); // total=60, diff=20
+        assert!(!check_bball(35, 20)); // total=55, diff=15 — too early
+    }
+
+    fn check_bball(s1: i32, s2: i32) -> bool {
+        let total = s1 + s2;
+        let diff = (s1 - s2).abs();
+        (total >= 140 && diff >= 10) || (total >= 100 && diff >= 15) || (total >= 60 && diff >= 20)
+    }
+}
+
+#[cfg(test)]
+mod threshold_relax_tests {
+    use super::{
+        cs2_map_win_prob,
+        cs2_map_winner_min_edge,
+        cs2_round_to_match_prob,
+        cs2_round_match_winner_guard,
+        tennis_score_edge_min_edge,
+    };
+
+    #[test]
+    fn cs2_map_winner_is_relaxed_to_22() {
+        assert_eq!(cs2_map_winner_min_edge("cs2", None, "map1_winner"), Some(22.0));
+        assert_eq!(cs2_map_winner_min_edge("esports", Some("cs2"), "map2_winner"), Some(22.0));
+        assert_eq!(cs2_map_winner_min_edge("cs2", None, "match_winner"), None);
+    }
+
+    #[test]
+    fn dominant_tennis_and_controlled_one_set_get_relaxed_thresholds() {
+        assert_eq!(tennis_score_edge_min_edge(2, 0, 0.80, 1.95), 30.0);
+        assert_eq!(tennis_score_edge_min_edge(1, 0, 0.68, 1.85), 34.0);
+        assert_eq!(tennis_score_edge_min_edge(1, 0, 0.67, 1.85), 38.0);
+        assert_eq!(tennis_score_edge_min_edge(1, 0, 0.70, 1.96), 38.0);
+    }
+
+    #[test]
+    fn cs2_round_match_winner_needs_all_variant3_guards() {
+        // Standard path: map lead + ≥72% + ≥10 rounds + odds ≤2.80
+        assert!(cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.25)));
+        assert!(cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.80)));
+        assert!(cs2_round_match_winner_guard(1, 1, true, 0.80, 10, Some(1.80)));
+        // M:0-0 without extreme dominance → blocked
+        assert!(!cs2_round_match_winner_guard(0, 0, false, 0.80, 10, Some(1.80)));
+        // 1-1 tied without decider flag → blocked
+        assert!(!cs2_round_match_winner_guard(1, 1, false, 0.80, 10, Some(1.80)));
+        // prob below 72% → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.71, 10, Some(1.80)));
+        // rounds below 10 → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 9, Some(1.80)));
+        // odds above 2.80 → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 10, Some(2.81)));
+        // no odds → blocked
+        assert!(!cs2_round_match_winner_guard(1, 0, false, 0.72, 10, None));
+        // First-map domination: M:0-0 + ≥90% + ≥20 rounds → allowed
+        assert!(cs2_round_match_winner_guard(0, 0, false, 0.90, 20, Some(2.50)));
+        assert!(cs2_round_match_winner_guard(0, 0, false, 0.95, 24, Some(1.80)));
+        // First-map but not dominant enough → blocked
+        assert!(!cs2_round_match_winner_guard(0, 0, false, 0.89, 20, Some(1.80)));
+        assert!(!cs2_round_match_winner_guard(0, 0, false, 0.90, 19, Some(1.80)));
+    }
+
+    #[test]
+    fn cs2_map_win_prob_respects_dominant_round_leads() {
+        assert_eq!(cs2_map_win_prob(6, 12), 0.88);
+        assert_eq!(cs2_map_win_prob(8, 10), 0.94);
+        assert_eq!(cs2_map_win_prob(5, 13), 0.91);
+    }
+
+    #[test]
+    fn cs2_match_closeout_is_less_aggressive_on_early_map2_leads() {
+        assert_eq!(cs2_round_to_match_prob(1, 0, 6, 4), Some(0.69));
+        assert_eq!(cs2_round_to_match_prob(1, 0, 7, 5), Some(0.71));
+        assert_eq!(cs2_round_to_match_prob(1, 0, 8, 7), Some(0.76));
+    }
+
+    #[test]
+    fn cs2_match_closeout_keeps_late_strong_states() {
+        assert_eq!(cs2_round_to_match_prob(1, 0, 11, 10), Some(0.85));
+        assert_eq!(cs2_round_to_match_prob(1, 1, 10, 6), Some(0.78));
+    }
+}
+
+#[cfg(test)]
+mod strategy_hotfix_tests {
+    use super::{
+        count_pending_slots,
+        cross_market_base_dedup_block,
+        dynamic_base_stake,
+        executable_stake_floor,
+        get_sport_config,
+        get_sport_exposure_cap,
+        is_cs2_forward_spike_state,
+        is_cs2_terminal_map_score,
+        locked_exposure_total,
+        mark_cs2_glitch_quarantine,
+        record_cs2_distrust_event,
+        refresh_active_bet_from_onchain_pending,
+        score_edge_max_odds,
+        stake_below_executable_floor,
+        ActiveBet,
+        ScoreTracker,
+        trim_stake,
+        CS2_SCORE_DISTRUST_LOCK_SECS,
+        CS2_SCORE_GLITCH_QUARANTINE_SECS,
+        STARTUP_UNVERIFIED_GRACE_SECS,
+    };
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn tennis_score_edge_is_capped_below_1_90_band() {
+        assert_eq!(score_edge_max_odds("match_winner", "tennis", None), 1.90);
+    }
+
+    #[test]
+    fn football_and_generic_esports_stay_in_low_exposure_mode() {
+        let bankroll = 100.0;
+        assert_eq!(get_sport_exposure_cap("football", bankroll), 10.0);
+        assert_eq!(get_sport_exposure_cap("esports", bankroll), 10.0);
+        assert_eq!(dynamic_base_stake(bankroll, "football"), 0.50);
+        assert_eq!(dynamic_base_stake(bankroll, "esports"), 0.50);
+    }
+
+    #[test]
+    fn concrete_esports_match_fallback_is_only_gently_relaxed() {
+        let (allowed, min_edge, mult, preferred_market) = get_sport_config("cs2");
+        assert!(allowed);
+        assert_eq!(min_edge, 33.0);
+        assert_eq!(mult, 1.0);
+        assert_eq!(preferred_market, "match_or_map");
+    }
+
+    #[test]
+    fn micro_bankroll_per_bet_cap_still_allows_executable_minimum() {
+        let bankroll = 9.64;
+        assert_eq!(executable_stake_floor(bankroll), 0.50);
+
+        let final_stake = trim_stake(
+            1.50,
+            bankroll,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "cs2",
+            1.0,
+            bankroll,
+            "score_edge",
+            1.98,
+            30.0,
+        );
+
+        assert_eq!(final_stake, 0.50);
+    }
+
+    #[test]
+    fn micro_bankroll_trim_still_respects_other_exposure_caps() {
+        let bankroll = 9.64;
+        let final_stake = trim_stake(
+            1.50,
+            bankroll,
+            0.48,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "cs2",
+            1.0,
+            bankroll,
+            "score_edge",
+            1.98,
+            30.0,
+        );
+
+        assert_eq!(final_stake, 0.0);
+    }
+
+    #[test]
+    fn raw_stake_below_floor_is_marked_not_feasible() {
+        let bankroll = 9.64;
+        assert!(stake_below_executable_floor(0.49, bankroll));
+        assert!(!stake_below_executable_floor(0.50, bankroll));
+        assert!(!stake_below_executable_floor(0.0, bankroll));
+    }
+
+    #[test]
+    fn stale_loaded_unverified_bet_stops_blocking_pending_and_inflight() {
+        let session_start = Utc::now() - Duration::seconds(STARTUP_UNVERIFIED_GRACE_SECS + 5);
+        let active_bets = vec![ActiveBet {
+            alert_id: 0,
+            bet_id: "loaded-stale".to_string(),
+            match_key: "cs2::aurora_vs_legacy".to_string(),
+            market_key: "map3_winner".to_string(),
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
+            team1: "Aurora".to_string(),
+            team2: "Legacy".to_string(),
+            value_team: "Aurora".to_string(),
+            amount_usd: 3.05,
+            odds: 1.87,
+            placed_at: "loaded".to_string(),
+            condition_id: String::new(),
+            outcome_id: String::new(),
+            graph_bet_id: None,
+            token_id: None,
+            path: "loaded".to_string(),
+        }];
+
+        assert_eq!(count_pending_slots(&active_bets, session_start), 0);
+        assert_eq!(locked_exposure_total(&active_bets, session_start), 0.0);
+    }
+
+    #[test]
+    fn fresh_live_unverified_bet_still_counts_until_executor_confirms_it() {
+        let session_start = Utc::now() - Duration::seconds(30);
+        let active_bets = vec![ActiveBet {
+            alert_id: 42,
+            bet_id: "live-fresh".to_string(),
+            match_key: "cs2::aurora_vs_legacy".to_string(),
+            market_key: "map3_winner".to_string(),
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
+            team1: "Aurora".to_string(),
+            team2: "Legacy".to_string(),
+            value_team: "Aurora".to_string(),
+            amount_usd: 3.05,
+            odds: 1.87,
+            placed_at: Utc::now().to_rfc3339(),
+            condition_id: "cond-1".to_string(),
+            outcome_id: "out-1".to_string(),
+            graph_bet_id: None,
+            token_id: None,
+            path: "score_edge".to_string(),
+        }];
+
+        assert_eq!(count_pending_slots(&active_bets, session_start), 1);
+        assert_eq!(locked_exposure_total(&active_bets, session_start), 3.05);
+    }
+
+    #[test]
+    fn verified_pending_bet_counts_for_exposure_but_not_pending_slot_cap() {
+        let session_start = Utc::now() - Duration::seconds(30);
+        let active_bets = vec![ActiveBet {
+            alert_id: 42,
+            bet_id: "verified-pending".to_string(),
+            match_key: "cs2::aurora_vs_legacy".to_string(),
+            market_key: "map3_winner".to_string(),
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
+            team1: "Aurora".to_string(),
+            team2: "Legacy".to_string(),
+            value_team: "Aurora".to_string(),
+            amount_usd: 2.10,
+            odds: 1.87,
+            placed_at: Utc::now().to_rfc3339(),
+            condition_id: "cond-1".to_string(),
+            outcome_id: "out-1".to_string(),
+            graph_bet_id: None,
+            token_id: Some("225846".to_string()),
+            path: "score_edge".to_string(),
+        }];
+
+        assert_eq!(count_pending_slots(&active_bets, session_start), 0);
+        assert_eq!(locked_exposure_total(&active_bets, session_start), 2.10);
+    }
+
+    #[test]
+    fn onchain_pending_refresh_updates_stale_cache_amount_and_odds() {
+        let mut bet = ActiveBet {
+            alert_id: 0,
+            bet_id: "cached-bet".to_string(),
+            match_key: "".to_string(),
+            market_key: "unknown".to_string(),
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
+            team1: "?".to_string(),
+            team2: "?".to_string(),
+            value_team: "?".to_string(),
+            amount_usd: 2.0,
+            odds: 1.50,
+            placed_at: "loaded".to_string(),
+            condition_id: String::new(),
+            outcome_id: String::new(),
+            graph_bet_id: None,
+            token_id: Some("227937".to_string()),
+            path: "loaded".to_string(),
+        };
+
+        assert!(refresh_active_bet_from_onchain_pending(
+            &mut bet,
+            "Legacy",
+            1.84,
+            0.538497,
+            "esports::aurora_vs_legacy",
+        ));
+        assert_eq!(bet.value_team, "Legacy");
+        assert_eq!(bet.match_key, "esports::aurora_vs_legacy");
+        assert!((bet.amount_usd - 0.538497).abs() < 0.000001);
+        assert!((bet.odds - 1.84).abs() < 0.000001);
+    }
+
+    #[test]
+    fn onchain_pending_refresh_preserves_accepted_odds_for_live_tracked_bet() {
+        let mut bet = ActiveBet {
+            alert_id: 77,
+            bet_id: "live-bet".to_string(),
+            match_key: "esports::fut_vs_mouz".to_string(),
+            market_key: "match_winner".to_string(),
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
+            team1: "FUT".to_string(),
+            team2: "MOUZ".to_string(),
+            value_team: "FUT".to_string(),
+            amount_usd: 2.0,
+            odds: 2.18,
+            placed_at: Utc::now().to_rfc3339(),
+            condition_id: "cond-77".to_string(),
+            outcome_id: "out-77".to_string(),
+            graph_bet_id: None,
+            token_id: Some("227937".to_string()),
+            path: "score_edge".to_string(),
+        };
+
+        assert!(!refresh_active_bet_from_onchain_pending(
+            &mut bet,
+            "FUT",
+            2.49,
+            2.0,
+            "esports::fut_vs_mouz",
+        ));
+        assert!((bet.odds - 2.18).abs() < 0.000001);
+    }
+
+    #[test]
+    fn cs2_terminal_map_scores_are_detected() {
+        assert!(is_cs2_terminal_map_score(13, 7));
+        assert!(is_cs2_terminal_map_score(16, 14));
+        assert!(!is_cs2_terminal_map_score(12, 1));
+        assert!(!is_cs2_terminal_map_score(11, 9));
+    }
+
+    #[test]
+    fn cs2_glitch_quarantine_sets_future_deadline() {
+        let now = Utc::now();
+        let mut tracker = ScoreTracker::new();
+
+        mark_cs2_glitch_quarantine(&mut tracker, "esports::alliance_vs_nexus", now);
+
+        let until = tracker
+            .cs2_glitch_quarantine_until
+            .get("esports::alliance_vs_nexus")
+            .copied()
+            .expect("quarantine set");
+        assert!(until >= now + Duration::seconds(CS2_SCORE_GLITCH_QUARANTINE_SECS - 1));
+    }
+
+    #[test]
+    fn cs2_forward_spike_states_are_detected() {
+        assert!(is_cs2_forward_spike_state(
+            8,
+            7,
+            12,
+            1,
+            8,
+            Some("Lepší ze 3 | 1.mapa - 8:7"),
+            Some("cs2"),
+        ));
+        assert!(!is_cs2_forward_spike_state(
+            8,
+            7,
+            9,
+            8,
+            8,
+            Some("Lepší ze 3 | 1.mapa - 8:7"),
+            Some("cs2"),
+        ));
+    }
+
+    #[test]
+    fn cs2_distrust_events_lock_match_after_threshold() {
+        let now = Utc::now();
+        let mut tracker = ScoreTracker::new();
+
+        let (points_after_first, first_lock) =
+            record_cs2_distrust_event(&mut tracker, "esports::alliance_vs_nexus", now, 2);
+        assert_eq!(points_after_first, 2);
+        assert!(first_lock.is_none());
+
+        let (points_after_second, second_lock) = record_cs2_distrust_event(
+            &mut tracker,
+            "esports::alliance_vs_nexus",
+            now + Duration::seconds(5),
+            1,
+        );
+        assert_eq!(points_after_second, 3);
+        let until = second_lock.expect("lock set");
+        assert!(until >= now + Duration::seconds(CS2_SCORE_DISTRUST_LOCK_SECS - 1));
+    }
+
+    #[test]
+    fn cross_market_base_dedup_only_blocks_map_winner_siblings() {
+        use std::collections::HashSet;
+
+        let mut base_matches = HashSet::new();
+        let mut map_winners = HashSet::new();
+        let base = "esports::cybershoke_vs_ruby".to_string();
+
+        assert!(!cross_market_base_dedup_block(&base, true, &base_matches, &map_winners));
+        assert!(!cross_market_base_dedup_block(&base, false, &base_matches, &map_winners));
+
+        base_matches.insert(base.clone());
+        assert!(!cross_market_base_dedup_block(&base, true, &base_matches, &map_winners));
+        assert!(!cross_market_base_dedup_block(&base, false, &base_matches, &map_winners));
+
+        map_winners.insert(base.clone());
+        assert!(cross_market_base_dedup_block(&base, true, &base_matches, &map_winners));
+        assert!(!cross_market_base_dedup_block(&base, false, &base_matches, &map_winners));
+    }
+}
+
 fn cs2_round_edge_max_odds_override(
     sport: &str,
     market_key: &str,
@@ -1974,10 +2843,19 @@ fn cs2_round_edge_max_odds_override(
         };
     }
 
+    let round_diff = (score1 - score2).abs();
+    let max_rounds = score1.max(score2);
+    let dominant_map_state = max_rounds >= 8 && round_diff >= 6;
+    let strong_map_state = max_rounds >= 8 && round_diff >= 7;
+    let solid_map_state = max_rounds >= 7 && round_diff >= 5;
+
     match cs2_map_confidence {
         Some("ULTRA") if edge_pct >= 40.0 => Some(3.60),
         Some("HIGH") if edge_pct >= 40.0 => Some(3.60),
         Some("HIGH") if edge_pct >= 32.0 => Some(3.45),
+        Some("MEDIUM") | Some("HIGH") if edge_pct >= 41.0 && strong_map_state => Some(2.30),
+        Some("MEDIUM") | Some("HIGH") if edge_pct >= 35.0 && dominant_map_state => Some(2.20),
+        Some("MEDIUM") | Some("HIGH") if edge_pct >= 34.0 && solid_map_state => Some(2.10),
         _ => None,
     }
 }
@@ -2034,6 +2912,15 @@ fn is_map_winner_market(match_key: &str, market_key: &str) -> bool {
 
 fn scoped_condition_key(base_match_key: &str, condition_id: &str) -> String {
     format!("{}|{}", base_match_key, condition_id)
+}
+
+fn cross_market_base_dedup_block(
+    base_match_key: &str,
+    is_candidate_map_winner: bool,
+    _already_bet_base_matches: &HashSet<String>,
+    already_bet_map_winners: &HashSet<String>,
+) -> bool {
+    is_candidate_map_winner && already_bet_map_winners.contains(base_match_key)
 }
 
 fn market_dedup_key(match_key: &str, market_key: &str) -> String {
@@ -2471,31 +3358,31 @@ fn cs2_map_win_prob(diff: i32, total_rounds: i32) -> f64 {
         // Even big diffs can reverse after side switch
         (d, t) if t <= 8 => match d {
             1..=2 => 0.55,
-            3..=4 => 0.62,
-            5..=6 => 0.68,
-            _ => 0.75,   // 7-0 or 7-1 early = strong but volatile
+            3..=4 => 0.64,
+            5..=6 => 0.74,
+            _ => 0.82,   // 7-0 / 8-0 is still volatile, but far stronger than a generic early lead
         },
         // MID-EARLY (total 9-12): approaching half, some info but switch coming
         (d, t) if t <= 12 => match d {
-            1..=2 => 0.57,
-            3..=4 => 0.67,
-            5..=6 => 0.76,
-            7..=8 => 0.85,
-            _ => 0.90,
+            1..=2 => 0.58,
+            3..=4 => 0.74,
+            5..=6 => 0.88,
+            7..=8 => 0.94,
+            _ => 0.97,
         },
         // AT/PAST HALF (total 13-18): half-switch done, momentum visible
         (d, t) if t <= 18 => match d {
-            1..=2 => 0.60,
-            3..=4 => 0.73,
-            5..=6 => 0.84,
-            7..=8 => 0.92,
-            _ => 0.96,
+            1..=2 => 0.62,
+            3..=4 => 0.78,
+            5..=6 => 0.91,
+            7..=8 => 0.97,
+            _ => 0.99,
         },
         // LATE GAME (total 19+): very few rounds left, approaching 13
         (d, _) => match d {
-            1..=2 => 0.65,
-            3..=4 => 0.82,
-            5..=6 => 0.93,
+            1..=2 => 0.70,
+            3..=4 => 0.88,
+            5..=6 => 0.96,
             _ => 0.97,
         },
     }
@@ -2520,6 +3407,42 @@ fn cs2_round_to_match_prob(
     let diff = round_lead - round_lose;
     let total = round_lead + round_lose;
     if diff <= 0 { return None; }
+
+    // Closing out a BO3 from 1-0 with only a narrow early map-2 lead is materially
+    // less certain than the naive transition math suggests. The old formula put
+    // 1-0 + 6:4 around 79%, which was too aggressive in production for underdog-led
+    // series states. Keep dominant positions intact, but damp the early close-out band.
+    if map_lead == 1 && map_lose == 0 {
+        let closeout_prob = if total <= 10 {
+            match diff {
+                1..=2 => Some(0.69),
+                3..=4 => Some(0.77),
+                5..=6 => Some(0.87),
+                _ => Some(0.94),
+            }
+        } else if total <= 12 {
+            match diff {
+                1..=2 => Some(0.71),
+                3..=4 => Some(0.80),
+                5..=6 => Some(0.89),
+                _ => Some(0.95),
+            }
+        } else if total <= 16 {
+            match diff {
+                1..=2 => Some(0.76),
+                3..=4 => Some(0.84),
+                5..=6 => Some(0.92),
+                _ => Some(0.97),
+            }
+        } else {
+            None
+        };
+
+        if let Some(match_prob) = closeout_prob {
+            if match_prob < 0.55 { return None; }
+            return Some(match_prob);
+        }
+    }
 
     let map_prob = cs2_map_win_prob(diff, total);
 
@@ -2689,11 +3612,92 @@ fn football_auto_bet_guard(goal_diff: i32, minute: Option<i32>) -> bool {
     };
 
     match goal_diff {
-        diff if diff >= 3 => minute >= 55,
-        2 => minute >= 70,
+        diff if diff >= 4 => minute >= 45,
+        3 => minute >= 58,
+        2 => minute >= 72,
         1 => false,
         _ => false,
     }
+}
+
+fn cs2_map_winner_min_edge(sport: &str, esports_family: Option<&str>, market_key: &str) -> Option<f64> {
+    let is_cs2_score_edge = sport == "cs2" || (sport == "esports" && esports_family == Some("cs2"));
+    let is_map_winner_bet = market_key.starts_with("map") && market_key.ends_with("_winner");
+    if is_cs2_score_edge && is_map_winner_bet {
+        Some(22.0)
+    } else {
+        None
+    }
+}
+
+fn tennis_score_edge_min_edge(score1: i32, score2: i32, expected_prob: f64, azuro_odds: f64) -> f64 {
+    let set_diff = (score1 - score2).abs();
+    if set_diff >= 2 {
+        30.0
+    } else if set_diff >= 1 && expected_prob >= 0.68 && azuro_odds <= 1.85 {
+        34.0
+    } else {
+        38.0
+    }
+}
+
+fn cs2_round_match_winner_guard(
+    map_lead: i32,
+    map_lose: i32,
+    allow_tied_decider: bool,
+    expected_prob: f64,
+    round_total: i32,
+    azuro_odds: Option<f64>,
+) -> bool {
+    let odds_ok = azuro_odds.is_some_and(|odds| odds <= CS2_ROUND_MATCH_WINNER_MAX_ODDS);
+    let has_map_lead = map_lead > map_lose;
+    let is_decider = allow_tied_decider && map_lead == map_lose && map_lead == 1;
+    // Standard path: map lead or 1-1 decider + ≥72% + ≥10 rounds + odds ≤ 2.80
+    let standard = (has_map_lead || is_decider)
+        && expected_prob >= 0.72
+        && round_total >= CS2_ROUND_MATCH_WINNER_MIN_ROUNDS
+        && odds_ok;
+    // First-map domination: M:0-0 but map is essentially won (≥90% + ≥20 rounds)
+    // e.g. 14-6, 15-5 — safer than generic M:0-0 bets
+    let first_map_domination = map_lead == 0 && map_lose == 0
+        && expected_prob >= 0.90
+        && round_total >= 20
+        && odds_ok;
+    standard || first_map_domination
+}
+
+fn is_cs2_terminal_map_score(score1: i32, score2: i32) -> bool {
+    let hi = score1.max(score2);
+    let lo = score1.min(score2);
+    if hi < 13 {
+        return false;
+    }
+
+    if hi == 13 {
+        return hi - lo >= 2;
+    }
+
+    hi - lo >= 2
+}
+
+fn mark_cs2_glitch_quarantine(tracker: &mut ScoreTracker, match_key: &str, now: DateTime<Utc>) {
+    tracker.cs2_glitch_quarantine_until.insert(
+        match_key.to_string(),
+        now + chrono::Duration::seconds(CS2_SCORE_GLITCH_QUARANTINE_SECS),
+    );
+}
+
+fn record_cs2_distrust_event(
+    tracker: &mut ScoreTracker,
+    match_key: &str,
+    now: DateTime<Utc>,
+    points: u8,
+) -> (u8, Option<DateTime<Utc>>) {
+    tracker
+        .cs2_distrust_state
+        .entry(match_key.to_string())
+        .or_insert_with(|| Cs2DistrustState::new(now))
+        .record_event(now, points)
 }
 
 fn blocked_score_edge_reason_codes(
@@ -3208,6 +4212,17 @@ fn find_score_edges(
             live_esports_class.family,
         );
         if cs2_reset_hold_state || cs2_round_rewind_hold_state || cs2_map_rollover_hold_state || cs2_incomplete_map_score_hold_state {
+            if cs2_round_rewind_hold_state {
+                mark_cs2_glitch_quarantine(tracker, match_key, now);
+                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+                if let Some(lock_until) = distrust_lock_until {
+                    info!(
+                        "  ⛔ {} CS2 distrust lock active until {} after round rewind",
+                        match_key,
+                        lock_until.to_rfc3339()
+                    );
+                }
+            }
             tracker.backward_scores.remove(*match_key);
             let suppress_duplicate = tracker.edge_cooldown.get(*match_key)
                 .map(|ts| (now - *ts).num_seconds() < 45)
@@ -3270,6 +4285,7 @@ fn find_score_edges(
         );
 
         let score_changed = s1 != prev_s1 || s2 != prev_s2;
+        let elapsed_secs = (now - prev_seen_at).num_seconds().max(1);
         // Guard against score-mode switches / parser glitches:
         // examples: 19-17 -> 1-0, 1-2 -> 0-0. These are often round->map or source resets.
         let backward_score_jump = score_changed
@@ -3284,6 +4300,17 @@ fn find_score_edges(
         }
 
         if backward_score_jump {
+            if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref()) {
+                mark_cs2_glitch_quarantine(tracker, match_key, now);
+                let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+                if let Some(lock_until) = distrust_lock_until {
+                    info!(
+                        "  ⛔ {} CS2 distrust lock active until {} after backward score jump",
+                        match_key,
+                        lock_until.to_rfc3339()
+                    );
+                }
+            }
             if is_cs2_backward_score_pending_state(
                 prev_s1,
                 prev_s2,
@@ -3378,9 +4405,129 @@ fn find_score_edges(
 
         tracker.prev_scores.insert(match_key.to_string(), (s1, s2, now));
 
+        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref()) {
+            if let Some(lock_until) = tracker
+                .cs2_distrust_state
+                .get(*match_key)
+                .and_then(|state| state.active_lock_until(now))
+            {
+                info!(
+                    "  ⛔ {} {}-{}: CS2 distrust lock active until {} — skipping edge eval",
+                    match_key,
+                    s1,
+                    s2,
+                    lock_until.to_rfc3339()
+                );
+                if should_audit_esports_score_decision(
+                    match_key,
+                    live_esports_class.family,
+                    live_esports_class.confidence,
+                ) {
+                    append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                        "match_key": match_key,
+                        "path": "score_model",
+                        "decision": "blocked_candidate",
+                        "reason_code": "ScoreDistrustLocked",
+                        "reason_codes": ["ScoreDistrustLocked"],
+                        "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                        "esports_family": live_esports_class.family,
+                        "sport_confidence": live_esports_class.confidence,
+                        "sport_reason": live_esports_class.reason,
+                        "team1": live.payload.team1,
+                        "team2": live.payload.team2,
+                        "raw_score1": raw_s1,
+                        "raw_score2": raw_s2,
+                        "prev_score1": prev_s1,
+                        "prev_score2": prev_s2,
+                        "score1": s1,
+                        "score2": s2,
+                        "live_status": live.payload.status,
+                        "detailed_score": live.payload.detailed_score,
+                    }));
+                }
+                tracker.edge_cooldown.insert(match_key.to_string(), now);
+                continue;
+            }
+            if let Some(quarantine_until) = tracker.cs2_glitch_quarantine_until.get(*match_key) {
+                if now < *quarantine_until {
+                    info!(
+                        "  ⏭️ {} {}-{}: CS2 glitch quarantine active until {} — skipping edge eval",
+                        match_key,
+                        s1,
+                        s2,
+                        quarantine_until.to_rfc3339()
+                    );
+                    tracker.edge_cooldown.insert(match_key.to_string(), now);
+                    continue;
+                }
+            }
+        }
+
+        let cs2_forward_spike = score_changed
+            && !is_first_sight
+            && !cs2_legit_map_rollover
+            && !cs2_round_context_override
+            && is_cs2_forward_spike_state(
+                prev_s1,
+                prev_s2,
+                s1,
+                s2,
+                elapsed_secs,
+                live.payload.detailed_score.as_deref(),
+                live_esports_class.family,
+            );
+        if cs2_forward_spike {
+            mark_cs2_glitch_quarantine(tracker, match_key, now);
+            let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 3);
+            info!(
+                "  ⏭️ {} CS2 forward spike {}-{} -> {}-{} ({}s) — skipping edge eval",
+                match_key,
+                prev_s1,
+                prev_s2,
+                s1,
+                s2,
+                elapsed_secs
+            );
+            if let Some(lock_until) = distrust_lock_until {
+                info!(
+                    "  ⛔ {} CS2 distrust lock active until {} after forward spike",
+                    match_key,
+                    lock_until.to_rfc3339()
+                );
+            }
+            if should_audit_esports_score_decision(
+                match_key,
+                live_esports_class.family,
+                live_esports_class.confidence,
+            ) {
+                append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                    "match_key": match_key,
+                    "path": "score_model",
+                    "decision": "blocked_candidate",
+                    "reason_code": "ScoreForwardSpike",
+                    "reason_codes": ["ScoreForwardSpike"],
+                    "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                    "esports_family": live_esports_class.family,
+                    "sport_confidence": live_esports_class.confidence,
+                    "sport_reason": live_esports_class.reason,
+                    "team1": live.payload.team1,
+                    "team2": live.payload.team2,
+                    "raw_score1": raw_s1,
+                    "raw_score2": raw_s2,
+                    "prev_score1": prev_s1,
+                    "prev_score2": prev_s2,
+                    "score1": s1,
+                    "score2": s2,
+                    "live_status": live.payload.status,
+                    "detailed_score": live.payload.detailed_score,
+                }));
+            }
+            tracker.edge_cooldown.insert(match_key.to_string(), now);
+            continue;
+        }
+
         // Guard against impossible forward spikes in basketball feed.
         // Example parser/source glitch: 7-7 -> 77-7 in one poll window.
-        let elapsed_secs = (now - prev_seen_at).num_seconds().max(1);
         let delta1 = s1 - prev_s1;
         let delta2 = s2 - prev_s2;
         let is_basketball_match = match_key.starts_with("basketball::");
@@ -3463,6 +4610,56 @@ fn find_score_edges(
         }
 
         if !has_recent_azuro_market_for_live(match_key, live, now, &azuro_by_match, &map_winners_by_match) {
+            continue;
+        }
+
+        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref())
+            && s1.max(s2) > 3
+            && is_cs2_terminal_map_score(s1, s2)
+        {
+            mark_cs2_glitch_quarantine(tracker, match_key, now);
+            let (_, distrust_lock_until) = record_cs2_distrust_event(tracker, match_key, now, 2);
+            info!(
+                "  ⏭️ {} {}-{}: terminal CS2 map score — likely settled map/rollover, skipping edge eval",
+                match_key,
+                s1,
+                s2
+            );
+            if let Some(lock_until) = distrust_lock_until {
+                info!(
+                    "  ⛔ {} CS2 distrust lock active until {} after terminal map score",
+                    match_key,
+                    lock_until.to_rfc3339()
+                );
+            }
+            if should_audit_esports_score_decision(
+                match_key,
+                live_esports_class.family,
+                live_esports_class.confidence,
+            ) {
+                append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                    "match_key": match_key,
+                    "path": "score_model",
+                    "decision": "blocked_candidate",
+                    "reason_code": "ScoreTerminalMapState",
+                    "reason_codes": ["ScoreTerminalMapState"],
+                    "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                    "esports_family": live_esports_class.family,
+                    "sport_confidence": live_esports_class.confidence,
+                    "sport_reason": live_esports_class.reason,
+                    "team1": live.payload.team1,
+                    "team2": live.payload.team2,
+                    "raw_score1": raw_s1,
+                    "raw_score2": raw_s2,
+                    "prev_score1": prev_s1,
+                    "prev_score2": prev_s2,
+                    "score1": s1,
+                    "score2": s2,
+                    "live_status": live.payload.status,
+                    "detailed_score": live.payload.detailed_score,
+                }));
+            }
+            tracker.edge_cooldown.insert(match_key.to_string(), now);
             continue;
         }
 
@@ -3628,38 +4825,14 @@ fn find_score_edges(
                         p
                     }
                     None => {
-                        info!("  ⏭️ {} {}-{}: CS2 round score → match_prob below threshold (maps={}-{})",
+                        // match_prob below 55% — not enough for match_winner, but
+                        // map_winner may still have strong edge (map_win_prob can
+                        // be 65-85% while match_prob is only 50-54% on maps 0-0).
+                        // Use 0.50 fallback so STEP 1 (map_winner) still runs.
+                        // STEP 2 (match_winner) is blocked by RoundScoreMatchWinnerDisabled.
+                        info!("  ⏭️ {} {}-{}: CS2 round match_prob below threshold (maps={}-{}) — map_winner path still open",
                             match_key, s1, s2, map_leader, map_loser);
-                        if should_audit_esports_score_decision(
-                            match_key,
-                            live_esports_class.family,
-                            live_esports_class.confidence,
-                        ) {
-                            append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
-                                "match_key": match_key,
-                                "path": "score_model",
-                                "decision": "blocked_candidate",
-                                "reason_code": "RoundModelBelowThreshold",
-                                "reason_codes": ["RoundModelBelowThreshold"],
-                                "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
-                                "esports_family": live_esports_class.family,
-                                "sport_confidence": live_esports_class.confidence,
-                                "sport_reason": live_esports_class.reason,
-                                "team1": live.payload.team1,
-                                "team2": live.payload.team2,
-                                "raw_score1": raw_s1,
-                                "raw_score2": raw_s2,
-                                "map_score1": map_leader,
-                                "map_score2": map_loser,
-                                "round_score1": leading_maps,
-                                "round_score2": losing_maps,
-                                "score1": s1,
-                                "score2": s2,
-                                "live_status": live.payload.status,
-                                "detailed_score": live.payload.detailed_score,
-                            }));
-                        }
-                        continue;
+                        0.50_f64
                     }
                 }
             } else {
@@ -3947,45 +5120,6 @@ fn find_score_edges(
             continue;
         }
 
-        // Root-cause safety gate: CS2 round-level score is reliable for active-map
-        // markets, but not for whole-series match_winner. Recent realized PnL shows
-        // this fallback is structurally mispriced, so disable it until a dedicated
-        // series-state model is reworked and revalidated.
-        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref())
-            && leading_maps.max(losing_maps) > 3
-        {
-            info!(
-                "  🛑 {} {}-{}: CS2 round-level score cannot safely drive match_winner — skipping fallback edge",
-                match_key, s1, s2
-            );
-            if should_audit_esports_score_decision(
-                match_key,
-                live_esports_class.family,
-                live_esports_class.confidence,
-            ) {
-                append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
-                    "match_key": match_key,
-                    "path": "score_model",
-                    "decision": "blocked_candidate",
-                    "reason_code": "RoundScoreMatchWinnerDisabled",
-                    "reason_codes": ["RoundScoreMatchWinnerDisabled"],
-                    "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
-                    "esports_family": live_esports_class.family,
-                    "sport_confidence": live_esports_class.confidence,
-                    "sport_reason": live_esports_class.reason,
-                    "team1": live.payload.team1,
-                    "team2": live.payload.team2,
-                    "raw_score1": raw_s1,
-                    "raw_score2": raw_s2,
-                    "score1": s1,
-                    "score2": s2,
-                    "live_status": live.payload.status,
-                    "detailed_score": live.payload.detailed_score,
-                }));
-            }
-            continue;
-        }
-
         // Get current Azuro odds for match winner
         let azuro = match azuro_by_match.get(odds_lookup_key).copied().or_else(|| {
             azuro_by_match.values().find(|item| {
@@ -4028,6 +5162,97 @@ fn find_score_edges(
                     match_key, azuro_prefix, &azuro.match_key);
                 resolved_sport_for_odds = azuro.match_key.split("::").next().unwrap_or("esports");
             }
+        }
+
+        // Variant 3: allow CS2 round-level match_winner slightly earlier, but only
+        // with map lead, or explicit 1-1 Bo3 decider on map3, plus 72%+ match
+        // probability, 10+ rounds played, and odds <= 2.25.
+        if is_cs2_like(live_esports_class.family, live.payload.detailed_score.as_deref())
+            && leading_maps.max(losing_maps) > 3
+        {
+            let ds_guard = live.payload.detailed_score.as_deref().unwrap_or("");
+            let (gml, gmm) = parse_esports_map_score(ds_guard, s1, s2);
+            let (guard_map_lead, guard_map_lose) = if gml > gmm { (gml, gmm) } else if gmm > gml { (gmm, gml) } else {
+                if let Some(ms) = parse_dust2_map_score(ds_guard) {
+                    if ms.0 > ms.1 { (ms.0, ms.1) } else { (ms.1, ms.0) }
+                } else {
+                    (0, 0)
+                }
+            };
+            let round_total = s1 + s2;
+            let allow_tied_decider = guard_map_lead == 1
+                && guard_map_lose == 1
+                && parse_cs2_current_map(ds_guard) == Some(3);
+            let guard_azuro_odds = resolve_azuro_side_pair(
+                &live.payload.team1,
+                &live.payload.team2,
+                leading_side,
+                &azuro.payload.team1,
+                &azuro.payload.team2,
+            ).map(|side| if side == 1 { azuro.payload.odds_team1 } else { azuro.payload.odds_team2 });
+
+            if !cs2_round_match_winner_guard(
+                guard_map_lead,
+                guard_map_lose,
+                allow_tied_decider,
+                expected_prob,
+                round_total,
+                guard_azuro_odds,
+            ) {
+                info!(
+                    "  🛑 {} {}-{}: CS2 round-level match_winner blocked (maps={}-{}, prob={:.1}%, rounds={}, odds={:?}) — need map lead + ≥72% + ≥10r + odds≤2.80, OR M:0-0 + ≥90% + ≥20r",
+                    match_key,
+                    s1,
+                    s2,
+                    guard_map_lead,
+                    guard_map_lose,
+                    expected_prob * 100.0,
+                    round_total,
+                    guard_azuro_odds,
+                );
+                if should_audit_esports_score_decision(
+                    match_key,
+                    live_esports_class.family,
+                    live_esports_class.confidence,
+                ) {
+                    append_ledger_audit_event("ESPORTS_SCORE_DECISION_AUDIT", &serde_json::json!({
+                        "match_key": match_key,
+                        "path": "score_model",
+                        "decision": "blocked_candidate",
+                        "reason_code": "RoundScoreMatchWinnerDisabled",
+                        "reason_codes": ["RoundScoreMatchWinnerDisabled"],
+                        "resolved_sport": live_esports_class.family.or(live.payload.sport.as_deref()),
+                        "esports_family": live_esports_class.family,
+                        "sport_confidence": live_esports_class.confidence,
+                        "sport_reason": live_esports_class.reason,
+                        "team1": live.payload.team1,
+                        "team2": live.payload.team2,
+                        "raw_score1": raw_s1,
+                        "raw_score2": raw_s2,
+                        "score1": s1,
+                        "score2": s2,
+                        "live_status": live.payload.status,
+                        "detailed_score": live.payload.detailed_score,
+                        "guard_map_lead": guard_map_lead,
+                        "guard_map_lose": guard_map_lose,
+                        "match_prob": expected_prob,
+                        "round_total": round_total,
+                        "guard_azuro_odds": guard_azuro_odds,
+                    }));
+                }
+                continue;
+            }
+            info!(
+                "  ✅ {} {}-{}: CS2 match_winner ALLOWED via map lead (maps={}-{}, match_prob={:.1}%, rounds={}, odds={:?})",
+                match_key,
+                s1,
+                s2,
+                guard_map_lead,
+                guard_map_lose,
+                expected_prob * 100.0,
+                round_total,
+                guard_azuro_odds,
+            );
         }
 
         // Resolve correct Azuro side by TEAM NAME — HARD BLOCK if ambiguous
@@ -4263,6 +5488,9 @@ struct ActiveBet {
     bet_id: String,
     match_key: String,
     market_key: String,
+    original_sport: Option<String>,
+    resolved_sport: Option<String>,
+    esports_family: Option<String>,
     team1: String,
     team2: String,
     value_team: String,
@@ -4277,8 +5505,81 @@ struct ActiveBet {
     path: String,
 }
 
-fn count_pending_slots(active_bets: &[ActiveBet]) -> usize {
-    active_bets.iter().filter(|bet| bet.token_id.is_none()).count()
+fn count_pending_slots(active_bets: &[ActiveBet], session_start: DateTime<Utc>) -> usize {
+    let now_utc = Utc::now();
+    active_bets.iter()
+        .filter(|bet| should_count_unverified_pending_bet(bet, now_utc, session_start))
+        .count()
+}
+
+fn should_count_unverified_pending_bet(
+    bet: &ActiveBet,
+    now_utc: DateTime<Utc>,
+    session_start: DateTime<Utc>,
+) -> bool {
+    if bet.token_id.is_some() {
+        return false;
+    }
+
+    if bet.alert_id > 0 && bet.path != "loaded" && bet.placed_at != "loaded" {
+        return true;
+    }
+
+    if bet.placed_at == "loaded" || bet.path == "loaded" {
+        return (now_utc - session_start).num_seconds() <= STARTUP_UNVERIFIED_GRACE_SECS;
+    }
+
+    match chrono::DateTime::parse_from_rfc3339(&bet.placed_at) {
+        Ok(placed) => {
+            let age_secs = (now_utc - placed.with_timezone(&Utc)).num_seconds();
+            age_secs <= STARTUP_UNVERIFIED_GRACE_SECS
+        }
+        Err(_) => false,
+    }
+}
+
+fn locked_exposure_total(active_bets: &[ActiveBet], session_start: DateTime<Utc>) -> f64 {
+    let now_utc = Utc::now();
+    active_bets.iter()
+        .filter(|bet| {
+            bet.token_id.is_some()
+                || should_count_unverified_pending_bet(bet, now_utc, session_start)
+        })
+        .map(|bet| bet.amount_usd)
+        .sum()
+}
+
+fn refresh_active_bet_from_onchain_pending(
+    bet: &mut ActiveBet,
+    team: &str,
+    odds: f64,
+    amount: f64,
+    match_key: &str,
+) -> bool {
+    let mut changed = false;
+
+    if amount > 0.0 && (bet.amount_usd - amount).abs() > 0.009 {
+        bet.amount_usd = amount;
+        changed = true;
+    }
+    let should_refresh_odds = odds > 0.0
+        && (bet.odds <= 0.0 || bet.path == "loaded" || bet.path == "onchain" || bet.placed_at == "loaded" || bet.placed_at == "onchain");
+    if should_refresh_odds && (bet.odds - odds).abs() > 0.009 {
+        bet.odds = odds;
+        changed = true;
+    }
+    if !match_key.is_empty() && bet.match_key != match_key {
+        bet.match_key = match_key.to_string();
+        changed = true;
+    }
+    if !team.is_empty() && (bet.value_team.is_empty() || bet.value_team == "?" || bet.path == "loaded" || bet.path == "onchain") {
+        if bet.value_team != team {
+            bet.value_team = team.to_string();
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 fn rewrite_pending_claims_file(active_bets: &[ActiveBet], pending_claims_path: &str) {
@@ -4287,12 +5588,92 @@ fn rewrite_pending_claims_file(active_bets: &[ActiveBet], pending_claims_path: &
         .open(pending_claims_path) {
         use std::io::Write;
         for bet in active_bets {
-            let tid = bet.token_id.as_deref().unwrap_or("?");
-            let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                tid, bet.bet_id, bet.match_key,
-                bet.value_team, bet.amount_usd, bet.odds,
-                bet.team1, bet.team2, bet.market_key);
+            let _ = writeln!(f, "{}", pending_claims_line(bet));
         }
+    }
+}
+
+fn pending_claims_line(bet: &ActiveBet) -> String {
+    let tid = bet.token_id.as_deref().unwrap_or("?");
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        tid,
+        bet.bet_id,
+        bet.match_key,
+        bet.value_team,
+        bet.amount_usd,
+        bet.odds,
+        bet.team1,
+        bet.team2,
+        bet.market_key,
+        bet.original_sport.as_deref().unwrap_or(""),
+        bet.resolved_sport.as_deref().unwrap_or(""),
+        bet.esports_family.as_deref().unwrap_or("")
+    )
+}
+
+fn load_dashboard_runtime_config(
+    cfg_path: &str,
+    dashboard_max_stake: &mut Option<f64>,
+    dashboard_sport_focus: &mut Vec<String>,
+    dashboard_autobet_enabled: &mut bool,
+) {
+    if let Ok(contents) = std::fs::read_to_string(cfg_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+            if let Some(ms) = v["max_stake"].as_f64() {
+                if ms > 0.0 && ms < 100.0 {
+                    *dashboard_max_stake = Some(ms);
+                }
+            }
+            if let Some(arr) = v["sport_focus"].as_array() {
+                let sports: Vec<String> = arr.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect();
+                if !sports.is_empty() {
+                    *dashboard_sport_focus = sports;
+                }
+            }
+            if let Some(no_bet_mode) = v["no_bet_mode"].as_bool() {
+                *dashboard_autobet_enabled = !no_bet_mode;
+            } else if let Some(ae) = v["autobet_enabled"].as_bool() {
+                *dashboard_autobet_enabled = ae;
+            }
+        }
+    }
+}
+
+fn persist_dashboard_runtime_config(
+    cfg_path: &str,
+    dashboard_max_stake: Option<f64>,
+    dashboard_sport_focus: &[String],
+    dashboard_autobet_enabled: bool,
+) {
+    let mut root = match std::fs::read_to_string(cfg_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+    {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+
+    root.insert("autobet_enabled".to_string(), serde_json::json!(dashboard_autobet_enabled));
+    root.insert("no_bet_mode".to_string(), serde_json::json!(!dashboard_autobet_enabled));
+    root.insert("sport_focus".to_string(), serde_json::json!(dashboard_sport_focus));
+    if let Some(ms) = dashboard_max_stake {
+        root.insert("max_stake".to_string(), serde_json::json!(ms));
+    }
+
+    if let Ok(serialized) = serde_json::to_string_pretty(&serde_json::Value::Object(root)) {
+        let _ = std::fs::write(cfg_path, serialized);
+    }
+}
+
+fn append_pending_claim_entry(bet: &ActiveBet, pending_claims_path: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(pending_claims_path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", pending_claims_line(bet));
     }
 }
 
@@ -4324,11 +5705,295 @@ fn bet_display_name(bet: &ActiveBet) -> String {
 }
 
 fn display_sport(bet: &ActiveBet) -> String {
-    bet.match_key.split("::").next().unwrap_or("?").to_uppercase()
+    bet.resolved_sport
+        .as_deref()
+        .or_else(|| Some(bet.match_key.split("::").next().unwrap_or("?")))
+        .unwrap_or("?")
+        .to_uppercase()
+}
+
+/// Verbose sport label: includes esports family from ledger if available
+fn display_sport_verbose(bet: &ActiveBet) -> String {
+    let base = bet.match_key.split("::").next().unwrap_or("?");
+    let original = bet.original_sport.as_deref().unwrap_or(base);
+    let resolved = bet.resolved_sport.as_deref().unwrap_or(base);
+    if let Some(family) = bet.esports_family.as_deref().filter(|value| !value.is_empty()) {
+        return format!("{} ({})", resolved.to_uppercase(), family);
+    }
+    if !original.is_empty() && original != resolved && !resolved.is_empty() {
+        return format!("{} → {}", original.to_uppercase(), resolved.to_uppercase());
+    }
+    resolved.to_uppercase()
+}
+
+/// Format rich recent bets overview for /prehled command
+fn format_recent_bets_detail(limit: usize) -> String {
+    let ledger_path = "data/ledger.jsonl";
+    let Ok(contents) = std::fs::read_to_string(ledger_path) else {
+        return "📭 Žádná data v ledgeru.".to_string();
+    };
+
+    let mut entries: Vec<(String, serde_json::Value)> = Vec::new();
+    for line in contents.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+        let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        if event != "WON" && event != "LOST" && event != "CANCELED" { continue; }
+        entries.push((event.to_string(), entry));
+        if entries.len() >= limit { break; }
+    }
+
+    if entries.is_empty() {
+        return "📭 Žádné settled bety.".to_string();
+    }
+
+    let mut msg = String::from("📋 <b>Posledních settled betů:</b>\n\n");
+    for (event, entry) in &entries {
+        let emoji = match event.as_str() {
+            "WON" => "✅",
+            "LOST" => "❌",
+            "CANCELED" => "🔄",
+            _ => "❓",
+        };
+        let match_key = entry.get("match_key").and_then(|v| v.as_str()).unwrap_or("?");
+        let sport = match_key.split("::").next().unwrap_or("?").to_uppercase();
+        let market = entry.get("market_key").and_then(|v| v.as_str()).unwrap_or("match_winner");
+        let value_team = entry.get("value_team").and_then(|v| v.as_str()).unwrap_or("?");
+        let odds = entry.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let amount = entry.get("amount_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let ts = entry.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        let time_short = if ts.len() >= 16 { &ts[11..16] } else { "?" };
+
+        // Lookup PLACED data for this bet_id
+        let bet_id = entry.get("bet_id").and_then(|v| v.as_str()).unwrap_or("");
+        let meta = if !bet_id.is_empty() { lookup_placed_metadata(bet_id) } else { None };
+
+        let esports = meta.as_ref().map(|_| {
+            // Already captured in PlacedMeta.path
+            String::new()
+        }).unwrap_or_default();
+        let _ = esports; // suppress unused
+
+        let result_text = match event.as_str() {
+            "WON" => format!("+${:.2}", amount * odds - amount),
+            "LOST" => format!("-${:.2}", amount),
+            "CANCELED" => format!("↩ ${:.2}", amount),
+            _ => "?".to_string(),
+        };
+
+        let match_name = match_key.split("::").nth(1).unwrap_or(match_key)
+            .replace("_vs_", " vs ").replace('_', " ");
+
+        msg.push_str(&format!(
+            "{} <b>{}</b> | {} | {}\n   {} @ {:.2} — {}\n",
+            emoji, sport, market, time_short,
+            value_team, odds, result_text
+        ));
+        msg.push_str(&format!("   {}\n", match_name));
+
+        if let Some(ref m) = meta {
+            if !m.score.is_empty() {
+                msg.push_str(&format!("   📊 Skóre: {} ", m.score));
+            }
+            if m.edge_pct > 0.0 {
+                msg.push_str(&format!("📈 Edge: {:.1}% ", m.edge_pct));
+            }
+            if !m.path.is_empty() {
+                msg.push_str(&format!("🔀 {}", m.path));
+            }
+            msg.push('\n');
+        }
+        msg.push('\n');
+    }
+
+    msg
 }
 
 fn display_market(bet: &ActiveBet) -> &str {
     if bet.market_key.is_empty() || bet.market_key == "unknown" { "match_winner" } else { &bet.market_key }
+}
+
+/// Metadata retrieved from the PLACED ledger entry for enriching WON/LOST notifications
+struct PlacedMeta {
+    market_key: String,
+    edge_pct: f64,
+    score: String,
+    detailed_score: String,
+    path: String,
+    requested_odds: Option<f64>,
+    logged_odds: Option<f64>,
+    azuro_implied_pct: f64,
+    score_implied_pct: f64,
+}
+
+/// Look up original placement metadata from ledger.jsonl by bet_id
+fn lookup_placed_metadata(bet_id: &str) -> Option<PlacedMeta> {
+    let contents = std::fs::read_to_string("data/ledger.jsonl").ok()?;
+    for line in contents.lines().rev() {
+        let entry: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        if event != "PLACED" { continue; }
+        let bid = entry.get("bet_id").and_then(|v| v.as_str()).unwrap_or("");
+        if bid != bet_id { continue; }
+
+        let market_key = entry.get("market_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let edge_pct = entry.get("edge_pct").and_then(|v| v.as_f64())
+            .or_else(|| entry.get("anomaly_disc_pct").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let score = {
+            let s1 = entry.get("score1").and_then(|v| v.as_i64());
+            let s2 = entry.get("score2").and_then(|v| v.as_i64());
+            match (s1, s2) {
+                (Some(a), Some(b)) => format!("{}-{}", a, b),
+                _ => entry.get("anomaly_live_score")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            }
+        };
+        let detailed_score = entry.get("detailed_score")
+            .or_else(|| entry.get("anomaly_detailed_score"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let requested_odds = entry.get("requested_odds").and_then(|v| v.as_f64());
+        let logged_odds = entry.get("odds").and_then(|v| v.as_f64());
+        let azuro_implied_pct = entry.get("azuro_implied_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let score_implied_pct = entry.get("score_implied_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        return Some(PlacedMeta {
+            market_key,
+            edge_pct,
+            score,
+            detailed_score,
+            path,
+            requested_odds,
+            logged_odds,
+            azuro_implied_pct,
+            score_implied_pct,
+        });
+    }
+    None
+}
+
+fn parse_simple_score_pair(score: &str) -> Option<(i64, i64)> {
+    let trimmed = score.trim();
+    let delim = if trimmed.contains('-') {
+        '-'
+    } else if trimmed.contains(':') {
+        ':'
+    } else {
+        return None;
+    };
+    let mut parts = trimmed.split(delim);
+    let left = parts.next()?.trim().parse::<i64>().ok()?;
+    let right = parts.next()?.trim().parse::<i64>().ok()?;
+    Some((left, right))
+}
+
+fn compact_entry_score(meta: &PlacedMeta, bet: Option<&ActiveBet>) -> String {
+    let base = if !meta.score.is_empty() {
+        meta.score.clone()
+    } else if !meta.detailed_score.is_empty() {
+        meta.detailed_score.clone()
+    } else {
+        String::new()
+    };
+
+    if base.is_empty() {
+        return base;
+    }
+
+    if let (Some((left, right)), Some(b)) = (parse_simple_score_pair(&meta.score), bet) {
+        let (team1, team2) = display_teams(b);
+        let picked = b.value_team.trim();
+        let suffix = if !picked.is_empty() && picked != "?" && picked.eq_ignore_ascii_case(team1.trim()) {
+            if left > right {
+                Some("pick vedl")
+            } else if left < right {
+                Some("pick prohrával")
+            } else {
+                Some("stav byl remíza")
+            }
+        } else if !picked.is_empty() && picked != "?" && picked.eq_ignore_ascii_case(team2.trim()) {
+            if right > left {
+                Some("pick vedl")
+            } else if right < left {
+                Some("pick prohrával")
+            } else {
+                Some("stav byl remíza")
+            }
+        } else {
+            None
+        };
+
+        if let Some(tag) = suffix {
+            return format!("{} ({})", base, tag);
+        }
+    }
+
+    base
+}
+
+fn format_odds_flow(meta: Option<&PlacedMeta>, executor_odds: f64) -> String {
+    if let Some(m) = meta {
+        if let Some(req) = m.requested_odds {
+            let mut parts = vec![format!("req @{:.2}", req), format!("exec @{:.2}", executor_odds)];
+            if let Some(logged) = m.logged_odds {
+                if (logged - executor_odds).abs() > 0.009 {
+                    parts.push(format!("log @{:.2}", logged));
+                }
+            }
+            return parts.join(" → ");
+        }
+    }
+    format!("@{:.2}", executor_odds)
+}
+
+fn format_status_bet_line(bet: &ActiveBet) -> String {
+    let display_name = bet_display_name(bet);
+    let market = display_market_key(display_market(bet));
+    let meta = lookup_placed_metadata(&bet.bet_id);
+    let odds_flow = format_odds_flow(meta.as_ref(), bet.odds);
+    let score_suffix = meta.as_ref()
+        .map(|m| compact_entry_score(m, Some(bet)))
+        .filter(|score| !score.is_empty())
+        .map(|score| format!(" | vstup {}", score))
+        .unwrap_or_default();
+    format!(
+        "  • {} <i>{} / {}</i> {} ${:.2}{}",
+        display_name,
+        display_sport(bet),
+        market,
+        odds_flow,
+        bet.amount_usd,
+        score_suffix,
+    )
+}
+
+/// Format enriched detail block for WON/LOST notifications
+fn format_placed_detail(meta: &PlacedMeta) -> String {
+    let mut parts = Vec::new();
+    if !meta.score.is_empty() {
+        parts.push(format!("📊 Skóre při sázce: <b>{}</b>", meta.score));
+    }
+    if !meta.detailed_score.is_empty() {
+        parts.push(format!("📋 Detail: {}", meta.detailed_score));
+    }
+    if meta.edge_pct > 0.0 {
+        parts.push(format!("📈 Edge: <b>{:.1}%</b>", meta.edge_pct));
+    }
+    if meta.azuro_implied_pct > 0.0 && meta.score_implied_pct > 0.0 {
+        parts.push(format!("🎯 Model: {:.0}% vs Azuro: {:.0}%", meta.score_implied_pct, meta.azuro_implied_pct));
+    }
+    if !meta.path.is_empty() {
+        parts.push(format!("🔀 Path: {}", meta.path));
+    }
+    parts.join("\n")
 }
 
 fn should_count_loss_streak(bet: &ActiveBet) -> bool {
@@ -4442,6 +6107,18 @@ fn reconcile_active_bets_with_executor_snapshot(
         }
     }
 
+    for bet in active_bets.iter_mut() {
+        let onchain_match = onchain_enriched.iter().find(|(tid, _, _, _, _, bet_id)| {
+            bet.token_id.as_ref().is_some_and(|local_tid| local_tid == tid)
+                || (!bet.bet_id.is_empty() && !bet_id.is_empty() && bet.bet_id == *bet_id)
+        });
+        if let Some((_, team, odds, amount, match_key, _)) = onchain_match {
+            if refresh_active_bet_from_onchain_pending(bet, team, *odds, *amount, match_key) {
+                needs_rewrite = true;
+            }
+        }
+    }
+
     let local_tids: HashSet<String> = active_bets.iter()
         .filter_map(|b| b.token_id.clone())
         .collect();
@@ -4449,13 +6126,25 @@ fn reconcile_active_bets_with_executor_snapshot(
         if !local_tids.contains(tid) {
             let ledger_meta = ledger_meta_by_token_id.get(tid)
                 .or_else(|| ledger_meta_by_bet_id.get(bet_id));
-            let (eff_team, eff_t1, eff_t2, eff_market_key, eff_condition_id, eff_outcome_id, eff_graph_bet_id) =
+            if ledger_meta.is_none() && (match_key.is_empty() || *amount <= 0.0 || *odds <= 0.0) {
+                info!(
+                    "🧹 RECONCILE: skipping metadata-poor on-chain pending token {} (bet_id={}, match_key='{}', amount={:.2}, odds={:.2})",
+                    tid,
+                    bet_id,
+                    match_key,
+                    amount,
+                    odds,
+                );
+                continue;
+            }
+            let (eff_team, eff_t1, eff_t2, eff_market_key, eff_odds, eff_condition_id, eff_outcome_id, eff_graph_bet_id) =
                 if let Some(meta) = ledger_meta {
                     (
                         if !meta.value_team.is_empty() { meta.value_team.clone() } else { format!("{} vs {}", meta.team1, meta.team2) },
                         meta.team1.clone(),
                         meta.team2.clone(),
                         meta.market_key.clone(),
+                        meta.odds,
                         meta.condition_id.clone(),
                         meta.outcome_id.clone(),
                         meta.graph_bet_id.clone(),
@@ -4466,6 +6155,7 @@ fn reconcile_active_bets_with_executor_snapshot(
                         team.clone(),
                         "?".to_string(),
                         market_from_match_key(match_key),
+                        *odds,
                         String::new(),
                         String::new(),
                         None,
@@ -4476,6 +6166,7 @@ fn reconcile_active_bets_with_executor_snapshot(
                         t1,
                         t2,
                         market_from_match_key(match_key),
+                        *odds,
                         String::new(),
                         String::new(),
                         None,
@@ -4486,6 +6177,7 @@ fn reconcile_active_bets_with_executor_snapshot(
                         "?".to_string(),
                         "?".to_string(),
                         market_from_match_key(match_key),
+                        *odds,
                         String::new(),
                         String::new(),
                         None,
@@ -4496,11 +6188,14 @@ fn reconcile_active_bets_with_executor_snapshot(
                 bet_id: if !bet_id.is_empty() { bet_id.clone() } else { format!("onchain_{}", tid) },
                 match_key: match_key.clone(),
                 market_key: eff_market_key,
+                original_sport: None,
+                resolved_sport: Some(match_key.split("::").next().unwrap_or("").to_string()).filter(|v| !v.is_empty()),
+                esports_family: None,
                 team1: eff_t1,
                 team2: eff_t2,
                 value_team: eff_team,
                 amount_usd: *amount,
-                odds: *odds,
+                odds: eff_odds,
                 placed_at: "onchain".to_string(),
                 condition_id: eff_condition_id,
                 outcome_id: eff_outcome_id,
@@ -4535,6 +6230,28 @@ fn reconcile_active_bets_with_executor_snapshot(
         }
     }
 
+    let before_unverified_prune = active_bets.len();
+    active_bets.retain(|bet| {
+        if bet.token_id.is_some() {
+            return true;
+        }
+
+        if should_count_unverified_pending_bet(bet, now_utc, session_start) {
+            return true;
+        }
+
+        info!(
+            "🧹 RECONCILE: dropping stale unverified bet {} ({}) from locked exposure after {}s grace",
+            bet.bet_id,
+            bet.value_team,
+            STARTUP_UNVERIFIED_GRACE_SECS,
+        );
+        false
+    });
+    if active_bets.len() != before_unverified_prune {
+        needs_rewrite = true;
+    }
+
     let post_count = active_bets.len();
     if pre_count != post_count {
         info!("🔄 RECONCILE: active_bets {} → {} (on-chain pending: {})",
@@ -4552,7 +6269,7 @@ fn reconcile_active_bets_with_executor_snapshot(
         info!("💾 RECONCILE: pending_claims.txt rewritten ({} entries)", active_bets.len());
     }
 
-    active_bets.iter().map(|b| b.amount_usd).sum()
+    locked_exposure_total(active_bets, session_start)
 }
 
 #[derive(Debug, Deserialize)]
@@ -4572,6 +6289,19 @@ struct ExecutorBetResponse {
     min_odds: Option<f64>,
     state: Option<String>,
     error: Option<String>,
+}
+
+fn json_f64_field(value: &serde_json::Value, key: &str) -> Option<f64> {
+    value.get(key).and_then(|raw| match raw {
+        serde_json::Value::Number(num) => num.as_f64(),
+        serde_json::Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    })
+}
+
+fn executor_truth_accepted_odds(value: &serde_json::Value) -> Option<f64> {
+    json_f64_field(value, "acceptedOdds")
+        .or_else(|| json_f64_field(value, "odds"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4763,15 +6493,27 @@ struct LedgerRecoveryStats {
     stale_12h: usize,
     stale_24h: usize,
     oldest_age_hours: Option<f64>,
+    skipped_stale_orphans: usize,
+    skipped_missing_token: usize,
+}
+
+fn entry_age_hours(entry: &serde_json::Value, now: DateTime<Utc>) -> Option<f64> {
+    let ts = entry.get("ts").and_then(|v| v.as_str())?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some((now - parsed.with_timezone(&Utc)).num_seconds() as f64 / 3600.0)
 }
 
 #[derive(Debug, Default, Clone)]
 struct LedgerBetMetadata {
     match_key: String,
     market_key: String,
+    original_sport: Option<String>,
+    resolved_sport: Option<String>,
+    esports_family: Option<String>,
     team1: String,
     team2: String,
     value_team: String,
+    odds: f64,
     placed_at: String,
     path: String,
     alert_id: Option<u32>,
@@ -4779,6 +6521,197 @@ struct LedgerBetMetadata {
     outcome_id: String,
     graph_bet_id: Option<String>,
     token_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SettlementBetView {
+    alert_id: u32,
+    match_key: String,
+    market_key: String,
+    team1: String,
+    team2: String,
+    value_team: String,
+    amount_usd: f64,
+    odds: f64,
+    token_id: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimDetail {
+    token_id: String,
+    alert_id: u32,
+    bet_id: String,
+    match_key: String,
+    market_key: String,
+    team1: String,
+    team2: String,
+    value_team: String,
+    amount_usd: f64,
+    odds: f64,
+    payout_usd: f64,
+    result: String,
+    path: String,
+}
+
+fn prefer_non_missing_field(current: &str, candidate: &str) -> String {
+    if !is_missing_display_field(candidate) {
+        candidate.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+fn merge_ledger_metadata(
+    existing: Option<&LedgerBetMetadata>,
+    candidate: LedgerBetMetadata,
+    event: &str,
+) -> LedgerBetMetadata {
+    let Some(existing) = existing else {
+        return candidate;
+    };
+
+    let mut merged = existing.clone();
+
+    if merged.match_key.is_empty() {
+        merged.match_key = candidate.match_key.clone();
+    }
+    if merged.market_key.is_empty() || merged.market_key == "unknown" {
+        merged.market_key = candidate.market_key.clone();
+    }
+    if merged.original_sport.as_ref().is_none_or(|value| value.is_empty()) {
+        merged.original_sport = candidate.original_sport.clone();
+    }
+    if merged.resolved_sport.as_ref().is_none_or(|value| value.is_empty()) {
+        merged.resolved_sport = candidate.resolved_sport.clone();
+    }
+    if merged.esports_family.as_ref().is_none_or(|value| value.is_empty()) {
+        merged.esports_family = candidate.esports_family.clone();
+    }
+    if is_missing_display_field(&merged.team1) {
+        merged.team1 = candidate.team1.clone();
+    }
+    if is_missing_display_field(&merged.team2) {
+        merged.team2 = candidate.team2.clone();
+    }
+    if is_missing_display_field(&merged.value_team) {
+        merged.value_team = candidate.value_team.clone();
+    }
+    if merged.odds <= 0.0 {
+        merged.odds = candidate.odds;
+    }
+    if merged.placed_at.is_empty() {
+        merged.placed_at = candidate.placed_at.clone();
+    }
+    if merged.path.is_empty() {
+        merged.path = candidate.path.clone();
+    }
+    if merged.alert_id.is_none() {
+        merged.alert_id = candidate.alert_id;
+    }
+    if merged.condition_id.is_empty() {
+        merged.condition_id = candidate.condition_id.clone();
+    }
+    if merged.outcome_id.is_empty() {
+        merged.outcome_id = candidate.outcome_id.clone();
+    }
+    if merged.graph_bet_id.is_none() {
+        merged.graph_bet_id = candidate.graph_bet_id.clone();
+    }
+    if merged.token_id.is_none() {
+        merged.token_id = candidate.token_id.clone();
+    }
+
+    if event == "PLACED" {
+        merged.match_key = candidate.match_key;
+        merged.market_key = prefer_non_missing_field(&merged.market_key, &candidate.market_key);
+        if candidate.original_sport.as_ref().is_some_and(|value| !value.is_empty()) {
+            merged.original_sport = candidate.original_sport;
+        }
+        if candidate.resolved_sport.as_ref().is_some_and(|value| !value.is_empty()) {
+            merged.resolved_sport = candidate.resolved_sport;
+        }
+        if candidate.esports_family.as_ref().is_some_and(|value| !value.is_empty()) {
+            merged.esports_family = candidate.esports_family;
+        }
+        merged.team1 = prefer_non_missing_field(&merged.team1, &candidate.team1);
+        merged.team2 = prefer_non_missing_field(&merged.team2, &candidate.team2);
+        merged.value_team = prefer_non_missing_field(&merged.value_team, &candidate.value_team);
+        if candidate.odds > 0.0 {
+            merged.odds = candidate.odds;
+        }
+        if !candidate.placed_at.is_empty() {
+            merged.placed_at = candidate.placed_at;
+        }
+        merged.path = prefer_non_missing_field(&merged.path, &candidate.path);
+        if candidate.alert_id.is_some() {
+            merged.alert_id = candidate.alert_id;
+        }
+        if !candidate.condition_id.is_empty() {
+            merged.condition_id = candidate.condition_id;
+        }
+        if !candidate.outcome_id.is_empty() {
+            merged.outcome_id = candidate.outcome_id;
+        }
+        if candidate.graph_bet_id.is_some() {
+            merged.graph_bet_id = candidate.graph_bet_id;
+        }
+        if candidate.token_id.is_some() {
+            merged.token_id = candidate.token_id;
+        }
+    }
+
+    merged
+}
+
+fn settlement_bet_view(
+    bet: &ActiveBet,
+    by_bet_id: &HashMap<String, LedgerBetMetadata>,
+    by_token_id: &HashMap<String, LedgerBetMetadata>,
+) -> SettlementBetView {
+    let metadata = bet.token_id.as_ref()
+        .and_then(|tid| by_token_id.get(tid))
+        .or_else(|| by_bet_id.get(&bet.bet_id));
+
+    let match_key = metadata.map(|m| m.match_key.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| bet.match_key.clone());
+    let market_key = metadata.map(|m| m.market_key.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| bet.market_key.clone());
+    let team1 = metadata.map(|m| m.team1.clone()).filter(|v| !is_missing_display_field(v)).unwrap_or_else(|| bet.team1.clone());
+    let team2 = metadata.map(|m| m.team2.clone()).filter(|v| !is_missing_display_field(v)).unwrap_or_else(|| bet.team2.clone());
+    let value_team = metadata.map(|m| m.value_team.clone()).filter(|v| !is_missing_display_field(v)).unwrap_or_else(|| bet.value_team.clone());
+    let path = metadata.map(|m| m.path.clone()).filter(|v| !v.is_empty()).unwrap_or_else(|| bet.path.clone());
+    let alert_id = metadata.and_then(|m| m.alert_id).unwrap_or(bet.alert_id);
+    let odds = metadata.map(|m| m.odds).filter(|v| *v > 0.0).unwrap_or(bet.odds);
+
+    SettlementBetView {
+        alert_id,
+        match_key,
+        market_key,
+        team1,
+        team2,
+        value_team,
+        amount_usd: bet.amount_usd,
+        odds,
+        token_id: bet.token_id.clone(),
+        path,
+    }
+}
+
+fn display_team_pair(match_key: &str, team1: &str, team2: &str) -> (String, String) {
+    let t1 = if !team1.is_empty() && team1 != "?" {
+        team1.to_string()
+    } else {
+        match_key_team_parts(match_key).map(|(a, _)| a).unwrap_or_else(|| "?".to_string())
+    };
+    let t2 = if !team2.is_empty() && team2 != "?" {
+        team2.to_string()
+    } else {
+        match_key_team_parts(match_key).map(|(_, b)| b).unwrap_or_else(|| "?".to_string())
+    };
+    (t1, t2)
+}
+
+fn display_market_key(market_key: &str) -> &str {
+    if market_key.is_empty() || market_key == "unknown" { "match_winner" } else { market_key }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -4791,10 +6724,113 @@ struct RuntimeAuditSummary {
     fail_reasons: Vec<(String, usize)>,
 }
 
+#[derive(Debug, Default, Clone)]
+struct OddsDriftAuditSummary {
+    alerts: usize,
+    top_lines: Vec<String>,
+}
+
+impl OddsDriftAuditSummary {
+    fn has_data(&self) -> bool {
+        self.alerts > 0
+    }
+}
+
 impl RuntimeAuditSummary {
     fn has_data(&self) -> bool {
         self.placed > 0 || self.accepted > 0 || self.bet_failed > 0 || self.won > 0 || self.lost > 0
     }
+}
+
+fn recent_portfolio_event_lines(limit: usize, lookback_hours: i64) -> Vec<String> {
+    let ledger_path = "data/ledger.jsonl";
+    if !Path::new(ledger_path).exists() {
+        return Vec::new();
+    }
+
+    let Ok(contents) = std::fs::read_to_string(ledger_path) else {
+        return Vec::new();
+    };
+
+    let cutoff = Utc::now() - chrono::Duration::hours(lookback_hours.max(1));
+    let mut out: Vec<String> = Vec::new();
+
+    for line in contents.lines().rev() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        if event != "PLACED" && event != "WON" && event != "LOST" && event != "CANCELED" {
+            continue;
+        }
+
+        let Some(ts) = entry.get("ts").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(parsed_ts) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        let parsed_ts = parsed_ts.with_timezone(&Utc);
+        if parsed_ts < cutoff {
+            break;
+        }
+
+        let match_key = entry.get("match_key").and_then(|v| v.as_str()).unwrap_or("");
+        let display_name = match_key_team_parts(match_key)
+            .map(|(a, b)| format!("{} vs {}", a, b))
+            .unwrap_or_else(|| {
+                if match_key.is_empty() {
+                    "?".to_string()
+                } else {
+                    match_key.replace("::", " ").replace("_vs_", " vs ").replace('_', " ")
+                }
+            });
+        let odds = entry.get("odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let stake = entry.get("amount_usd")
+            .and_then(|v| v.as_f64())
+            .or_else(|| entry.get("stake").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let payout = entry.get("payout_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let bet_id = entry.get("bet_id").and_then(|v| v.as_str()).unwrap_or("");
+        let meta = if !bet_id.is_empty() { lookup_placed_metadata(bet_id) } else { None };
+        let market_key = entry.get("market_key").and_then(|v| v.as_str()).unwrap_or("");
+        let market = if !market_key.is_empty() {
+            display_market_key(market_key).to_string()
+        } else {
+            meta.as_ref()
+                .map(|m| display_market_key(&m.market_key).to_string())
+                .unwrap_or_else(|| "match_winner".to_string())
+        };
+        let path = meta.as_ref().map(|m| m.path.as_str()).filter(|path| !path.is_empty()).unwrap_or_else(|| {
+            entry.get("path").and_then(|v| v.as_str()).unwrap_or("")
+        });
+        let score_suffix = meta.as_ref()
+            .map(|m| compact_entry_score(m, None))
+            .filter(|score| !score.is_empty())
+            .map(|score| format!(" | {}", score))
+            .unwrap_or_default();
+        let age_mins = (Utc::now() - parsed_ts).num_minutes().max(0);
+        let age = if age_mins >= 60 {
+            format!("{}h", age_mins / 60)
+        } else {
+            format!("{}m", age_mins)
+        };
+
+        let line = match event {
+            "PLACED" => format!("  • ⏳ {} | {} | {} @ {:.2} ${:.2}{} ({})", display_name, market, path, odds, stake, score_suffix, age),
+            "WON" => format!("  • ✅ {} | {} | {} +${:.2}{} ({})", display_name, market, path, (payout - stake).max(0.0), score_suffix, age),
+            "LOST" => format!("  • ❌ {} | {} | {} -${:.2}{} ({})", display_name, market, path, stake, score_suffix, age),
+            "CANCELED" => format!("  • ↩️ {} | {} | {} canceled{} ({})", display_name, market, path, score_suffix, age),
+            _ => continue,
+        };
+
+        out.push(line);
+        if out.len() >= limit {
+            break;
+        }
+    }
+
+    out
 }
 
 fn load_ledger_bet_metadata() -> (HashMap<String, LedgerBetMetadata>, HashMap<String, LedgerBetMetadata>) {
@@ -4855,11 +6891,28 @@ fn load_ledger_bet_metadata() -> (HashMap<String, LedgerBetMetadata>, HashMap<St
             .filter(|v| !is_missing_display_field(v))
             .map(|v| v.to_string())
             .unwrap_or_else(|| market_from_match_key(&match_key));
+        let original_sport = entry.get("original_sport")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        let resolved_sport = entry.get("resolved_sport")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .or_else(|| Some(match_key.split("::").next().unwrap_or("").to_string()).filter(|v| !v.is_empty()));
+        let esports_family = entry.get("esports_family")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
         let token_id = sanitize_token_id(
             entry.get("token_id")
                 .and_then(|v| v.as_str())
                 .map(|v| v.to_string())
         );
+        let odds = entry.get("odds")
+            .and_then(|v| v.as_f64())
+            .or_else(|| entry.get("requested_odds").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
         let placed_at = entry.get("ts")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -4872,9 +6925,13 @@ fn load_ledger_bet_metadata() -> (HashMap<String, LedgerBetMetadata>, HashMap<St
         let metadata = LedgerBetMetadata {
             match_key,
             market_key,
+            original_sport,
+            resolved_sport,
+            esports_family,
             team1,
             team2,
             value_team,
+            odds,
             placed_at,
             path,
             alert_id: entry.get("alert_id")
@@ -4893,9 +6950,10 @@ fn load_ledger_bet_metadata() -> (HashMap<String, LedgerBetMetadata>, HashMap<St
                 .map(|v| v.to_string()),
             token_id: token_id.clone(),
         };
-        by_bet_id.insert(bet_id.to_string(), metadata.clone());
-        if let Some(tid) = token_id {
-            by_token_id.insert(tid, metadata);
+        let merged = merge_ledger_metadata(by_bet_id.get(bet_id), metadata, event);
+        by_bet_id.insert(bet_id.to_string(), merged.clone());
+        if let Some(tid) = merged.token_id.clone() {
+            by_token_id.insert(tid, merged);
         }
     }
 
@@ -4921,6 +6979,24 @@ fn enrich_active_bet_from_ledger_metadata(
     }
     if is_missing_display_field(&bet.market_key) && !metadata.market_key.is_empty() {
         bet.market_key = metadata.market_key.clone();
+        changed = true;
+    }
+    if bet.original_sport.as_ref().is_none_or(|value| value.is_empty())
+        && metadata.original_sport.as_ref().is_some_and(|value| !value.is_empty())
+    {
+        bet.original_sport = metadata.original_sport.clone();
+        changed = true;
+    }
+    if bet.resolved_sport.as_ref().is_none_or(|value| value.is_empty())
+        && metadata.resolved_sport.as_ref().is_some_and(|value| !value.is_empty())
+    {
+        bet.resolved_sport = metadata.resolved_sport.clone();
+        changed = true;
+    }
+    if bet.esports_family.as_ref().is_none_or(|value| value.is_empty())
+        && metadata.esports_family.as_ref().is_some_and(|value| !value.is_empty())
+    {
+        bet.esports_family = metadata.esports_family.clone();
         changed = true;
     }
     if is_missing_display_field(&bet.team1) && !metadata.team1.is_empty() {
@@ -5095,6 +7171,57 @@ fn summarize_recent_runtime(hours: i64) -> RuntimeAuditSummary {
     summary
 }
 
+fn summarize_recent_odds_drift(hours: i64) -> OddsDriftAuditSummary {
+    let mut summary = OddsDriftAuditSummary::default();
+    let ledger_path = "data/ledger.jsonl";
+    if !Path::new(ledger_path).exists() {
+        return summary;
+    }
+
+    let Ok(contents) = std::fs::read_to_string(ledger_path) else {
+        return summary;
+    };
+
+    let cutoff = Utc::now() - chrono::Duration::hours(hours);
+    let mut rows: Vec<(f64, String)> = Vec::new();
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("event").and_then(|v| v.as_str()) != Some("ODDS_DRIFT_ALERT") {
+            continue;
+        }
+        let Some(ts) = entry.get("ts").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(parsed_ts) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        if parsed_ts.with_timezone(&Utc) < cutoff {
+            continue;
+        }
+
+        summary.alerts += 1;
+        let match_key = entry.get("match_key").and_then(|v| v.as_str()).unwrap_or("?");
+        let display_name = match_key_team_parts(match_key)
+            .map(|(a, b)| format!("{} vs {}", a, b))
+            .unwrap_or_else(|| match_key.replace("::", " ").replace("_vs_", " vs ").replace('_', " "));
+        let requested = entry.get("requested_odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let accepted = entry.get("accepted_odds").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let delta_pct = entry.get("delta_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let path = entry.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        rows.push((
+            delta_pct.abs(),
+            format!("{} | {} @ {:.2} → {:.2} ({:+.1}%)", display_name, path, requested, accepted, delta_pct),
+        ));
+    }
+
+    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    summary.top_lines = rows.into_iter().take(3).map(|(_, line)| line).collect();
+    summary
+}
+
 fn recover_unresolved_accepts_from_ledger(
     active_bets: &mut Vec<ActiveBet>,
     ledger_settled_ids: &HashSet<String>,
@@ -5140,19 +7267,16 @@ fn recover_unresolved_accepts_from_ledger(
     stats.unresolved_total = unresolved_accepts.len();
     let now = Utc::now();
     for entry in unresolved_accepts.values() {
-        if let Some(ts) = entry.get("ts").and_then(|v| v.as_str()) {
-            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
-                let age_hours = (now - parsed.with_timezone(&Utc)).num_seconds() as f64 / 3600.0;
-                stats.oldest_age_hours = Some(match stats.oldest_age_hours {
-                    Some(current) => current.max(age_hours),
-                    None => age_hours,
-                });
-                if age_hours >= UNRESOLVED_ACCEPTED_STALE_HOURS as f64 {
-                    stats.stale_12h += 1;
-                }
-                if age_hours >= 24.0 {
-                    stats.stale_24h += 1;
-                }
+        if let Some(age_hours) = entry_age_hours(entry, now) {
+            stats.oldest_age_hours = Some(match stats.oldest_age_hours {
+                Some(current) => current.max(age_hours),
+                None => age_hours,
+            });
+            if age_hours >= UNRESOLVED_ACCEPTED_STALE_HOURS as f64 {
+                stats.stale_12h += 1;
+            }
+            if age_hours >= 24.0 {
+                stats.stale_24h += 1;
             }
         }
     }
@@ -5191,6 +7315,14 @@ fn recover_unresolved_accepts_from_ledger(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         );
+        if token_id.is_none() {
+            stats.skipped_missing_token += 1;
+            continue;
+        }
+        if entry_age_hours(&entry, now).is_some_and(|age_hours| age_hours >= 24.0) {
+            stats.skipped_stale_orphans += 1;
+            continue;
+        }
         let alert_id = entry.get("alert_id")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
@@ -5219,6 +7351,9 @@ fn recover_unresolved_accepts_from_ledger(
             bet_id: bet_id.clone(),
             match_key,
             market_key,
+            original_sport: None,
+            resolved_sport: None,
+            esports_family: None,
             team1: value_team.clone(),
             team2: "?".to_string(),
             value_team,
@@ -5229,7 +7364,7 @@ fn recover_unresolved_accepts_from_ledger(
             outcome_id,
             graph_bet_id,
             token_id,
-            path,
+            path: if path.is_empty() { "ledger_recovery".to_string() } else { path },
         });
         tracked_bet_ids.insert(bet_id);
         stats.recovered += 1;
@@ -5770,6 +7905,7 @@ fn format_auto_bet_result_message(
     path: &str,
     match_key: &str,
     team: &str,
+    requested_odds: f64,
     odds: f64,
     stake: f64,
     bet_id: &str,
@@ -5778,12 +7914,15 @@ fn format_auto_bet_result_message(
     is_dry_run: bool,
 ) -> String {
     let sport = match_key.split("::").next().unwrap_or("?").to_uppercase();
+    let drift_suffix = format_odds_drift_message(requested_odds, odds)
+        .map(|msg| format!("\n{}", msg))
+        .unwrap_or_default();
     if is_dry_run {
         format!(
             "🧪 <b>AUTO-BET #{} DRY-RUN</b>\n\
              🏷️ <b>{}</b> | path: <b>{}</b>\n\
-             💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>",
-            aid, sport, path, team, odds, stake
+             💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>{}",
+            aid, sport, path, team, odds, stake, drift_suffix
         )
     } else {
         let header = if bet_state == "Accepted" {
@@ -5798,7 +7937,7 @@ fn format_auto_bet_result_message(
              🏷️ <b>{}</b> | path: <b>{}</b>\n\
              💡 Pick: <b>{}</b> @ <b>{:.2}</b> | stake <b>${:.2}</b>\n\
              🧾 Bet ID: <code>{}</code> | state: <b>{}</b>\n\
-             📈 Auto-bets dnes: <b>{}</b>",
+             📈 Auto-bets dnes: <b>{}</b>{}",
             header.replace("{aid}", &aid.to_string()),
             sport,
             path,
@@ -5807,9 +7946,37 @@ fn format_auto_bet_result_message(
             stake,
             bet_id,
             bet_state,
-            auto_bet_count
+            auto_bet_count,
+            drift_suffix
         )
     }
+}
+
+fn significant_odds_drift(requested_odds: f64, accepted_odds: f64) -> Option<(f64, f64)> {
+    if requested_odds <= 0.0 || accepted_odds <= 0.0 {
+        return None;
+    }
+    let delta_abs = accepted_odds - requested_odds;
+    let delta_pct = (delta_abs / requested_odds) * 100.0;
+    if delta_abs.abs() >= ACCEPTED_ODDS_DRIFT_ALERT_ABS
+        && delta_pct.abs() >= ACCEPTED_ODDS_DRIFT_ALERT_REL_PCT
+    {
+        Some((delta_abs, delta_pct))
+    } else {
+        None
+    }
+}
+
+fn format_odds_drift_message(requested_odds: f64, accepted_odds: f64) -> Option<String> {
+    significant_odds_drift(requested_odds, accepted_odds).map(|(delta_abs, delta_pct)| {
+        format!(
+            "⚠️ Odds drift: req <b>@{:.2}</b> → exec <b>@{:.2}</b> ({:+.2}, {:+.1}%)",
+            requested_odds,
+            accepted_odds,
+            delta_abs,
+            delta_pct,
+        )
+    })
 }
 
 fn format_auto_bet_failed_message(
@@ -5994,6 +8161,7 @@ async fn main() -> Result<()> {
     let mut msg_id_to_alert_id: HashMap<i64, u32> = HashMap::new();
     // Manual alert throttle per match_key (anti-spam)
     let mut manual_offer_last_sent: HashMap<String, DateTime<Utc>> = HashMap::new();
+    let mut anomaly_source_skip_last_logged: HashMap<String, DateTime<Utc>> = HashMap::new();
     let mut active_bets: Vec<ActiveBet> = Vec::new();
     // Tokens that are already settled in subgraph but not yet claimable on-chain.
     // These should NOT block new bets via MAX_CONCURRENT_PENDING (no longer risk exposure).
@@ -6066,24 +8234,14 @@ async fn main() -> Result<()> {
     // Load dashboard config at boot
     {
         let cfg_path = "data/dashboard_config.json";
-        if let Ok(contents) = std::fs::read_to_string(cfg_path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
-                if let Some(ms) = v["max_stake"].as_f64() {
-                    if ms > 0.0 && ms < 100.0 { dashboard_max_stake = Some(ms); }
-                }
-                if let Some(arr) = v["sport_focus"].as_array() {
-                    let sports: Vec<String> = arr.iter()
-                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                        .collect();
-                    if !sports.is_empty() { dashboard_sport_focus = sports; }
-                }
-                if let Some(ae) = v["autobet_enabled"].as_bool() {
-                    dashboard_autobet_enabled = ae;
-                }
-                info!("📱 Dashboard config loaded: max_stake={:?}, sport_focus={:?}, autobet={}",
-                    dashboard_max_stake, dashboard_sport_focus, dashboard_autobet_enabled);
-            }
-        }
+        load_dashboard_runtime_config(
+            cfg_path,
+            &mut dashboard_max_stake,
+            &mut dashboard_sport_focus,
+            &mut dashboard_autobet_enabled,
+        );
+        info!("📱 Dashboard config loaded: max_stake={:?}, sport_focus={:?}, autobet={}, no_bet_mode={}",
+            dashboard_max_stake, dashboard_sport_focus, dashboard_autobet_enabled, !dashboard_autobet_enabled);
     }
     // Load from daily_pnl.json if exists (includes SOD bankroll persistence)
     {
@@ -6413,8 +8571,8 @@ async fn main() -> Result<()> {
     let mut blacklisted_conditions: HashMap<String, std::time::Instant> = HashMap::new();
     const CONDITION_BLACKLIST_TTL_SECS: u64 = 600; // 10 min — allow retry after cooldown
 
-    // === MATCH-LEVEL BLACKLIST: block entire match when conditions keep dying ===
-    // After ConditionNotRunning or on-chain Rejected, the match's conditions are usually all dead.
+    // === MATCH-LEVEL BLACKLIST: block entire base match when conditions keep dying ===
+    // After ConditionNotRunning or WS not-active, sibling markets on the same base match are usually dead too.
     // New condition_ids get generated per score update → condition-level blacklist alone is insufficient.
     let mut blacklisted_matches: HashMap<String, std::time::Instant> = HashMap::new();
     const MATCH_BLACKLIST_TTL_SECS: u64 = 600; // 10 min — match-level cooldown (raised from 300s: 3x CondNR on same match within 16min)
@@ -6423,11 +8581,11 @@ async fn main() -> Result<()> {
     let bet_history_path = "data/bet_history.txt";
     let mut already_bet_matches: HashSet<String> = HashSet::new();
     let mut already_bet_conditions: HashSet<String> = HashSet::new();
-    // BUG #1 FIX: Also track base match keys (without ::mapN_winner suffix)
-    // to prevent multiple map-winner bets on the same match (triple exposure)
+    // Track base match keys (without ::mapN_winner suffix) for match-level exposure
+    // and scoped condition dedup across sibling markets.
     let mut already_bet_base_matches: HashSet<String> = HashSet::new();
-    // Subset of already_bet_base_matches: only entries from MAP_WINNER bets (not match_winner).
-    // Used to allow map2↔map3 sibling bets while still blocking match_winner↔map_winner crosses.
+    // Subset of already_bet_base_matches containing MAP_WINNER placements.
+    // Used to block only sibling map-winner bets on the same series.
     let mut already_bet_map_winners: HashSet<String> = HashSet::new();
     // Load from file on startup
     if Path::new(bet_history_path).exists() {
@@ -6469,7 +8627,7 @@ async fn main() -> Result<()> {
 
     // === PENDING CLAIMS: persist token IDs for bets waiting to be claimed ===
     let pending_claims_path = "data/pending_claims.txt";
-    // Format per line: tokenId|betId|matchKey|valueTeam|amountUsd|odds|team1|team2|marketKey
+    // Format per line: tokenId|betId|matchKey|valueTeam|amountUsd|odds|team1|team2|marketKey|originalSport|resolvedSport|esportsFamily
     // Load on startup → add to active_bets for auto-claim monitoring
     let (ledger_meta_by_bet_id, ledger_meta_by_token_id) = load_ledger_bet_metadata();
     if Path::new(pending_claims_path).exists() {
@@ -6495,6 +8653,9 @@ async fn main() -> Result<()> {
                     let loaded_team1 = parts.get(6).unwrap_or(&"").to_string();
                     let loaded_team2 = parts.get(7).unwrap_or(&"").to_string();
                     let loaded_market = parts.get(8).unwrap_or(&"unknown").to_string();
+                    let loaded_original_sport = parts.get(9).filter(|v| !v.is_empty()).map(|v| (*v).to_string());
+                    let loaded_resolved_sport = parts.get(10).filter(|v| !v.is_empty()).map(|v| (*v).to_string());
+                    let loaded_esports_family = parts.get(11).filter(|v| !v.is_empty()).map(|v| (*v).to_string());
                     // Fallback: derive teams from match_key if not stored
                     let (fb_t1, fb_t2) = match_key_team_parts(&match_key)
                         .unwrap_or_else(|| (value_team.clone(), "?".to_string()));
@@ -6508,6 +8669,9 @@ async fn main() -> Result<()> {
                     if is_missing_display_field(parts.get(6).copied().unwrap_or(""))
                         || is_missing_display_field(parts.get(7).copied().unwrap_or(""))
                         || is_missing_display_field(parts.get(8).copied().unwrap_or(""))
+                        || parts.get(9).is_none()
+                        || parts.get(10).is_none()
+                        || parts.get(11).is_none()
                     {
                         rewrite_pending_claims_on_startup = true;
                     }
@@ -6530,6 +8694,9 @@ async fn main() -> Result<()> {
                         bet_id: bet_id.clone(),
                         match_key: match_key.clone(),
                         market_key,
+                        original_sport: loaded_original_sport,
+                        resolved_sport: loaded_resolved_sport.or_else(|| Some(match_key.split("::").next().unwrap_or("").to_string()).filter(|v| !v.is_empty())),
+                        esports_family: loaded_esports_family,
                         team1,
                         team2,
                         value_team: value_team.clone(),
@@ -6763,6 +8930,8 @@ async fn main() -> Result<()> {
                 "stale_24h": recovery_stats.stale_24h,
                 "oldest_age_hours": recovery_stats.oldest_age_hours,
                 "recovered": recovery_stats.recovered,
+                "skipped_stale_orphans": recovery_stats.skipped_stale_orphans,
+                "skipped_missing_token": recovery_stats.skipped_missing_token,
             }));
         }
     }
@@ -6790,6 +8959,9 @@ async fn main() -> Result<()> {
                 // Clean old alerts from cooldown
                 let now = Utc::now();
                 sent_alerts.retain(|a| (now - a.sent_at).num_seconds() < ALERT_COOLDOWN_SECS);
+                anomaly_source_skip_last_logged.retain(|_, ts| {
+                    (now - *ts).num_seconds() < ANOMALY_SOURCE_SKIP_LOG_COOLDOWN_SECS
+                });
 
                 let already_alerted: HashSet<String> = sent_alerts.iter()
                     .map(|a| a.match_key.clone()).collect();
@@ -6989,24 +9161,12 @@ async fn main() -> Result<()> {
                                 // === DASHBOARD CONFIG RELOAD (every poll) ===
                                 {
                                     let cfg_path = "data/dashboard_config.json";
-                                    if let Ok(contents) = std::fs::read_to_string(cfg_path) {
-                                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
-                                            if let Some(ms) = v["max_stake"].as_f64() {
-                                                if ms > 0.0 && ms < 100.0 {
-                                                    dashboard_max_stake = Some(ms);
-                                                }
-                                            }
-                                            if let Some(arr) = v["sport_focus"].as_array() {
-                                                let sports: Vec<String> = arr.iter()
-                                                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                                                    .collect();
-                                                if !sports.is_empty() { dashboard_sport_focus = sports; }
-                                            }
-                                            if let Some(ae) = v["autobet_enabled"].as_bool() {
-                                                dashboard_autobet_enabled = ae;
-                                            }
-                                        }
-                                    }
+                                    load_dashboard_runtime_config(
+                                        cfg_path,
+                                        &mut dashboard_max_stake,
+                                        &mut dashboard_sport_focus,
+                                        &mut dashboard_autobet_enabled,
+                                    );
                                 }
 
                                 // === DAILY LOSS CAP NOTIFICATION ===
@@ -7134,14 +9294,15 @@ async fn main() -> Result<()> {
                                     let is_inflight = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
                                         || inflight_conditions.contains(&bet_market_dedup_key);
 
-                                    // BUG FIX: Prevent match_winner↔map_winner cross-market overexposure.
-                                    // REFINED: map2_winner↔map3_winner sibling bets are ALLOWED when the previous bet
-                                    // was also a map-level market (different cond ID, different settlement event).
-                                    // match_cap/trim_stake guard total exposure on the base match.
+                                    // Cross-market dedup only blocks sibling map-winner bets.
+                                    // Exact market dedup and match exposure caps handle the rest.
                                     let is_candidate_map_winner = is_map_winner_market(&match_key_for_bet, &edge.market_key);
-                                    let base_already_bet = already_bet_base_matches.contains(&base_match_key)
-                                        && is_candidate_map_winner
-                                        && !already_bet_map_winners.contains(&base_match_key); // existing was match_winner → still block
+                                    let base_already_bet = cross_market_base_dedup_block(
+                                        &base_match_key,
+                                        is_candidate_map_winner,
+                                        &already_bet_base_matches,
+                                        &already_bet_map_winners,
+                                    );
 
                                     let mut scoped_cond_key = (!cond_id_str.is_empty())
                                         .then(|| scoped_condition_key(&base_match_key, &cond_id_str));
@@ -7149,8 +9310,7 @@ async fn main() -> Result<()> {
                                     let (already_bet_this, rebet_ok) = if is_inflight {
                                         (true, false) // In-flight → always block
                                     } else if base_already_bet {
-                                        // Previous was match_winner → block this map-winner (cross-market triple exposure guard)
-                                        info!("🛡️ BASE-MATCH DEDUP: {} blocked (base {} has match_winner bet, blocking map variant)",
+                                        info!("🛡️ MAP-WINNER DEDUP: {} blocked (base {} already has a map-winner bet)",
                                             match_key_for_bet, base_match_key);
                                         (true, false)
                                     } else if scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
@@ -7197,14 +9357,21 @@ async fn main() -> Result<()> {
                                     if sport == "football" {
                                         sport_min_edge = dynamic_football_min_edge(edge.detailed_score.as_deref());
                                     }
-                                    // CS2 map_winner: lower threshold to 28% — cs2:: is historically profitable (71% WR),
-                                    // and round-level score-edge with 80%+ win prob is high-certainty.
-                                    // Keep 38% for match_winner and other sports.
-                                    if (sport == "cs2" || (sport == "esports" && edge.esports_family == Some("cs2"))) {
-                                        let is_map_winner_bet = edge.market_key.starts_with("map") && edge.market_key.ends_with("_winner");
-                                        if is_map_winner_bet {
-                                            sport_min_edge = 28.0;
-                                        }
+                                    if sport == "tennis" {
+                                        sport_min_edge = tennis_score_edge_min_edge(
+                                            edge.score1,
+                                            edge.score2,
+                                            edge.score_implied_pct / 100.0,
+                                            azuro_odds,
+                                        );
+                                    }
+                                    // CS2 map_winner: further relaxed to 24% for the cleanest live score signal.
+                                    if let Some(cs2_min_edge) = cs2_map_winner_min_edge(
+                                        sport,
+                                        edge.esports_family,
+                                        &edge.market_key,
+                                    ) {
+                                        sport_min_edge = cs2_min_edge;
                                     }
                                     // Dynamic base stake: bankroll-scaled instead of hardcoded $3
                                     let mut base_stake = dynamic_base_stake(current_bankroll, sport);
@@ -7243,9 +9410,21 @@ async fn main() -> Result<()> {
                                     let sport_exp = sport_exposure.get(sport).copied().unwrap_or(0.0);
                                     let daily_net_loss_for_cap = (daily_wagered - daily_returned).max(0.0);
                                     let cv_sm = edge.cv_stake_mult;
-                                    let stake = trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
-                                        inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge", azuro_odds,
-                                        daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD));
+                                    let stake = if stake_below_executable_floor(raw_stake, current_bankroll) {
+                                        info!(
+                                            "🪫 STAKE_NOT_FEASIBLE: {} raw=${:.2} below executable floor ${:.2} at bankroll ${:.2} | sport={} path=score_edge",
+                                            match_key_for_bet,
+                                            raw_stake,
+                                            executable_stake_floor(current_bankroll),
+                                            current_bankroll,
+                                            sport
+                                        );
+                                        0.0
+                                    } else {
+                                        trim_stake(raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap,
+                                            inflight_wagered_total, sport_exp, sport, cv_sm, start_of_day_bankroll, "score_edge", azuro_odds,
+                                            daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD))
+                                    };
                                     if stake < 0.50 && raw_stake >= 0.50 {
                                         info!("🛡️ EXPOSURE CAP: {} stake trimmed from ${:.2} to $0 (bank=${:.0} cond_exp=${:.2} match_exp=${:.2} daily_loss=${:.2})",
                                             match_key_for_bet, raw_stake, current_bankroll, cond_exp, match_exp, daily_net_loss_for_cap);
@@ -7355,20 +9534,20 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         "basketball" => {
-                                            // Basketball has high scores (80-120+ total).
-                                            // Only auto-bet when game is well underway AND lead is significant.
+                                            // Basketball tiered guard: game progress + lead significance.
+                                            // Later game → smaller lead is still safe.
                                             let total_points = edge.score1 + edge.score2;
                                             let point_diff = (edge.score1 - edge.score2).abs();
-                                            if total_points < 80 {
-                                                info!("🏀 BASKETBALL GUARD: {} score {}-{} total={} < 80 — too early, blocking auto-bet",
-                                                    edge.match_key, edge.score1, edge.score2, total_points);
-                                                false
-                                            } else if point_diff < 20 {
-                                                info!("🏀 BASKETBALL GUARD: {} score {}-{} diff={} < 20 — lead not significant enough, blocking auto-bet",
-                                                    edge.match_key, edge.score1, edge.score2, point_diff);
-                                                false
+                                            if total_points >= 140 && point_diff >= 10 {
+                                                true // Late game (Q4), moderate lead
+                                            } else if total_points >= 100 && point_diff >= 15 {
+                                                true // Mid-game (Q3+), significant lead
+                                            } else if total_points >= 60 && point_diff >= 20 {
+                                                true // Early-mid game, very strong lead
                                             } else {
-                                                true // 80+ total points AND 20+ point lead → OK
+                                                info!("🏀 BASKETBALL GUARD: {} score {}-{} total={} diff={} — doesn't meet tiered thresholds (140/10, 100/15, 60/20)",
+                                                    edge.match_key, edge.score1, edge.score2, total_points, point_diff);
+                                                false
                                             }
                                         }
                                         _ => true, // other sports: no extra guard
@@ -7397,7 +9576,7 @@ async fn main() -> Result<()> {
 
                                     // New guards: bankroll floor, pending cap, loss streak
                                     let bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let pending_count = count_pending_slots(&active_bets);
+                                    let pending_count = count_pending_slots(&active_bets, session_start);
                                     let pending_ok = pending_count < MAX_CONCURRENT_PENDING;
                                     let streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
@@ -7422,13 +9601,13 @@ async fn main() -> Result<()> {
 
                                     // MATCH-LEVEL BLACKLIST: skip entire match when conditions keep dying
                                     let match_blacklisted = {
-                                        if let Some(bl_time) = blacklisted_matches.get(&edge.match_key) {
+                                        if let Some(bl_time) = blacklisted_matches.get(&base_match_key) {
                                             if bl_time.elapsed() < std::time::Duration::from_secs(MATCH_BLACKLIST_TTL_SECS) {
                                                 info!("🚫 MATCH BLACKLISTED (edge): {} — failed {}s ago, skipping",
-                                                    &edge.match_key, bl_time.elapsed().as_secs());
+                                                    &base_match_key, bl_time.elapsed().as_secs());
                                                 true
                                             } else {
-                                                blacklisted_matches.remove(&edge.match_key);
+                                                blacklisted_matches.remove(&base_match_key);
                                                 false
                                             }
                                         } else {
@@ -7679,6 +9858,7 @@ async fn main() -> Result<()> {
                                                     scoped_condition_key(&base_match_key, &condition_id),
                                                     std::time::Instant::now(),
                                                 );
+                                                blacklisted_matches.insert(base_match_key.clone(), std::time::Instant::now());
                                                 ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                     "alert_id": aid, "match_key": match_key_for_bet,
                                                     "condition_id": condition_id, "outcome_id": outcome_id,
@@ -7696,6 +9876,8 @@ async fn main() -> Result<()> {
                                                     "ws_state": state, "ws_age_ms": age_ms,
                                                     "gql_age_ms": condition_age_ms, "reason": "WsStateNotActive",
                                                 }));
+                                                info!("🚫 MATCH BLACKLISTED {} (WsStateNotActive, TTL={}s)",
+                                                    &base_match_key, MATCH_BLACKLIST_TTL_SECS);
                                                 ws_gate_not_active_count += 1;
                                                 true
                                             }
@@ -7825,6 +10007,9 @@ async fn main() -> Result<()> {
                                             "minOdds": min_odds.to_string(),
                                             "requestedOdds": azuro_odds,
                                             "matchKey": match_key_for_bet,
+                                            "originalSport": sport_raw,
+                                            "resolvedSport": sport,
+                                            "esportsFamily": edge.esports_family,
                                             "team1": edge.team1,
                                             "team2": edge.team2,
                                             "valueTeam": leading_team,
@@ -7988,9 +10173,9 @@ async fn main() -> Result<()> {
                                                             }
                                                             // MATCH BLACKLIST: ConditionNotRunning → block entire match
                                                             if is_condition_state_reject {
-                                                                blacklisted_matches.insert(match_key_for_bet.clone(), std::time::Instant::now());
+                                                                blacklisted_matches.insert(base_match_key.clone(), std::time::Instant::now());
                                                                 info!("🚫 MATCH BLACKLISTED {} (ConditionNotRunning, TTL={}s)",
-                                                                    &match_key_for_bet, MATCH_BLACKLIST_TTL_SECS);
+                                                                    &base_match_key, MATCH_BLACKLIST_TTL_SECS);
                                                             }
                                                             error!("❌ AUTO-BET #{} FAILED: {} (cond={}, outcome={}, match={}, rtt={}ms, pipeline={}ms, requested_odds={:.4}, min_odds={:.4}, reason={})",
                                                                 aid, err,
@@ -8095,7 +10280,50 @@ async fn main() -> Result<()> {
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
                                                             let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
-                                                            let accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
+                                                            let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
+                                                            let mut accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
+                                                            if bet_state == "Accepted" && !is_dry_run {
+                                                                if let Ok(status_resp) = client
+                                                                    .get(format!("{}/bet/{}", executor_url, bet_id))
+                                                                    .send()
+                                                                    .await
+                                                                {
+                                                                    if let Ok(status_json) = status_resp.json::<serde_json::Value>().await {
+                                                                        if let Some(canonical_odds) = executor_truth_accepted_odds(&status_json) {
+                                                                            accepted_odds = canonical_odds;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if let Some((delta_abs, delta_pct)) = significant_odds_drift(azuro_odds, accepted_odds) {
+                                                                warn!(
+                                                                    "⚠️ AUTO-BET #{} odds drift: req @{:.2} -> exec @{:.2} ({:+.2}, {:+.1}%) bet_id={} match={} path=edge",
+                                                                    aid,
+                                                                    azuro_odds,
+                                                                    accepted_odds,
+                                                                    delta_abs,
+                                                                    delta_pct,
+                                                                    bet_id,
+                                                                    match_key_for_bet,
+                                                                );
+                                                                ledger_write("ODDS_DRIFT_ALERT", &serde_json::json!({
+                                                                    "alert_id": aid,
+                                                                    "bet_id": bet_id,
+                                                                    "match_key": edge.match_key,
+                                                                    "match_prefix": match_prefix_from_match_key(&edge.match_key),
+                                                                    "market_key": edge.market_key,
+                                                                    "condition_id": condition_id,
+                                                                    "outcome_id": outcome_id,
+                                                                    "path": "edge",
+                                                                    "requested_odds": azuro_odds,
+                                                                    "accepted_odds": accepted_odds,
+                                                                    "delta_abs": delta_abs,
+                                                                    "delta_pct": delta_pct,
+                                                                    "stake": stake,
+                                                                    "token_id": token_id_opt,
+                                                                    "graph_bet_id": graph_bet_id_opt,
+                                                                }));
+                                                            }
 
                                                             // === DEDUP: record bet to prevent duplicates ===
                                                             already_bet_matches.insert(bet_market_dedup_key.clone());
@@ -8146,13 +10374,15 @@ async fn main() -> Result<()> {
                                                                     leading_team, accepted_odds, Utc::now().to_rfc3339(), edge.market_key);
                                                             }
 
-                                                            let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
                                                             if !is_dry_run {
-                                                                active_bets.push(ActiveBet {
+                                                                let active_bet = ActiveBet {
                                                                     alert_id: aid,
                                                                     bet_id: bet_id.to_string(),
                                                                     match_key: edge.match_key.clone(),
                                                                     market_key: edge.market_key.clone(),
+                                                                    original_sport: Some(sport_raw.to_string()),
+                                                                    resolved_sport: Some(sport.to_string()),
+                                                                    esports_family: edge.esports_family.map(|value| value.to_string()),
                                                                     team1: edge.team1.clone(),
                                                                     team2: edge.team2.clone(),
                                                                     value_team: leading_team.to_string(),
@@ -8164,19 +10394,9 @@ async fn main() -> Result<()> {
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
                                                                     path: "score_edge".to_string(),
-                                                                });
-                                                                // Persist pending claim (prefer real tokenId from executor)
-                                                                let token_to_write = token_id_opt.as_deref().unwrap_or("?");
-                                                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                                                    .create(true).append(true)
-                                                                    .open(pending_claims_path) {
-                                                                    use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                                                                        token_to_write,
-                                                                        bet_id, edge.match_key,
-                                                                        leading_team, stake, accepted_odds,
-                                                                        edge.team1, edge.team2, edge.market_key);
-                                                                }
+                                                                };
+                                                                active_bets.push(active_bet.clone());
+                                                                append_pending_claim_entry(&active_bet, pending_claims_path);
                                                                 // === LEDGER: BET PLACED ===
                                                                 ledger_write("PLACED", &serde_json::json!({
                                                                     "alert_id": aid, "bet_id": bet_id,
@@ -8260,6 +10480,7 @@ async fn main() -> Result<()> {
                                                                 "edge",
                                                                 &match_key_for_bet,
                                                                 leading_team,
+                                                                azuro_odds,
                                                                 accepted_odds,
                                                                 stake,
                                                                 bet_id,
@@ -8337,18 +10558,24 @@ async fn main() -> Result<()> {
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                let accepted_odds = executor_truth_accepted_odds(&br)
+                                                                                    .unwrap_or(follow_odds);
+                                                                                let drift_line = format_odds_drift_message(follow_odds, accepted_odds)
+                                                                                    .map(|msg| format!("\n{}", msg))
+                                                                                    .unwrap_or_default();
                                                                                 let alert = format!(
                                                                                     "✅ <b>AUTO-BET #{} CONFIRMED (follow-up)</b>\n\
                                                                                      path: <b>edge</b>\n\
                                                                                      💡 Pick: <b>{}</b>\n\
                                                                                      🧾 Bet ID: <code>{}</code>\n\
                                                                                      🧠 on-chain state: <b>{}</b>\n\
-                                                                                     🪙 tokenId: <code>{}</code>",
+                                                                                     🪙 tokenId: <code>{}</code>{}",
                                                                                     follow_aid,
                                                                                     follow_team,
                                                                                     follow_bet_id,
                                                                                     final_state,
                                                                                     token_id,
+                                                                                    drift_line,
                                                                                 );
                                                                                 let _ = tg_send_message(
                                                                                     &follow_client,
@@ -8372,7 +10599,8 @@ async fn main() -> Result<()> {
                                                                                         "on_chain_state": final_state,
                                                                                         "token_id": token_id,
                                                                                         "path": "edge",
-                                                                                        "odds": follow_odds,
+                                                                                        "odds": accepted_odds,
+                                                                                        "requested_odds": follow_odds,
                                                                                         "stake": follow_stake,
                                                                                         "path": "edge",
                                                                                     });
@@ -8380,6 +10608,26 @@ async fn main() -> Result<()> {
                                                                                         .create(true).append(true).open("data/ledger.jsonl") {
                                                                                         use std::io::Write;
                                                                                         let _ = writeln!(f, "{}", entry);
+                                                                                        if let Some((delta_abs, delta_pct)) = significant_odds_drift(follow_odds, accepted_odds) {
+                                                                                            let drift_entry = serde_json::json!({
+                                                                                                "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                                "event": "ODDS_DRIFT_ALERT",
+                                                                                                "alert_id": follow_aid,
+                                                                                                "match_key": follow_match_key,
+                                                                                                "market_key": follow_market_key,
+                                                                                                "condition_id": follow_condition_id,
+                                                                                                "outcome_id": follow_outcome_id,
+                                                                                                "bet_id": follow_bet_id,
+                                                                                                "token_id": token_id,
+                                                                                                "path": "edge",
+                                                                                                "requested_odds": follow_odds,
+                                                                                                "accepted_odds": accepted_odds,
+                                                                                                "delta_abs": delta_abs,
+                                                                                                "delta_pct": delta_pct,
+                                                                                                "stake": follow_stake,
+                                                                                            });
+                                                                                            let _ = writeln!(f, "{}", drift_entry);
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             } else {
@@ -8444,6 +10692,8 @@ async fn main() -> Result<()> {
                                     } else if !mute_manual_alerts {
                                         // Manual alert (MEDIUM confidence or auto-bet disabled)
                                         let now_alert = Utc::now();
+                                        let mut telegram_attempted = false;
+                                        let mut telegram_failed = false;
                                         let too_soon = manual_offer_last_sent
                                             .get(&edge.match_key)
                                             .map(|ts| (now_alert - *ts).num_seconds() < MANUAL_MATCH_COOLDOWN_SECS)
@@ -8453,15 +10703,29 @@ async fn main() -> Result<()> {
                                                 edge.match_key, MANUAL_MATCH_COOLDOWN_SECS);
                                         } else {
                                             let msg = format_score_edge_alert(edge, aid);
+                                            telegram_attempted = true;
                                             match tg_send_message(&client, &token, chat_id, &msg).await {
                                                 Ok(msg_id) => {
                                                     score_alert_sent = true;
-                                                    msg_id_to_alert_id.insert(msg_id, aid);
+                                                    if msg_id > 0 {
+                                                        msg_id_to_alert_id.insert(msg_id, aid);
+                                                    }
                                                     manual_offer_last_sent.insert(edge.match_key.clone(), now_alert);
                                                 }
                                                 Err(e) => {
+                                                    telegram_failed = true;
                                                     error!("Failed to send score edge alert: {}", e);
                                                 }
+                                            }
+                                        }
+
+                                        if !score_alert_sent {
+                                            if telegram_failed {
+                                                warn!("⚠️ Score Edge #{} not sent: Telegram delivery failed", aid);
+                                            } else if telegram_attempted {
+                                                info!("ℹ️ Score Edge #{} not sent: Telegram returned no message id", aid);
+                                            } else {
+                                                info!("ℹ️ Score Edge #{} not sent: manual alert throttled", aid);
                                             }
                                         }
                                     } else {
@@ -8478,8 +10742,6 @@ async fn main() -> Result<()> {
                                             sent_at: Utc::now(),
                                         });
                                         alert_map.insert(aid, anomaly);
-                                    } else {
-                                        warn!("⚠️ Score Edge #{} NOT marked as sent (Telegram delivery failed)", aid);
                                     }
                                 }
 
@@ -8520,18 +10782,20 @@ async fn main() -> Result<()> {
                                         .then(|| scoped_condition_key(&base_match_key, &cond_id_str));
                                     let is_inflight_anom = (!cond_id_str.is_empty() && inflight_conditions.contains(&cond_id_str))
                                         || inflight_conditions.contains(&bet_market_dedup_key);
-                                    // BUG FIX: Prevent match_winner↔map cross-exposure.
-                                    // REFINED: map2↔map3 sibling bets allowed when previous was also map-level (match_cap guards).
+                                    // Cross-market dedup only blocks sibling map-winner bets.
                                     let is_candidate_map_winner_anom = is_map_winner_market(&match_key_for_bet, &anomaly.market_key);
-                                    let base_already_bet_anom = already_bet_base_matches.contains(&base_match_key)
-                                        && is_candidate_map_winner_anom
-                                        && !already_bet_map_winners.contains(&base_match_key);
+                                    let base_already_bet_anom = cross_market_base_dedup_block(
+                                        &base_match_key,
+                                        is_candidate_map_winner_anom,
+                                        &already_bet_base_matches,
+                                        &already_bet_map_winners,
+                                    );
                                     let already_bet_this = is_inflight_anom
                                         || base_already_bet_anom
                                         || scoped_cond_key.as_ref().is_some_and(|key| already_bet_conditions.contains(key))
                                         || already_bet_matches.contains(&bet_market_dedup_key);
                                     if base_already_bet_anom {
-                                        info!("🛡️ BASE-MATCH DEDUP (anomaly): {} blocked (base {} already bet)",
+                                        info!("🛡️ MAP-WINNER DEDUP (anomaly): {} blocked (base {} already has a map-winner bet)",
                                             match_key_for_bet, base_match_key);
                                     }
 
@@ -8625,9 +10889,21 @@ async fn main() -> Result<()> {
                                     } else {
                                         anomaly_raw_stake
                                     };
-                                    let anomaly_stake = trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
-                                        inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds,
-                                        daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD));
+                                    let anomaly_stake = if stake_below_executable_floor(anomaly_raw_stake, current_bankroll) {
+                                        info!(
+                                            "🪫 STAKE_NOT_FEASIBLE: {} raw=${:.2} below executable floor ${:.2} at bankroll ${:.2} | sport={} path=anomaly",
+                                            anomaly.match_key,
+                                            anomaly_raw_stake,
+                                            executable_stake_floor(current_bankroll),
+                                            current_bankroll,
+                                            anomaly_sport
+                                        );
+                                        0.0
+                                    } else {
+                                        trim_stake(anomaly_raw_stake, current_bankroll, anomaly_cond_exp, anomaly_match_exp, anomaly_daily_loss,
+                                            inflight_wagered_total, anomaly_sport_exp, anomaly_sport, 1.0, start_of_day_bankroll, "anomaly", azuro_odds,
+                                            daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD))
+                                    };
 
                                     // SAFETY: block anomaly auto-bet when Azuro has identical odds (oracle bug)
                                     let azuro_odds_identical = (anomaly.azuro_w1 - anomaly.azuro_w2).abs() < 0.02;
@@ -8708,7 +10984,7 @@ async fn main() -> Result<()> {
 
                                     // New guards for anomaly path too
                                     let anomaly_bankroll_ok = current_bankroll >= MIN_BANKROLL_USD;
-                                    let anomaly_pending_count = count_pending_slots(&active_bets);
+                                    let anomaly_pending_count = count_pending_slots(&active_bets, session_start);
                                     let anomaly_pending_ok = anomaly_pending_count < MAX_CONCURRENT_PENDING;
                                     let anomaly_streak_ok = loss_streak_pause_until.map_or(true, |until| std::time::Instant::now() >= until);
 
@@ -8733,13 +11009,13 @@ async fn main() -> Result<()> {
 
                                     // MATCH-LEVEL BLACKLIST: skip entire match when conditions keep dying
                                     let anomaly_match_blacklisted = {
-                                        if let Some(bl_time) = blacklisted_matches.get(&anomaly.match_key) {
+                                        if let Some(bl_time) = blacklisted_matches.get(&base_match_key) {
                                             if bl_time.elapsed() < std::time::Duration::from_secs(MATCH_BLACKLIST_TTL_SECS) {
                                                 info!("🚫 MATCH BLACKLISTED (anomaly): {} — failed {}s ago, skipping",
-                                                    &anomaly.match_key, bl_time.elapsed().as_secs());
+                                                    &base_match_key, bl_time.elapsed().as_secs());
                                                 true
                                             } else {
-                                                blacklisted_matches.remove(&anomaly.match_key);
+                                                blacklisted_matches.remove(&base_match_key);
                                                 false
                                             }
                                         } else {
@@ -8808,8 +11084,17 @@ async fn main() -> Result<()> {
                                         && anomaly_streak_ok;    // LOSS_STREAK pause guard
 
                                     if anomaly.is_live && market_source_count < AUTO_BET_MIN_MARKET_SOURCES {
-                                        info!("⏭️ ODDS ANOMALY {} skipped for auto-bet: only {} market source(s)",
-                                            anomaly.match_key, market_source_count);
+                                        let should_log_source_skip = anomaly_source_skip_last_logged
+                                            .get(&anomaly.match_key)
+                                            .map(|ts| {
+                                                (now - *ts).num_seconds() >= ANOMALY_SOURCE_SKIP_LOG_COOLDOWN_SECS
+                                            })
+                                            .unwrap_or(true);
+                                        if should_log_source_skip {
+                                            info!("⏭️ ODDS ANOMALY {} skipped for auto-bet: only {} market source(s)",
+                                                anomaly.match_key, market_source_count);
+                                            anomaly_source_skip_last_logged.insert(anomaly.match_key.clone(), now);
+                                        }
                                     }
 
                                     let mut anomaly_alert_sent = false;
@@ -8858,6 +11143,7 @@ async fn main() -> Result<()> {
                                                     scoped_condition_key(&base_match_key, &condition_id),
                                                     std::time::Instant::now(),
                                                 );
+                                                blacklisted_matches.insert(base_match_key.clone(), std::time::Instant::now());
                                                 ledger_write("AUTO_BET_SKIPPED", &serde_json::json!({
                                                     "alert_id": aid, "match_key": anomaly.match_key,
                                                     "condition_id": condition_id, "outcome_id": outcome_id,
@@ -8875,6 +11161,8 @@ async fn main() -> Result<()> {
                                                     "ws_state": state, "ws_age_ms": age_ms,
                                                     "gql_age_ms": condition_age_ms_b, "reason": "WsStateNotActive",
                                                 }));
+                                                info!("🚫 MATCH BLACKLISTED {} (WsStateNotActive, TTL={}s)",
+                                                    &base_match_key, MATCH_BLACKLIST_TTL_SECS);
                                                 ws_gate_not_active_count += 1;
                                                 true
                                             }
@@ -8982,6 +11270,9 @@ async fn main() -> Result<()> {
                                             "minOdds": min_odds.to_string(),
                                             "requestedOdds": azuro_odds,
                                             "matchKey": match_key_for_bet,
+                                            "originalSport": anomaly.match_key.split("::").next().unwrap_or(""),
+                                            "resolvedSport": anomaly_sport,
+                                            "esportsFamily": canonicalize_esports_family(anomaly_sport),
                                             "team1": anomaly.team1,
                                             "team2": anomaly.team2,
                                             "valueTeam": value_team,
@@ -9133,9 +11424,9 @@ async fn main() -> Result<()> {
                                                             }
                                                             // MATCH BLACKLIST: ConditionNotRunning → block entire match
                                                             if is_condition_state_reject_b {
-                                                                blacklisted_matches.insert(anomaly.match_key.clone(), std::time::Instant::now());
+                                                                blacklisted_matches.insert(base_match_key.clone(), std::time::Instant::now());
                                                                 info!("🚫 MATCH BLACKLISTED {} (ConditionNotRunning, TTL={}s)",
-                                                                    &anomaly.match_key, MATCH_BLACKLIST_TTL_SECS);
+                                                                    &base_match_key, MATCH_BLACKLIST_TTL_SECS);
                                                             }
                                                             error!("❌ AUTO-BET ODDS #{} FAILED: {} (cond={}, match={}, rtt={}ms, pipeline={}ms, odds={:.4}, min={:.4}, reason={})",
                                                                 aid, err,
@@ -9221,7 +11512,49 @@ async fn main() -> Result<()> {
                                                             let bet_state = br.state.as_deref().unwrap_or("?");
                                                             let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
-                                                            let accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
+                                                            let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
+                                                            let mut accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
+                                                            if bet_state == "Accepted" && !is_dry_run {
+                                                                if let Ok(status_resp) = client
+                                                                    .get(format!("{}/bet/{}", executor_url, bet_id))
+                                                                    .send()
+                                                                    .await
+                                                                {
+                                                                    if let Ok(status_json) = status_resp.json::<serde_json::Value>().await {
+                                                                        if let Some(canonical_odds) = executor_truth_accepted_odds(&status_json) {
+                                                                            accepted_odds = canonical_odds;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            if let Some((delta_abs, delta_pct)) = significant_odds_drift(azuro_odds, accepted_odds) {
+                                                                warn!(
+                                                                    "⚠️ AUTO-BET ODDS #{} drift: req @{:.2} -> exec @{:.2} ({:+.2}, {:+.1}%) bet_id={} match={} path=anomaly_odds",
+                                                                    aid,
+                                                                    azuro_odds,
+                                                                    accepted_odds,
+                                                                    delta_abs,
+                                                                    delta_pct,
+                                                                    bet_id,
+                                                                    match_key_for_bet,
+                                                                );
+                                                                ledger_write("ODDS_DRIFT_ALERT", &serde_json::json!({
+                                                                    "alert_id": aid,
+                                                                    "bet_id": bet_id,
+                                                                    "match_key": anomaly.match_key,
+                                                                    "market_key": anomaly.market_key,
+                                                                    "condition_id": condition_id,
+                                                                    "outcome_id": outcome_id,
+                                                                    "path": "anomaly_odds",
+                                                                    "requested_odds": azuro_odds,
+                                                                    "accepted_odds": accepted_odds,
+                                                                    "delta_abs": delta_abs,
+                                                                    "delta_pct": delta_pct,
+                                                                    "stake": stake,
+                                                                    "token_id": token_id_opt,
+                                                                    "graph_bet_id": graph_bet_id_opt,
+                                                                }));
+                                                            }
 
                                                             already_bet_matches.insert(bet_market_dedup_key.clone());
                                                             if let Some(key) = scoped_cond_key.as_ref() {
@@ -9250,13 +11583,15 @@ async fn main() -> Result<()> {
                                                                     value_team, accepted_odds, Utc::now().to_rfc3339(), anomaly.market_key);
                                                             }
 
-                                                            let is_dry_run = bet_state == "DRY-RUN" || bet_id.starts_with("dry-");
                                                             if !is_dry_run {
-                                                                active_bets.push(ActiveBet {
+                                                                let active_bet = ActiveBet {
                                                                     alert_id: aid,
                                                                     bet_id: bet_id.to_string(),
                                                                     match_key: anomaly.match_key.clone(),
                                                                     market_key: anomaly.market_key.clone(),
+                                                                    original_sport: Some(anomaly.match_key.split("::").next().unwrap_or("").to_string()),
+                                                                    resolved_sport: Some(anomaly_sport.to_string()),
+                                                                    esports_family: canonicalize_esports_family(anomaly_sport).map(|value| value.to_string()),
                                                                     team1: anomaly.team1.clone(),
                                                                     team2: anomaly.team2.clone(),
                                                                     value_team: value_team.clone(),
@@ -9268,18 +11603,9 @@ async fn main() -> Result<()> {
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
                                                                     path: "anomaly_odds".to_string(),
-                                                                });
-                                                                let token_to_write = token_id_opt.as_deref().unwrap_or("?");
-                                                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                                                    .create(true).append(true)
-                                                                    .open(pending_claims_path) {
-                                                                    use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                                                                        token_to_write,
-                                                                        bet_id, anomaly.match_key,
-                                                                        value_team, stake, accepted_odds,
-                                                                        anomaly.team1, anomaly.team2, anomaly.market_key);
-                                                                }
+                                                                };
+                                                                active_bets.push(active_bet.clone());
+                                                                append_pending_claim_entry(&active_bet, pending_claims_path);
                                                                 // === LEDGER: BET PLACED ===
                                                                 ledger_write("PLACED", &serde_json::json!({
                                                                     "alert_id": aid, "bet_id": bet_id,
@@ -9344,6 +11670,7 @@ async fn main() -> Result<()> {
                                                                 "anomaly_odds",
                                                                 &match_key_for_bet,
                                                                 &value_team,
+                                                                azuro_odds,
                                                                 accepted_odds,
                                                                 stake,
                                                                 bet_id,
@@ -9421,18 +11748,24 @@ async fn main() -> Result<()> {
                                                                             } else if final_state == "Accepted" {
                                                                                 let token_id = br.get("tokenId")
                                                                                     .and_then(|v| v.as_str()).unwrap_or("?");
+                                                                                let accepted_odds = executor_truth_accepted_odds(&br)
+                                                                                    .unwrap_or(follow_odds);
+                                                                                let drift_line = format_odds_drift_message(follow_odds, accepted_odds)
+                                                                                    .map(|msg| format!("\n{}", msg))
+                                                                                    .unwrap_or_default();
                                                                                 let alert = format!(
                                                                                     "✅ <b>AUTO-BET #{} CONFIRMED (follow-up)</b>\n\
                                                                                      path: <b>anomaly_odds</b>\n\
                                                                                      💡 Pick: <b>{}</b>\n\
                                                                                      🧾 Bet ID: <code>{}</code>\n\
                                                                                      🧠 on-chain state: <b>{}</b>\n\
-                                                                                     🪙 tokenId: <code>{}</code>",
+                                                                                     🪙 tokenId: <code>{}</code>{}",
                                                                                     follow_aid,
                                                                                     follow_team,
                                                                                     follow_bet_id,
                                                                                     final_state,
                                                                                     token_id,
+                                                                                    drift_line,
                                                                                 );
                                                                                 let _ = tg_send_message(
                                                                                     &follow_client,
@@ -9456,13 +11789,34 @@ async fn main() -> Result<()> {
                                                                                         "on_chain_state": final_state,
                                                                                         "token_id": token_id,
                                                                                         "path": "anomaly_odds",
-                                                                                        "odds": follow_odds,
+                                                                                        "odds": accepted_odds,
+                                                                                        "requested_odds": follow_odds,
                                                                                         "stake": follow_stake,
                                                                                     });
                                                                                     if let Ok(mut f) = std::fs::OpenOptions::new()
                                                                                         .create(true).append(true).open("data/ledger.jsonl") {
                                                                                         use std::io::Write;
                                                                                         let _ = writeln!(f, "{}", entry);
+                                                                                        if let Some((delta_abs, delta_pct)) = significant_odds_drift(follow_odds, accepted_odds) {
+                                                                                            let drift_entry = serde_json::json!({
+                                                                                                "ts": chrono::Utc::now().to_rfc3339(),
+                                                                                                "event": "ODDS_DRIFT_ALERT",
+                                                                                                "alert_id": follow_aid,
+                                                                                                "match_key": follow_match_key,
+                                                                                                "market_key": follow_market_key,
+                                                                                                "condition_id": follow_condition_id,
+                                                                                                "outcome_id": follow_outcome_id,
+                                                                                                "bet_id": follow_bet_id,
+                                                                                                "token_id": token_id,
+                                                                                                "path": "anomaly_odds",
+                                                                                                "requested_odds": follow_odds,
+                                                                                                "accepted_odds": accepted_odds,
+                                                                                                "delta_abs": delta_abs,
+                                                                                                "delta_pct": delta_pct,
+                                                                                                "stake": follow_stake,
+                                                                                            });
+                                                                                            let _ = writeln!(f, "{}", drift_entry);
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                             } else {
@@ -9705,12 +12059,14 @@ async fn main() -> Result<()> {
                         );
                     }
                     let reconcile_signature = format!(
-                        "{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}",
                         recovery_stats.recovered,
                         recovery_stats.unresolved_total,
                         recovery_stats.stale_12h,
                         recovery_stats.stale_24h,
-                        recovery_stats.oldest_age_hours.map(|v| v.floor() as i64).unwrap_or(0)
+                        recovery_stats.oldest_age_hours.map(|v| v.floor() as i64).unwrap_or(0),
+                        recovery_stats.skipped_stale_orphans,
+                        recovery_stats.skipped_missing_token
                     );
                     if reconcile_signature != last_reconcile_audit_signature
                         && (recovery_stats.recovered > 0 || recovery_stats.unresolved_total > 0)
@@ -9729,6 +12085,8 @@ async fn main() -> Result<()> {
                             "stale_24h": recovery_stats.stale_24h,
                             "oldest_age_hours": recovery_stats.oldest_age_hours,
                             "recovered": recovery_stats.recovered,
+                            "skipped_stale_orphans": recovery_stats.skipped_stale_orphans,
+                            "skipped_missing_token": recovery_stats.skipped_missing_token,
                             "cadence_ticks": LEDGER_RECONCILE_EVERY_CLAIM_TICKS,
                         }));
                         last_reconcile_audit_signature = reconcile_signature;
@@ -9831,13 +12189,21 @@ async fn main() -> Result<()> {
 
                 let mut bets_to_remove: Vec<String> = Vec::new();
                 let mut tokens_to_claim: Vec<String> = Vec::new();
-                let mut claim_details: Vec<(u32, String, String, String, f64, f64, String)> = Vec::new(); // (alert_id, team1, team2, value_team, amount, odds, result)
+                let mut claim_details: Vec<ClaimDetail> = Vec::new();
+
+                let (ledger_meta_by_bet_id, ledger_meta_by_token_id) = load_ledger_bet_metadata();
 
                 for bet in &mut active_bets {
                     // Skip already settled
                     if settled_bet_ids.contains(&bet.bet_id) {
                         continue;
                     }
+
+                    let bet_view = settlement_bet_view(
+                        bet,
+                        &ledger_meta_by_bet_id,
+                        &ledger_meta_by_token_id,
+                    );
 
                     // === PATH A: If we have tokenId already, check payout directly ===
                     if let Some(tid) = &bet.token_id {
@@ -9869,30 +12235,36 @@ async fn main() -> Result<()> {
                                 // === LEDGER: WON/CANCELED detected (check_payout) ===
                                 if !ledger_settled_ids.contains(&bet.bet_id) {
                                     ledger_write(if result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
-                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                        "match_key": bet.match_key,
-                                        "match_prefix": match_prefix_from_match_key(&bet.match_key),
-                                        "market_key": bet.market_key,
-                                        "value_team": bet.value_team,
-                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
+                                        "alert_id": bet_view.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet_view.match_key,
+                                        "match_prefix": match_prefix_from_match_key(&bet_view.match_key),
+                                        "market_key": bet_view.market_key,
+                                        "value_team": bet_view.value_team,
+                                        "amount_usd": bet_view.amount_usd, "odds": bet_view.odds,
                                         "payout_usd": payout_usd,
-                                        "token_id": bet.token_id, "path": &bet.path, "settle": "check_payout"
+                                        "token_id": bet_view.token_id, "path": &bet_view.path, "settle": "check_payout"
                                     }));
                                     ledger_settled_ids.insert(bet.bet_id.clone());
                                 }
                                 tokens_to_claim.push(tid.clone());
-                                claim_details.push((
-                                    bet.alert_id,
-                                    bet.team1.clone(),
-                                    bet.team2.clone(),
-                                    bet.value_team.clone(),
-                                    bet.amount_usd,
-                                    bet.odds,
-                                    result.to_string(),
-                                ));
+                                claim_details.push(ClaimDetail {
+                                    token_id: tid.clone(),
+                                    alert_id: bet_view.alert_id,
+                                    bet_id: bet.bet_id.clone(),
+                                    match_key: bet_view.match_key.clone(),
+                                    market_key: bet_view.market_key.clone(),
+                                    team1: bet_view.team1.clone(),
+                                    team2: bet_view.team2.clone(),
+                                    value_team: bet_view.value_team.clone(),
+                                    amount_usd: bet_view.amount_usd,
+                                    odds: bet_view.odds,
+                                    payout_usd,
+                                    result: result.to_string(),
+                                    path: bet_view.path.clone(),
+                                });
                                 settled_bet_ids.insert(bet.bet_id.clone());
                                 bets_to_remove.push(bet.bet_id.clone());
-                                total_wagered += bet.amount_usd;
+                                total_wagered += bet_view.amount_usd;
                             } else {
                                 // payout = 0 and not pending: this is NOT enough to mark LOST.
                                 // We must confirm real settlement state/result via /bet/:id.
@@ -9937,32 +12309,36 @@ async fn main() -> Result<()> {
                                             serde_json::json!({"date": today, "wagered": daily_wagered, "returned": daily_returned, "sod_bankroll": start_of_day_bankroll, "limit_override": daily_limit_override}).to_string(),
                                         );
                                     }
-                                    let (dt1, dt2) = display_teams(bet);
+                                    let (dt1, dt2) = display_team_pair(&bet_view.match_key, &bet_view.team1, &bet_view.team2);
+                                    let placed_detail = lookup_placed_metadata(&bet.bet_id)
+                                        .map(|m| format!("\n\n{}", format_placed_detail(&m)))
+                                        .unwrap_or_default();
                                     let loss_msg = format!(
                                         "❌ <b>PROHRA</b>\n\n\
                                          🏷️ <b>{}</b> | {}\n\
                                          {} vs {}\n\
                                          Sázka: <b>{}</b> @ {:.2} — ${:.2}\n\
-                                         Výsledek: <b>PROHRA</b> — -${:.2}",
-                                        display_sport(bet),
-                                        display_market(bet),
+                                         Výsledek: <b>PROHRA</b> — -${:.2}{}",
+                                        display_sport_verbose(bet),
+                                        display_market_key(&bet_view.market_key),
                                         dt1, dt2,
-                                        if !bet.value_team.is_empty() && bet.value_team != "?" { &bet.value_team } else { &dt1 },
-                                        bet.odds,
-                                        bet.amount_usd,
-                                        bet.amount_usd
+                                        if !bet_view.value_team.is_empty() && bet_view.value_team != "?" { &bet_view.value_team } else { &dt1 },
+                                        bet_view.odds,
+                                        bet_view.amount_usd,
+                                        bet_view.amount_usd,
+                                        placed_detail
                                     );
                                     let _ = tg_send_message(&client, &token, chat_id, &loss_msg).await;
                                     // === LEDGER: LOST (check_payout) ===
                                     if !ledger_settled_ids.contains(&bet.bet_id) {
                                         ledger_write("LOST", &serde_json::json!({
-                                            "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                            "match_key": bet.match_key,
-                                            "match_prefix": match_prefix_from_match_key(&bet.match_key),
-                                            "market_key": bet.market_key,
-                                            "value_team": bet.value_team,
-                                            "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                            "token_id": bet.token_id, "path": &bet.path, "settle": "check_payout"
+                                            "alert_id": bet_view.alert_id, "bet_id": bet.bet_id,
+                                            "match_key": bet_view.match_key,
+                                            "match_prefix": match_prefix_from_match_key(&bet_view.match_key),
+                                            "market_key": bet_view.market_key,
+                                            "value_team": bet_view.value_team,
+                                            "amount_usd": bet_view.amount_usd, "odds": bet_view.odds,
+                                            "token_id": bet_view.token_id, "path": &bet_view.path, "settle": "check_payout"
                                         }));
                                         ledger_settled_ids.insert(bet.bet_id.clone());
                                     }
@@ -10043,26 +12419,32 @@ async fn main() -> Result<()> {
                                 // === LEDGER: WON/CANCELED (bet_status) ===
                                 if !ledger_settled_ids.contains(&bet.bet_id) {
                                     ledger_write(if effective_result == "Won" { "WON" } else { "CANCELED" }, &serde_json::json!({
-                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                        "match_key": bet.match_key,
-                                        "match_prefix": match_prefix_from_match_key(&bet.match_key),
-                                        "market_key": bet.market_key,
-                                        "value_team": bet.value_team,
-                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                        "token_id": bet.token_id, "path": &bet.path, "settle": "bet_status"
+                                        "alert_id": bet_view.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet_view.match_key,
+                                        "match_prefix": match_prefix_from_match_key(&bet_view.match_key),
+                                        "market_key": bet_view.market_key,
+                                        "value_team": bet_view.value_team,
+                                        "amount_usd": bet_view.amount_usd, "odds": bet_view.odds,
+                                        "token_id": bet_view.token_id, "path": &bet_view.path, "settle": "bet_status"
                                     }));
                                     ledger_settled_ids.insert(bet.bet_id.clone());
                                 }
                                 tokens_to_claim.push(tid.clone());
-                                claim_details.push((
-                                    bet.alert_id,
-                                    bet.team1.clone(),
-                                    bet.team2.clone(),
-                                    bet.value_team.clone(),
-                                    bet.amount_usd,
-                                    bet.odds,
-                                    effective_result.clone(),
-                                ));
+                                claim_details.push(ClaimDetail {
+                                    token_id: tid.clone(),
+                                    alert_id: bet_view.alert_id,
+                                    bet_id: bet.bet_id.clone(),
+                                    match_key: bet_view.match_key.clone(),
+                                    market_key: bet_view.market_key.clone(),
+                                    team1: bet_view.team1.clone(),
+                                    team2: bet_view.team2.clone(),
+                                    value_team: bet_view.value_team.clone(),
+                                    amount_usd: bet_view.amount_usd,
+                                    odds: bet_view.odds,
+                                    payout_usd: 0.0,
+                                    result: effective_result.clone(),
+                                    path: bet_view.path.clone(),
+                                });
                             }
                             "Lost" => {
                                 record_live_loss_for_streak(
@@ -10073,33 +12455,37 @@ async fn main() -> Result<()> {
                                 // === LEDGER: LOST (bet_status) ===
                                 if !ledger_settled_ids.contains(&bet.bet_id) {
                                     ledger_write("LOST", &serde_json::json!({
-                                        "alert_id": bet.alert_id, "bet_id": bet.bet_id,
-                                        "match_key": bet.match_key,
-                                        "match_prefix": match_prefix_from_match_key(&bet.match_key),
-                                        "market_key": bet.market_key,
-                                        "value_team": bet.value_team,
-                                        "amount_usd": bet.amount_usd, "odds": bet.odds,
-                                        "token_id": bet.token_id, "path": &bet.path, "settle": "bet_status"
+                                        "alert_id": bet_view.alert_id, "bet_id": bet.bet_id,
+                                        "match_key": bet_view.match_key,
+                                        "match_prefix": match_prefix_from_match_key(&bet_view.match_key),
+                                        "market_key": bet_view.market_key,
+                                        "value_team": bet_view.value_team,
+                                        "amount_usd": bet_view.amount_usd, "odds": bet_view.odds,
+                                        "token_id": bet_view.token_id, "path": &bet_view.path, "settle": "bet_status"
                                     }));
                                     ledger_settled_ids.insert(bet.bet_id.clone());
                                 }
                                 // NOTE: daily_wagered is already incremented at PLACED time (BUG FIX: removed double-count)
                                 // Notify about loss immediately
-                                let (dt1, dt2) = display_teams(bet);
+                                let (dt1, dt2) = display_team_pair(&bet_view.match_key, &bet_view.team1, &bet_view.team2);
+                                let placed_detail = lookup_placed_metadata(&bet.bet_id)
+                                    .map(|m| format!("\n\n{}", format_placed_detail(&m)))
+                                    .unwrap_or_default();
                                 let loss_msg = format!(
                                     "❌ <b>PROHRA #{}</b>\n\n\
                                      🏷️ <b>{}</b> | {}\n\
                                      {} vs {}\n\
                                      Sázka: <b>{}</b> @ {:.2} — ${:.2}\n\
-                                     Výsledek: <b>PROHRA</b> — -${:.2}\n\n\
+                                     Výsledek: <b>PROHRA</b> — -${:.2}{}\n\n\
                                      📊 Session: vsazeno ${:.2}, vráceno ${:.2}",
-                                    bet.alert_id,
-                                    display_sport(bet),
-                                    display_market(bet),
+                                    bet_view.alert_id,
+                                    display_sport_verbose(bet),
+                                    display_market_key(&bet_view.market_key),
                                     dt1, dt2,
-                                    if !bet.value_team.is_empty() && bet.value_team != "?" { &bet.value_team } else { &dt1 },
-                                    bet.odds, bet.amount_usd,
-                                    bet.amount_usd,
+                                    if !bet_view.value_team.is_empty() && bet_view.value_team != "?" { &bet_view.value_team } else { &dt1 },
+                                    bet_view.odds, bet_view.amount_usd,
+                                    bet_view.amount_usd,
+                                    placed_detail,
                                     total_wagered, total_returned
                                 );
                                 let _ = tg_send_message(&client, &token, chat_id, &loss_msg).await;
@@ -10125,7 +12511,7 @@ async fn main() -> Result<()> {
                     // (subgraph can be ahead of chain — bet shows Canceled in subgraph but
                     //  viewPayout still reverts on chain)
                     let mut verified_tokens: Vec<String> = Vec::new();
-                    let mut verified_details: Vec<(u32, String, String, String, f64, f64, String)> = Vec::new();
+                    let mut verified_details: Vec<ClaimDetail> = Vec::new();
                     let mut deferred_bets: Vec<String> = Vec::new(); // tokens that are still pending on-chain
 
                     for (i, tid) in tokens_to_claim.iter().enumerate() {
@@ -10200,6 +12586,11 @@ async fn main() -> Result<()> {
                                     let total_payout = cr.total_payout_usd.unwrap_or(0.0);
                                     let new_balance = cr.new_balance_usd.as_deref().unwrap_or("?");
                                     let claimed_tokens = cr.token_ids.clone().unwrap_or_else(|| verified_tokens.clone());
+                                    let claimed_token_set: HashSet<&str> = claimed_tokens.iter().map(|tid| tid.as_str()).collect();
+                                    let claimed_details: Vec<ClaimDetail> = verified_details.iter()
+                                        .filter(|detail| claimed_token_set.contains(detail.token_id.as_str()))
+                                        .cloned()
+                                        .collect();
                                     let new_claim_tokens: Vec<String> = claimed_tokens.iter()
                                         .filter(|tid| !claimed_token_ids.contains(*tid))
                                         .cloned()
@@ -10232,17 +12623,29 @@ async fn main() -> Result<()> {
 
                                     // Build detailed notification
                                     let mut msg = String::from("💰 <b>AUTO-CLAIM úspěšný!</b>\n\n");
-                                    for (aid, _t1, _t2, vt, amt, odds, res) in &verified_details {
-                                        let emoji = if res == "Won" { "✅" } else { "🔄" };
-                                        let result_text = if res == "Won" {
-                                            format!("VÝHRA! +${:.2}", amt * odds - amt)
+                                    for detail in &claimed_details {
+                                        let emoji = if detail.result == "Won" { "✅" } else { "🔄" };
+                                        let result_text = if detail.result == "Won" {
+                                            let payout = if detail.payout_usd > 0.0 {
+                                                detail.payout_usd
+                                            } else {
+                                                detail.amount_usd * detail.odds
+                                            };
+                                            format!("VÝHRA! +${:.2}", payout - detail.amount_usd)
                                         } else {
-                                            format!("ZRUŠENO, refund ${:.2}", amt)
+                                            format!("ZRUŠENO, refund ${:.2}", detail.amount_usd)
                                         };
                                         msg.push_str(&format!(
                                             "{} #{} {} @ {:.2} — {}\n",
-                                            emoji, aid, vt, odds, result_text
+                                            emoji, detail.alert_id, detail.value_team, detail.odds, result_text
                                         ));
+                                        if let Some(meta) = lookup_placed_metadata(&detail.bet_id) {
+                                            let detail = format_placed_detail(&meta);
+                                            if !detail.is_empty() {
+                                                msg.push_str(&detail);
+                                                msg.push('\n');
+                                            }
+                                        }
                                     }
 
                                     let daily_pnl_claim = daily_returned - daily_wagered;
@@ -10261,11 +12664,21 @@ async fn main() -> Result<()> {
 
                                     let _ = tg_send_message(&client, &token, chat_id, &msg).await;
                                     if should_count_claim {
-                                        for (aid, _t1, _t2, vt, amt, odds, res) in &verified_details {
+                                        for detail in &claimed_details {
                                             ledger_write("CLAIMED", &serde_json::json!({
-                                                "alert_id": aid, "value_team": vt,
-                                                "amount_usd": amt, "odds": odds,
-                                                "result": res,
+                                                "token_id": detail.token_id,
+                                                "bet_id": detail.bet_id,
+                                                "alert_id": detail.alert_id,
+                                                "match_key": detail.match_key,
+                                                "market_key": detail.market_key,
+                                                "team1": detail.team1,
+                                                "team2": detail.team2,
+                                                "value_team": detail.value_team,
+                                                "amount_usd": detail.amount_usd,
+                                                "odds": detail.odds,
+                                                "payout_usd": if detail.payout_usd > 0.0 { detail.payout_usd } else { detail.amount_usd },
+                                                "result": detail.result,
+                                                "path": detail.path,
                                                 "total_payout_usd": total_payout,
                                                 "tx_hash": tx, "new_balance": new_balance
                                             }));
@@ -10296,7 +12709,7 @@ async fn main() -> Result<()> {
 
                 // Keep inflight cap grounded in reality: total USD currently locked
                 // in on-chain pending + in-flight bets (NOT cumulative daily wagered).
-                inflight_wagered_total = active_bets.iter().map(|b| b.amount_usd).sum();
+                inflight_wagered_total = locked_exposure_total(&active_bets, session_start);
 
                 // Rewrite pending_claims file when bets removed OR tokenIds discovered
                 if !bets_to_remove.is_empty() || needs_pending_rewrite {
@@ -10453,10 +12866,33 @@ async fn main() -> Result<()> {
                 };
                 let mut executor_pending_entries: Vec<PendingTelegramEntry> = Vec::new();
                 let mut executor_pending_available = false;
+                let mut executor_pending_error: Option<String> = None;
                 let subgraph_bets: Option<serde_json::Value> = if executor_ok {
                     match client.get(format!("{}/my-bets", executor_url)).send().await {
-                        Ok(r) => r.json::<serde_json::Value>().await.ok(),
-                        Err(_) => None,
+                        Ok(r) => {
+                            let status = r.status();
+                            match r.json::<serde_json::Value>().await {
+                                Ok(value) => {
+                                    if !status.is_success() {
+                                        let err = value.get("error")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown /my-bets error");
+                                        executor_pending_error = Some(format!("http {}: {}", status.as_u16(), err));
+                                        None
+                                    } else {
+                                        Some(value)
+                                    }
+                                }
+                                Err(e) => {
+                                    executor_pending_error = Some(format!("parse error: {}", e));
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            executor_pending_error = Some(e.to_string());
+                            None
+                        }
                     }
                 } else { None };
 
@@ -10550,6 +12986,20 @@ async fn main() -> Result<()> {
                             }
                         }
                     } else if !onchain_bets.is_empty() {
+                        if let Some(err) = executor_pending_error.as_ref() {
+                            let truncated = if err.len() > 140 {
+                                format!("{}...", &err[..140])
+                            } else {
+                                err.clone()
+                            };
+                            msg.push_str(&format!(
+                                "⚠️ Pending truth nedostupná: <code>{}</code>\n",
+                                truncated
+                            ));
+                        } else {
+                            msg.push_str("⚠️ Pending truth nedostupná; níže je jen stale odhad z local cache.\n");
+                        }
+
                         let live_cache_bets: Vec<&&ActiveBet> = onchain_bets.iter()
                             .filter(|b| !b.match_key.is_empty() && live_match_keys.contains(&b.match_key))
                             .collect();
@@ -10558,7 +13008,7 @@ async fn main() -> Result<()> {
                             .collect();
                         let total_live_cache: f64 = live_cache_bets.iter().map(|b| b.amount_usd).sum();
                         if !live_cache_bets.is_empty() {
-                            msg.push_str(&format!("🎮 Aktivní bety: <b>{}</b> (ve hře: ${:.2}) [local cache]\n",
+                            msg.push_str(&format!("🎮 Aktivní bety: <b>{}</b> (odhad local cache: ${:.2})\n",
                                 live_cache_bets.len(), total_live_cache));
                             for b in &live_cache_bets {
                                 let dn = bet_display_name(b);
@@ -10566,7 +13016,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         if !settlement_cache_bets.is_empty() {
-                            msg.push_str(&format!("⏳ Čeká na settlement: <b>{}</b> [local cache]\n",
+                            msg.push_str(&format!("⏳ Čeká na settlement: <b>{}</b> (stale local cache odhad)\n",
                                 settlement_cache_bets.len()));
                             for b in &settlement_cache_bets {
                                 let dn = bet_display_name(b);
@@ -10593,6 +13043,15 @@ async fn main() -> Result<()> {
                 }
 
                 // Daily P&L (persisted across restarts)
+                let recent_portfolio_events = recent_portfolio_event_lines(3, 6);
+                if !recent_portfolio_events.is_empty() {
+                    msg.push_str("\n🕒 Poslední bet eventy:\n");
+                    for line in &recent_portfolio_events {
+                        msg.push_str(line);
+                        msg.push('\n');
+                    }
+                }
+
                 let daily_pnl = daily_returned - daily_wagered;
                 let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
                 msg.push_str(&format!("\n{} Daily P/L: <b>{}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
@@ -10660,6 +13119,7 @@ async fn main() -> Result<()> {
                             update_offset = u.update_id + 1;
                             let mut text_owned: Option<String> = None;
                             let mut reply_text_owned: Option<String> = None;
+                            let mut callback_message_id: Option<i64> = None;
                             let mut force_opposite_side = false;
 
                             if let Some(msg) = &u.message {
@@ -10691,6 +13151,56 @@ async fn main() -> Result<()> {
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         "⚠️ Reakce je na zprávu mimo aktivní alerty (mimo okno posledních alertů). Použij prosím `YES $5` nebo `OPP $5` jako reply.").await;
                                     continue;
+                                }
+                            } else if let Some(cq) = &u.callback_query {
+                                // === INLINE KEYBOARD BUTTON CALLBACK ===
+                                let data = cq.data.as_deref().unwrap_or("");
+                                if let Some(msg) = &cq.message {
+                                    if msg.chat.id != chat_id { continue; }
+                                    callback_message_id = Some(msg.message_id);
+                                }
+                                info!("🔘 TG callback_query: data='{}' from user={}", data, cq.from.id);
+
+                                match data {
+                                    "menu_status" => {
+                                        tg_answer_callback_query(&client, &token, &cq.id, Some("📊 Loading...")).await;
+                                        text_owned = Some("/status".to_string());
+                                    }
+                                    "menu_prehled" => {
+                                        tg_answer_callback_query(&client, &token, &cq.id, Some("📋 Loading...")).await;
+                                        text_owned = Some("/prehled".to_string());
+                                    }
+                                    "menu_toggle_alerts" => {
+                                        mute_manual_alerts = !mute_manual_alerts;
+                                        let state_txt = if mute_manual_alerts { "🔇 VYPNUTY" } else { "🔔 ZAPNUTY" };
+                                        tg_answer_callback_query(&client, &token, &cq.id, Some(state_txt)).await;
+                                        text_owned = Some("/menu".to_string());
+                                    }
+                                    "menu_toggle_autobet" => {
+                                        dashboard_autobet_enabled = !dashboard_autobet_enabled;
+                                        persist_dashboard_runtime_config(
+                                            "data/dashboard_config.json",
+                                            dashboard_max_stake,
+                                            &dashboard_sport_focus,
+                                            dashboard_autobet_enabled,
+                                        );
+                                        let state_txt = if dashboard_autobet_enabled {
+                                            "✅ NO BET vypnut"
+                                        } else {
+                                            "🛑 NO BET zapnut"
+                                        };
+                                        tg_answer_callback_query(&client, &token, &cq.id, Some(state_txt)).await;
+                                        info!("🔘 NO_BET toggled via button: {}", !dashboard_autobet_enabled);
+                                        text_owned = Some("/menu".to_string());
+                                    }
+                                    "menu_refresh" => {
+                                        tg_answer_callback_query(&client, &token, &cq.id, Some("🔄 Refreshing...")).await;
+                                        text_owned = Some("/menu".to_string());
+                                    }
+                                    _ => {
+                                        tg_answer_callback_query(&client, &token, &cq.id, None).await;
+                                        continue;
+                                    }
                                 }
                             }
 
@@ -10771,10 +13281,7 @@ async fn main() -> Result<()> {
                                             msg.push_str(&format!("\n🎰 <b>Pending ({})</b> — ${:.2}\n",
                                                 onchain_bets.len(), total_onchain));
                                             for b in &onchain_bets {
-                                                let dn = bet_display_name(b);
-                                                let sport_tag = b.match_key.split("::").next().unwrap_or("");
-                                                msg.push_str(&format!("  \u{2022} {} <i>{}</i> @{:.2} ${:.2}\n",
-                                                    dn, sport_tag, b.odds, b.amount_usd));
+                                                msg.push_str(&format!("{}\n", format_status_bet_line(b)));
                                             }
                                         }
                                         if !inflight_bets_view.is_empty() {
@@ -10787,14 +13294,21 @@ async fn main() -> Result<()> {
                                                     }
                                                     Err(_) => b.placed_at.clone(),
                                                 };
-                                                let dn = bet_display_name(b);
-                                                msg.push_str(&format!("  \u{2022} {} @{:.2} ${:.2} ({})\n",
-                                                    dn, b.odds, b.amount_usd, age_str));
+                                                msg.push_str(&format!("{} ({})\n", format_status_bet_line(b), age_str));
                                             }
                                         }
                                     }
 
                                     // === P/L ===
+                                    let recent_portfolio_events = recent_portfolio_event_lines(3, 6);
+                                    if !recent_portfolio_events.is_empty() {
+                                        msg.push_str("\n🕒 Poslední bet eventy:\n");
+                                        for line in &recent_portfolio_events {
+                                            msg.push_str(line);
+                                            msg.push('\n');
+                                        }
+                                    }
+
                                     let daily_pnl = daily_returned - daily_wagered;
                                     let (pnl_sign, pnl_emoji) = if daily_pnl >= 0.0 { ("+", "📈") } else { ("", "📉") };
                                     msg.push_str(&format!("\n{} <b>P/L: {}{:.2} USDT</b>\n", pnl_emoji, pnl_sign, daily_pnl));
@@ -10824,6 +13338,13 @@ async fn main() -> Result<()> {
                                                 .collect::<Vec<_>>()
                                                 .join(" | ");
                                             msg.push_str(&format!("🧱 Fail 24h: {}\n", fail_line));
+                                        }
+                                    }
+                                    let odds_drift_audit = summarize_recent_odds_drift(24);
+                                    if odds_drift_audit.has_data() {
+                                        msg.push_str(&format!("⚠️ Drift 24h: {}\n", odds_drift_audit.alerts));
+                                        for line in &odds_drift_audit.top_lines {
+                                            msg.push_str(&format!("   {}\n", line));
                                         }
                                     }
 
@@ -10857,7 +13378,15 @@ async fn main() -> Result<()> {
                                         Err(_) => msg.push_str("📡 Feed-hub: ❌ offline\n"),
                                     }
 
-                                    let _ = tg_send_message(&client, &token, chat_id, &msg).await;
+                                    let status_keyboard = vec![
+                                        vec![("🎛 Menu", "menu_refresh"), ("📋 Přehled betů", "menu_prehled")],
+                                        vec![("🔄 Obnovit Status", "menu_status")],
+                                    ];
+                                    if let Some(message_id) = callback_message_id {
+                                        let _ = tg_edit_message_with_keyboard(&client, &token, chat_id, message_id, &msg, status_keyboard).await;
+                                    } else {
+                                        let _ = tg_send_message_with_keyboard(&client, &token, chat_id, &msg, status_keyboard).await;
+                                    }
 
                                 } else if text == "/odds" {
                                     match client.get(format!("{}/state", feed_hub_url)).send().await {
@@ -11064,13 +13593,66 @@ async fn main() -> Result<()> {
                                         }
                                     }
 
+                                } else if text == "/menu" {
+                                    // === INTERACTIVE MENU WITH INLINE KEYBOARD ===
+                                    let alert_status = if mute_manual_alerts { "🔇 Vypnuty" } else { "🔔 Zapnuty" };
+                                    let autobet_status = if dashboard_autobet_enabled { "✅ OFF" } else { "🛑 ON" };
+                                    let net_loss = (daily_wagered - daily_returned).max(0.0);
+                                    let cur_lim = daily_limit_override.unwrap_or(DAILY_LOSS_LIMIT_USD);
+                                    let room = (cur_lim - net_loss).max(0.0);
+
+                                    let menu_text = format!(
+                                        "🎛 <b>OVLÁDACÍ PANEL</b>\n\n\
+                                         🛑 NO BET: <b>{}</b>\n\
+                                         📢 Manuální alerty: <b>{}</b>\n\
+                                         💰 Daily P/L: -${:.2} / ${:.0} (room ${:.2})\n\
+                                         🎯 Aktivní bety: <b>{}</b>",
+                                        autobet_status, alert_status,
+                                        net_loss, cur_lim, room,
+                                        active_bets.len()
+                                    );
+
+                                    let btn_autobet = if dashboard_autobet_enabled {
+                                        ("🛑 Zapnout NO BET", "menu_toggle_autobet")
+                                    } else {
+                                        ("✅ Vypnout NO BET", "menu_toggle_autobet")
+                                    };
+                                    let btn_alerts = if mute_manual_alerts {
+                                        ("🔔 Zapnout Alerty", "menu_toggle_alerts")
+                                    } else {
+                                        ("🔇 Vypnout Alerty", "menu_toggle_alerts")
+                                    };
+
+                                    let keyboard = vec![
+                                        vec![("📊 Status", "menu_status"), ("📋 Přehled betů", "menu_prehled")],
+                                        vec![(btn_autobet.0, btn_autobet.1), (btn_alerts.0, btn_alerts.1)],
+                                        vec![("🔄 Obnovit Panel", "menu_refresh")],
+                                    ];
+                                    if let Some(message_id) = callback_message_id {
+                                        let _ = tg_edit_message_with_keyboard(&client, &token, chat_id, message_id, &menu_text, keyboard).await;
+                                    } else {
+                                        let _ = tg_send_message_with_keyboard(&client, &token, chat_id, &menu_text, keyboard).await;
+                                    }
+
+                                } else if text == "/prehled" {
+                                    // === RECENT BETS DETAIL VIEW ===
+                                    let detail = format_recent_bets_detail(10);
+                                    let keyboard = vec![
+                                        vec![("🔄 Obnovit", "menu_prehled"), ("🎛 Menu", "menu_refresh")],
+                                    ];
+                                    if let Some(message_id) = callback_message_id {
+                                        let _ = tg_edit_message_with_keyboard(&client, &token, chat_id, message_id, &detail, keyboard).await;
+                                    } else {
+                                        let _ = tg_send_message_with_keyboard(&client, &token, chat_id, &detail, keyboard).await;
+                                    }
+
                                 } else if text == "/nabidka" {
                                     mute_manual_alerts = true;
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         "🔇 <b>Manuální nabídky VYPNUTY</b>\n\n\
                                          Anomaly + score-edge alerty pro manuální sázení nebudou chodit.\n\
                                          Auto-bety, portfolio, claimy a status běží normálně.\n\n\
-                                         Pro zapnutí pošli: /nabidkaup"
+                                         Pro zapnutí pošli: /nabidkaup nebo použij /menu"
                                     ).await;
 
                                 } else if text == "/nabidkaup" {
@@ -11078,7 +13660,7 @@ async fn main() -> Result<()> {
                                     let _ = tg_send_message(&client, &token, chat_id,
                                         "🔔 <b>Manuální nabídky ZAPNUTY</b>\n\n\
                                          Anomaly + score-edge alerty opět chodí.\n\
-                                         Pokud chceš vypnout: /nabidka"
+                                         Pokud chceš vypnout: /nabidka nebo /menu"
                                     ).await;
 
                                 } else if text.starts_with("/limit") {
@@ -11158,15 +13740,17 @@ async fn main() -> Result<()> {
 
                                 } else if text == "/help" {
                                     let lim_h = "∞".to_string();
-                                    let _ = tg_send_message(&client, &token, chat_id,
-                                        &format!("🤖 <b>RustMisko Alert Bot v4.5</b>\n\n\
+                                    let _ = tg_send_message_with_keyboard(&client, &token, chat_id,
+                                        &format!("🤖 <b>RustMisko Alert Bot v4.6</b>\n\n\
                                          CS2 + Tennis + Football + Basketball\n\
                                          Match + Map Winner | Auto-bet + Auto-claim\n\n\
                                          <b>Commands:</b>\n\
+                                         /menu — 🎛 interaktivní ovládací panel\n\
+                                         /prehled — 📋 posledních 10 settled betů\n\
                                          /status — kompletní přehled systému + portfolio\n\
                                          /bets — sázky ze subgraphu (live) + lokální\n\
                                          /odds — aktuální odds anomálie\n\
-                                         /nabidka — vypnout manuální alerty (tichý mód)\n\
+                                         /nabidka — vypnout manuální alerty\n\
                                          /nabidkaup — zapnout manuální alerty\n\
                                          /reset_daily — reset daily loss limitu\n\
                                          /claim — manuální auto-claim výher\n\
@@ -11179,8 +13763,8 @@ async fn main() -> Result<()> {
                                          ❤️ reakce na alert — default bet $3\n\
                                          💙 reakce na alert — bet $3 na druhý tým\n\n\
                                          Auto-bet: edge ≥15% HIGH → auto $2 (limit: {})\n\
-                                         Auto-claim: každých 60s, safety-net každých 5min.\n\
-                                         Portfolio report: každých 30 min.", lim_h)
+                                         Auto-claim: každých 60s, safety-net každých 5min.", lim_h),
+                                        vec![vec![("🎛 Menu", "menu_refresh"), ("📋 Přehled", "menu_prehled")]],
                                     ).await;
 
                                 // === YES reply: place bet ===
@@ -11268,8 +13852,12 @@ async fn main() -> Result<()> {
                                         // Manual dedup guard (same as auto-bet protection):
                                         // don't allow re-betting same condition/base match from stale alert messages.
                                         let manual_base_match_key = strip_map_winner_suffix(&anomaly.match_key);
-                                        let manual_dedup_base = already_bet_base_matches.contains(&manual_base_match_key)
-                                            && is_map_winner_market(&anomaly.match_key, &anomaly.market_key);
+                                        let manual_dedup_base = cross_market_base_dedup_block(
+                                            &manual_base_match_key,
+                                            is_map_winner_market(&anomaly.match_key, &anomaly.market_key),
+                                            &already_bet_base_matches,
+                                            &already_bet_map_winners,
+                                        );
                                         let manual_scoped_condition = scoped_condition_key(&manual_base_match_key, &condition_id);
                                         let manual_market_dedup_key = market_dedup_key(&anomaly.match_key, &anomaly.market_key);
                                         let manual_dedup = already_bet_conditions.contains(&manual_scoped_condition)
@@ -11324,6 +13912,9 @@ async fn main() -> Result<()> {
                                             "minOdds": min_odds.to_string(),
                                             "requestedOdds": azuro_odds,
                                             "matchKey": anomaly.match_key,
+                                            "originalSport": anomaly.match_key.split("::").next().unwrap_or(""),
+                                            "resolvedSport": anomaly.match_key.split("::").next().unwrap_or(""),
+                                            "esportsFamily": canonicalize_esports_family(anomaly.match_key.split("::").next().unwrap_or("")),
                                             "team1": anomaly.team1,
                                             "team2": anomaly.team2,
                                             "valueTeam": value_team,
@@ -11359,9 +13950,52 @@ async fn main() -> Result<()> {
                                                             let state = br.state.as_deref().unwrap_or("?");
                                                             let token_id_opt = sanitize_token_id(br.token_id.clone());
                                                             let graph_bet_id_opt = br.graph_bet_id.clone();
-                                                            let accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
-
                                                             let is_dry_run = state == "DRY-RUN" || bet_id.starts_with("dry-");
+                                                            let mut accepted_odds = br.accepted_odds.unwrap_or(azuro_odds);
+                                                            if state == "Accepted" && !is_dry_run {
+                                                                if let Ok(status_resp) = client
+                                                                    .get(format!("{}/bet/{}", executor_url, bet_id))
+                                                                    .send()
+                                                                    .await
+                                                                {
+                                                                    if let Ok(status_json) = status_resp.json::<serde_json::Value>().await {
+                                                                        if let Some(canonical_odds) = executor_truth_accepted_odds(&status_json) {
+                                                                            accepted_odds = canonical_odds;
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            let drift_suffix = format_odds_drift_message(azuro_odds, accepted_odds)
+                                                                .map(|msg| format!("\n{}", msg))
+                                                                .unwrap_or_default();
+                                                            if let Some((delta_abs, delta_pct)) = significant_odds_drift(azuro_odds, accepted_odds) {
+                                                                warn!(
+                                                                    "⚠️ MANUAL BET #{} odds drift: req @{:.2} -> exec @{:.2} ({:+.2}, {:+.1}%) bet_id={} match={} path=bet_command",
+                                                                    aid,
+                                                                    azuro_odds,
+                                                                    accepted_odds,
+                                                                    delta_abs,
+                                                                    delta_pct,
+                                                                    bet_id,
+                                                                    anomaly.match_key,
+                                                                );
+                                                                ledger_write("ODDS_DRIFT_ALERT", &serde_json::json!({
+                                                                    "alert_id": aid,
+                                                                    "bet_id": bet_id,
+                                                                    "match_key": anomaly.match_key,
+                                                                    "market_key": anomaly.market_key,
+                                                                    "condition_id": condition_id,
+                                                                    "outcome_id": outcome_id,
+                                                                    "path": "bet_command",
+                                                                    "requested_odds": azuro_odds,
+                                                                    "accepted_odds": accepted_odds,
+                                                                    "delta_abs": delta_abs,
+                                                                    "delta_pct": delta_pct,
+                                                                    "stake": amount,
+                                                                    "token_id": token_id_opt,
+                                                                    "graph_bet_id": graph_bet_id_opt,
+                                                                }));
+                                                            }
 
                                                             // Don't track dry-run bets as active
                                                             if !is_dry_run {
@@ -11372,11 +14006,17 @@ async fn main() -> Result<()> {
                                                                     already_bet_map_winners.insert(manual_base_match_key.clone());
                                                                 }
 
-                                                                active_bets.push(ActiveBet {
+                                                                let manual_family = canonicalize_esports_family(
+                                                                    anomaly.match_key.split("::").next().unwrap_or("")
+                                                                ).map(|value| value.to_string());
+                                                                let active_bet = ActiveBet {
                                                                     alert_id: aid,
                                                                     bet_id: bet_id.to_string(),
                                                                     match_key: anomaly.match_key.clone(),
                                                                     market_key: anomaly.market_key.clone(),
+                                                                    original_sport: Some(anomaly.match_key.split("::").next().unwrap_or("").to_string()),
+                                                                    resolved_sport: Some(anomaly.match_key.split("::").next().unwrap_or("").to_string()),
+                                                                    esports_family: manual_family,
                                                                     team1: anomaly.team1.clone(),
                                                                     team2: anomaly.team2.clone(),
                                                                     value_team: value_team.to_string(),
@@ -11388,19 +14028,9 @@ async fn main() -> Result<()> {
                                                                     graph_bet_id: graph_bet_id_opt.clone(),
                                                                     token_id: token_id_opt.clone(),
                                                                     path: "bet_command".to_string(),
-                                                                });
-
-                                                                let token_to_write = token_id_opt.as_deref().unwrap_or("?");
-                                                                if let Ok(mut f) = std::fs::OpenOptions::new()
-                                                                    .create(true).append(true)
-                                                                    .open(pending_claims_path) {
-                                                                    use std::io::Write;
-                                                                    let _ = writeln!(f, "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-                                                                        token_to_write,
-                                                                        bet_id, anomaly.match_key,
-                                                                        value_team, amount, accepted_odds,
-                                                                        anomaly.team1, anomaly.team2, anomaly.market_key);
-                                                                }
+                                                                };
+                                                                active_bets.push(active_bet.clone());
+                                                                append_pending_claim_entry(&active_bet, pending_claims_path);
                                                                     if let Ok(mut f) = std::fs::OpenOptions::new()
                                                                         .create(true).append(true)
                                                                         .open(bet_history_path) {
@@ -11452,9 +14082,9 @@ async fn main() -> Result<()> {
                                                                      {} @ {:.2} | ${:.2}\n\
                                                                      Bet ID: <code>{}</code>\n\
                                                                      State: {}\n\n\
-                                                                     Auto-cashout aktivní (≥{}% profit).",
+                                                                     Auto-cashout aktivní (≥{}% profit).{}",
                                                                     aid, value_team, accepted_odds, amount,
-                                                                    bet_id, state, CASHOUT_MIN_PROFIT_PCT
+                                                                    bet_id, state, CASHOUT_MIN_PROFIT_PCT, drift_suffix
                                                                 )
                                                             };
 

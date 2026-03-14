@@ -23,10 +23,16 @@ const LOGS_DIR    = path.join(ROOT, 'logs');
 
 // ── Current system strategy (update when alert_bot tuning changes) ──────────
 const STRATEGY = {
-  updated: '2026-03-12',
+  updated: '2026-03-14',
   score_edge: {
     min_edge_default: 38,
     cs2_map_winner_min_edge: 28,
+    football_min_edge_tiers: {
+      early: { label: 'EARLY', range: '0-55 min', min_edge: 30 },
+      mid:   { label: 'MID',   range: '56-69 min', min_edge: 28 },
+      late:  { label: 'LATE',  range: '70-80 min', min_edge: 26 },
+      ultra: { label: 'ULTRA', range: '81+ min',   min_edge: 24 },
+    },
     min_odds: 1.70,
     max_odds_default: 3.00,
     cs2_max_odds_tiers: {
@@ -37,7 +43,7 @@ const STRATEGY = {
     },
     stakes: {
       cs2:        { base: 3.00, note: 'Score-edge path (includes promoted esports::→CS2)' },
-      football:   { base: 3.00, note: 'Score-edge path' },
+      football:   { base: 3.00, note: 'Contained late-game only: diff>=2@72+, diff>=3@58+, diff>=4@45+' },
       tennis:     { base: 0.50, note: 'Reduced — volatile' },
       basketball: { base: 0.50, note: 'Reduced — volatile' },
     },
@@ -63,6 +69,7 @@ const STRATEGY = {
     daily_loss_limit: 30,
     min_bankroll: 10,
     block_generic_esports: true,
+    football_containment: 'max odds 2.05, min odds 1.65, edge 24-30 by minute',
     promotion_gate: 'A1: Kill ALL generic esports:: | A2: Promote to CS2 model via Azuro-derived sport or team markers (medium OK)',
     azuro_derived_sport: 'Fuzzy-matched Azuro odds reveal actual sport from match_key prefix',
     cs2_team_markers: '45 teams (Tier 1-3) as fallback when Azuro prefix unavailable',
@@ -206,10 +213,15 @@ function getProcessStatus(name) {
 }
 
 function getConfig() {
-  const defaults = { autobet_enabled: true, sport_focus: ['all'], loss_limit: 30, max_stake: 3.00 };
+  const defaults = { autobet_enabled: true, no_bet_mode: false, sport_focus: ['all'], loss_limit: 30, max_stake: 3.00 };
   let config;
   try { config = { ...defaults, ...JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) }; }
   catch { config = defaults; }
+  if (typeof config.no_bet_mode === 'boolean') {
+    config.autobet_enabled = !config.no_bet_mode;
+  } else {
+    config.no_bet_mode = config.autobet_enabled === false;
+  }
   // Enrich with SOD bankroll + effective limit from daily_pnl.json
   const dailyPnl = readJson(path.join(DATA, 'daily_pnl.json'), {});
   config.sod_bankroll = dailyPnl?.sod_bankroll ?? null;
@@ -249,6 +261,69 @@ function getPnl7d() {
   return out;
 }
 
+function summarizeRuntimeAudit(hours = 24) {
+  const file = path.join(DATA, 'ledger.jsonl');
+  const empty = {
+    window_hours: hours,
+    drift_alerts: 0,
+    drift_max_abs: 0,
+    drift_max_pct: 0,
+    latest_drift: null,
+    football_blocked: 0,
+    football_guard_blocked: 0,
+    football_odds_blocked: 0,
+  };
+  if (!fs.existsSync(file)) return empty;
+
+  const cutoff = Date.now() - hours * 3600_000;
+  try {
+    const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const summary = { ...empty };
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let entry;
+      try { entry = JSON.parse(lines[i]); } catch { continue; }
+      if (!entry?.ts) continue;
+      const ts = new Date(entry.ts).getTime();
+      if (!Number.isFinite(ts)) continue;
+      if (ts < cutoff) break;
+
+      if (entry.event === 'ODDS_DRIFT_ALERT') {
+        const deltaAbs = Math.abs(Number(entry.delta_abs || 0));
+        const deltaPct = Math.abs(Number(entry.delta_pct || 0));
+        summary.drift_alerts += 1;
+        summary.drift_max_abs = Math.max(summary.drift_max_abs, deltaAbs);
+        summary.drift_max_pct = Math.max(summary.drift_max_pct, deltaPct);
+        if (!summary.latest_drift) {
+          summary.latest_drift = {
+            ts: entry.ts,
+            match_key: entry.match_key || null,
+            path: entry.path || null,
+            delta_abs: Number(entry.delta_abs || 0),
+            delta_pct: Number(entry.delta_pct || 0),
+          };
+        }
+        continue;
+      }
+
+      if (entry.event === 'FOOTBALL_DECISION_AUDIT' && entry.decision === 'blocked_candidate') {
+        const reasonCodes = Array.isArray(entry.reason_codes)
+          ? entry.reason_codes
+          : typeof entry.reason_code === 'string'
+            ? entry.reason_code.split('|').filter(Boolean)
+            : [];
+        summary.football_blocked += 1;
+        if (reasonCodes.includes('SportGuardBlocked')) summary.football_guard_blocked += 1;
+        if (reasonCodes.includes('OddsAboveMax') || reasonCodes.includes('OddsBelowMin')) {
+          summary.football_odds_blocked += 1;
+        }
+      }
+    }
+    return summary;
+  } catch {
+    return empty;
+  }
+}
+
 // ── Status snapshot ───────────────────────────────────────────────────────────
 let cachedMaticBalance = null;
 let maticCacheTs = 0;
@@ -269,6 +344,7 @@ async function getStatus() {
     : readJson(path.join(DATA, 'active_bets.json'), []);
   const dailyPnl    = readJson(path.join(DATA, 'daily_pnl.json'), {});
   const recentBets  = getRecentBets(500);
+  const runtimeAudit = summarizeRuntimeAudit(24);
   const alertBotAge = getAlertBotAge();
   const nowStatus = Date.now();
 
@@ -339,6 +415,7 @@ async function getStatus() {
     returned_today:dailyPnl?.returned ?? 0,
     bets_today:    dailyPnl?.bets_today ?? dailyPnl?.total_bets ?? recentBets.filter(b => b.ts && b.ts.slice(0,10) === new Date().toISOString().slice(0,10)).length,
     recent_bets:   recentBets,
+    runtime_audit: runtimeAudit,
     pnl_7d:        getPnl7d(),
     config:        getConfig(),
   };
@@ -504,8 +581,12 @@ app.get('/api/config', authApi, (_req, res) => {
 app.post('/api/config', authApi, (req, res) => {
   const current = getConfig();
   const body    = req.body || {};
+  const noBetMode = typeof body.no_bet_mode === 'boolean'
+    ? body.no_bet_mode
+    : (typeof body.autobet_enabled === 'boolean' ? !body.autobet_enabled : current.no_bet_mode);
   const next = {
-    autobet_enabled: typeof body.autobet_enabled === 'boolean' ? body.autobet_enabled : current.autobet_enabled,
+    autobet_enabled: !noBetMode,
+    no_bet_mode: noBetMode,
     sport_focus:     Array.isArray(body.sport_focus) ? body.sport_focus.filter(s => typeof s === 'string' && s.length < 32) : current.sport_focus,
     loss_limit:      (typeof body.loss_limit === 'number' && body.loss_limit > 0 && body.loss_limit < 1000) ? +body.loss_limit.toFixed(2) : current.loss_limit,
     max_stake:       (typeof body.max_stake  === 'number' && body.max_stake  > 0 && body.max_stake  < 100)  ? +body.max_stake.toFixed(2)  : current.max_stake,

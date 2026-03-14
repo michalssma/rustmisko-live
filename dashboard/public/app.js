@@ -91,13 +91,7 @@ function render(d) {
   renderProc('proc-alert-bot', d.processes['alert-bot']);
   renderProc('proc-executor',  d.processes['executor']);
 
-  // Auto-bet toggle reflects alert-bot state
-  const abt = document.getElementById('autobet-toggle');
-  if (abt) {
-    const running = d.processes['alert-bot'] === 'running';
-    abt.checked = running;
-    setText('autobet-label', running ? 'ENABLED' : 'DISABLED');
-  }
+  syncNoBetToggle(d.config, d.processes);
 
   // Compute today's P&L from bets
   const todayStr  = new Date().toISOString().slice(0,10);
@@ -126,8 +120,12 @@ function render(d) {
   const inflight   = d.inflight_pending || [];
   const totalStake = pending.reduce((s,b) => s+(b.amount||b.stake||b.amount_usd||0), 0);
   const mismatch   = d.pending_truth_mismatch || 0;
+  const recentBetSummary = buildRecentBetSummary(allBets);
+  const opsAuditSummary = buildOpsAuditSummary(d.runtime_audit || {});
   setText('pending-dots',    pending.length > 0 ? '●'.repeat(Math.min(pending.length,5)) : '○');
   setText('pending-summary', `${pending.length} chain • $${totalStake.toFixed(2)}${inflight.length ? ` • +${inflight.length} inflight` : ''}${mismatch ? ` • ${mismatch} stale` : ''}`);
+  setText('recent-bet-summary', recentBetSummary || 'Bez čerstvého bet eventu');
+  setText('ops-audit-summary', opsAuditSummary);
 
   // Loss limit bar — show REAL effective limit
   const configLimit = d.config?.loss_limit ?? 30;
@@ -391,10 +389,17 @@ function renderSportStats(bets) {
 
 // ── Controls ──────────────────────────────────────────────────────────────────
 async function toggleAutobet() {
-  const on = document.getElementById('autobet-toggle').checked;
-  setText('autobet-label', on ? 'ENABLING…' : 'DISABLING…');
-  if (on) await api('POST', '/api/process/start/alert-bot');
-  else    await api('POST', '/api/process/stop/alert-bot');
+  const input = document.getElementById('autobet-toggle');
+  if (!input) return;
+  const noBetMode = input.checked;
+  setText('autobet-label', noBetMode ? 'PŘEPÍNÁM NO BET…' : 'OBNOVUJU LIVE BET…');
+  const result = await api('POST', '/api/config', { no_bet_mode: noBetMode });
+  if (!result?.ok) {
+    input.checked = !noBetMode;
+    setText('autobet-label', 'CHYBA');
+    return;
+  }
+  applyConfig(result.config || { no_bet_mode: noBetMode });
 }
 
 function applyConfig(cfg) {
@@ -403,9 +408,23 @@ function applyConfig(cfg) {
   const msi = document.getElementById('max-stake-input');
   if (lil && document.activeElement !== lil) lil.value = cfg.loss_limit ?? 15.55;
   if (msi && document.activeElement !== msi) msi.value = cfg.max_stake  ?? 3.00;
+  syncNoBetToggle(cfg, lastData?.processes || {});
   document.querySelectorAll('.sport-pill').forEach(btn =>
     btn.classList.toggle('active', currentSportFocus.includes(btn.dataset.sport))
   );
+}
+
+function syncNoBetToggle(cfg, processes) {
+  const toggle = document.getElementById('autobet-toggle');
+  if (!toggle) return;
+  const noBetMode = !!(cfg && cfg.no_bet_mode);
+  const botRunning = processes && processes['alert-bot'] === 'running';
+  toggle.checked = noBetMode;
+  if (!botRunning) {
+    setText('autobet-label', noBetMode ? 'BOT OFFLINE · NO BET ON' : 'BOT OFFLINE');
+    return;
+  }
+  setText('autobet-label', noBetMode ? 'NO BET ON' : 'LIVE BET ON');
 }
 
 function toggleSport(sport, btn) {
@@ -674,4 +693,41 @@ function renderStrategy(s) {
     </div>
     <div style="padding:6px 0 0;font-size:11px;color:var(--muted)">Tuning ${s.updated} · data-driven</div>
   `;
+}
+
+function buildRecentBetSummary(bets) {
+  const recent = (bets || [])
+    .filter(b => ['PLACED', 'WON', 'LOST', 'CANCELED'].includes(b.event) && b.ts)
+    .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime());
+  if (!recent.length) return '';
+
+  const bet = recent[0];
+  const age = timeAgo(bet.ts);
+  const name = shortMatchKey(bet.match_key || '?');
+  const stake = +(bet.amount_usd || bet.stake || 0);
+  if (bet.event === 'LOST') return `Poslední settle: ❌ ${name} -$${stake.toFixed(2)} • ${age}`;
+  if (bet.event === 'WON') {
+    const profit = +((bet.payout_usd || 0) - stake).toFixed(2);
+    return `Poslední settle: ✅ ${name} +$${profit.toFixed(2)} • ${age}`;
+  }
+  if (bet.event === 'PLACED') return `Poslední bet: ⏳ ${name} @${+(bet.odds || 0).toFixed(2)} • $${stake.toFixed(2)} • ${age}`;
+  return `Poslední event: ↩️ ${name} • ${age}`;
+}
+
+function buildOpsAuditSummary(audit) {
+  const hours = audit.window_hours || 24;
+  const driftCount = audit.drift_alerts || 0;
+  const maxAbs = +(audit.drift_max_abs || 0);
+  const maxPct = +(audit.drift_max_pct || 0);
+  const footballBlocked = audit.football_blocked || 0;
+  const footballGuardBlocked = audit.football_guard_blocked || 0;
+  const footballOddsBlocked = audit.football_odds_blocked || 0;
+
+  const driftPart = driftCount > 0
+    ? `Drift ${hours}h: ${driftCount}x, max ${maxAbs.toFixed(2)} / ${maxPct.toFixed(1)}%`
+    : `Drift ${hours}h: 0`;
+  const footballPart = footballBlocked > 0
+    ? `Football containment: ${footballBlocked} bloků, guard ${footballGuardBlocked}, odds ${footballOddsBlocked}`
+    : 'Football containment: 0 bloků';
+  return `${driftPart} • ${footballPart}`;
 }

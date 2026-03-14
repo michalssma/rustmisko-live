@@ -123,6 +123,13 @@ const publicClient = createPublicClient({
   transport: rpcTransport,
 });
 
+const readonlyPublicClients = RPC_URLS.map((url) =>
+  createPublicClient({
+    chain,
+    transport: http(url, { retryCount: 0, timeout: 10_000 }),
+  }),
+);
+
 if (DRY_RUN) {
   console.log(`🧪 DRY-RUN: simulace na ${chain.name} (${CHAIN_ID})`);
 } else {
@@ -288,11 +295,22 @@ function saveActiveBetsToDisk() {
 // ============================================================
 const ALREADY_PAID_SELECTOR = "d70a0e30";
 const CLAIM_LOCK_STALE_MS = 5 * 60_000;
+const ONCHAIN_STATUS_CACHE_TTL_MS = 45_000;
+const TOKEN_ENUM_BATCH_SIZE = 10;
+const PAYOUT_BATCH_SIZE = 12;
 
 const claimLock = {
   active: false,
   label: null,
   since: 0,
+};
+
+const warningTimestamps = new Map();
+
+const onchainStatusCache = {
+  value: null,
+  ts: 0,
+  inFlight: null,
 };
 
 function classifyViewPayoutError(err) {
@@ -302,11 +320,25 @@ function classifyViewPayoutError(err) {
     return "already_paid";
   }
   // Log unknown selectors for future debugging
-  const selectorMatch = msg.match(/0x([0-9a-f]{8})/);
+  const selectorMatch = msg.match(/signature:\s*0x([0-9a-f]{8})/);
   if (selectorMatch && selectorMatch[1] !== ALREADY_PAID_SELECTOR) {
-    console.warn(`⚠️ Unknown viewPayout revert selector: 0x${selectorMatch[1]}`);
+    warnRateLimited(
+      `viewPayout-selector:${selectorMatch[1]}`,
+      `⚠️ Unknown viewPayout revert selector: 0x${selectorMatch[1]}`,
+      300_000,
+    );
   }
   return "pending";
+}
+
+function warnRateLimited(key, message, ttlMs = 60_000) {
+  const now = Date.now();
+  const lastTs = warningTimestamps.get(key) || 0;
+  if (now - lastTs < ttlMs) {
+    return;
+  }
+  warningTimestamps.set(key, now);
+  console.warn(message);
 }
 
 function normalizeMatchKey(input) {
@@ -329,6 +361,71 @@ function getRequestedOddsFromBody(body) {
   return normalizeOdds(body?.requestedOdds ?? body?.displayOdds ?? body?.odds);
 }
 
+function isRetryableReadError(err) {
+  const msg = (err?.message || err?.toString() || '').toLowerCase();
+  return [
+    'max fee per gas less than block base fee',
+    'fee cap',
+    'timeout',
+    'timed out',
+    'socket hang up',
+    'fetch failed',
+    'network error',
+    'rpc request failed',
+    'http request failed',
+    '429',
+    '503',
+    'rate limit',
+  ].some((needle) => msg.includes(needle));
+}
+
+function cloneStatusRows(rows) {
+  return rows.map((row) => ({ ...row }));
+}
+
+function timeoutAfter(ms, label) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+}
+
+async function withTimeout(promise, ms, label) {
+  return Promise.race([promise, timeoutAfter(ms, label)]);
+}
+
+async function readContractReadonly(args, label) {
+  let lastErr = null;
+
+  for (let i = 0; i < readonlyPublicClients.length; i++) {
+    const client = readonlyPublicClients[i];
+    try {
+      return await client.readContract(args);
+    } catch (err) {
+      lastErr = err;
+      const retryable = isRetryableReadError(err);
+      const url = RPC_URLS[i] || `rpc#${i + 1}`;
+      if (!retryable || i === readonlyPublicClients.length - 1) {
+        throw err;
+      }
+      warnRateLimited(
+        `read-retry:${label}:${url}`,
+        `⚠️ Read retry: ${label} via ${url} failed (${err.message}) — trying next RPC`,
+        60_000,
+      );
+    }
+  }
+
+  throw lastErr || new Error(`readContractReadonly failed: ${label}`);
+}
+
+async function readContractBestEffort(args, label, timeoutMs = 2_500) {
+  try {
+    return await withTimeout(readContractReadonly(args, label), timeoutMs, label);
+  } catch {
+    return null;
+  }
+}
+
 function getMinOddsDisplay(rawMinOdds) {
   const num = parseFiniteNumber(rawMinOdds);
   return num !== null && num > 0 ? num / 1e12 : null;
@@ -342,9 +439,15 @@ function normalizeActiveBetRecord(bet) {
   const requestedOdds = normalizeOdds(bet.requestedOdds ?? bet.displayOdds ?? bet.requested_odds);
   const acceptedOdds = normalizeOdds(bet.acceptedOdds ?? bet.accepted_odds ?? bet.odds);
   const minOdds = normalizeOdds(bet.minOdds ?? bet.min_odds);
+  const matchKey = normalizeMatchKey(bet.matchKey ?? bet.match_key);
+  const resolvedSport = bet.resolvedSport ?? bet.resolved_sport ?? bet.sport ?? (matchKey.split("::")[0] || "?");
   return {
     ...bet,
-    matchKey: normalizeMatchKey(bet.matchKey ?? bet.match_key),
+    matchKey,
+    sport: resolvedSport,
+    originalSport: bet.originalSport ?? bet.original_sport ?? null,
+    resolvedSport: resolvedSport || null,
+    esportsFamily: bet.esportsFamily ?? bet.esports_family ?? null,
     team: bet.team || bet.valueTeam || bet.value_team || bet.team1 || "",
     requestedOdds,
     acceptedOdds,
@@ -473,7 +576,12 @@ async function autoPruneSettled() {
   }
 }
 
-async function fetchOnchainOwnedBetStatuses() {
+function startOnchainStatusRefresh() {
+  if (onchainStatusCache.inFlight) {
+    return onchainStatusCache.inFlight;
+  }
+
+  const scanPromise = (async () => {
   const ownerAddress = account?.address;
   if (!ownerAddress) {
     return [];
@@ -487,45 +595,83 @@ async function fetchOnchainOwnedBetStatuses() {
     'function viewPayout(address,uint256) view returns (uint128)',
   ]);
 
-  const nftCount = Number(await publicClient.readContract({
+  const nftCount = Number(await readContractReadonly({
     address: contracts.azuroBet,
     abi: erc721Abi,
     functionName: 'balanceOf',
     args: [ownerAddress],
-  }));
+  }, 'azuroBet.balanceOf'));
 
   if (nftCount === 0) {
     return [];
   }
 
   const tokenIds = [];
-  for (let i = 0; i < nftCount; i += 10) {
+  for (let i = 0; i < nftCount; i += TOKEN_ENUM_BATCH_SIZE) {
     const batch = [];
-    for (let j = i; j < Math.min(i + 10, nftCount); j++) {
-      batch.push(publicClient.readContract({
+    for (let j = i; j < Math.min(i + TOKEN_ENUM_BATCH_SIZE, nftCount); j++) {
+      batch.push(readContractReadonly({
         address: contracts.azuroBet,
         abi: erc721Abi,
         functionName: 'tokenOfOwnerByIndex',
         args: [ownerAddress, BigInt(j)],
-      }));
+      }, `azuroBet.tokenOfOwnerByIndex(${j})`));
     }
     tokenIds.push(...await Promise.all(batch));
   }
 
-  return Promise.all(tokenIds.map(tid =>
-    publicClient.readContract({
-      address: contracts.lp,
-      abi: lpAbi,
-      functionName: 'viewPayout',
-      args: [contracts.core, tid],
-    }).then(p => {
-      const usd = Number(p) / (10 ** contracts.betTokenDecimals);
-      return { tokenId: tid.toString(), payoutUsd: usd, status: usd > 0 ? 'claimable' : 'lost' };
-    }).catch((e) => {
-      const cls = classifyViewPayoutError(e);
-      return { tokenId: tid.toString(), payoutUsd: 0, status: cls };
-    })
-  ));
+  const statuses = [];
+  for (let i = 0; i < tokenIds.length; i += PAYOUT_BATCH_SIZE) {
+    const batch = tokenIds.slice(i, i + PAYOUT_BATCH_SIZE).map((tid) =>
+      readContractReadonly({
+        address: contracts.lp,
+        abi: lpAbi,
+        functionName: 'viewPayout',
+        args: [contracts.core, tid],
+      }, `lp.viewPayout(${tid})`).then((p) => {
+        const usd = Number(p) / (10 ** contracts.betTokenDecimals);
+        return { tokenId: tid.toString(), payoutUsd: usd, status: usd > 0 ? 'claimable' : 'lost' };
+      }).catch((e) => {
+        const cls = classifyViewPayoutError(e);
+        return { tokenId: tid.toString(), payoutUsd: 0, status: cls };
+      })
+    );
+    statuses.push(...await Promise.all(batch));
+  }
+
+  onchainStatusCache.value = cloneStatusRows(statuses);
+  onchainStatusCache.ts = Date.now();
+  return statuses;
+  })();
+
+  onchainStatusCache.inFlight = scanPromise;
+  scanPromise.catch((err) => {
+    if (onchainStatusCache.value) {
+      warnRateLimited(
+        'stale-onchain-status-snapshot',
+        `⚠️ Using stale on-chain status snapshot after refresh failure: ${err.message}`,
+        60_000,
+      );
+    }
+  }).finally(() => {
+    if (onchainStatusCache.inFlight === scanPromise) {
+      onchainStatusCache.inFlight = null;
+    }
+  });
+
+  return scanPromise;
+}
+
+async function fetchOnchainOwnedBetStatuses() {
+  const now = Date.now();
+  if (onchainStatusCache.value) {
+    if (now - onchainStatusCache.ts >= ONCHAIN_STATUS_CACHE_TTL_MS && !onchainStatusCache.inFlight) {
+      startOnchainStatusRefresh().catch(() => {});
+    }
+    return cloneStatusRows(onchainStatusCache.value);
+  }
+
+  return cloneStatusRows(await startOnchainStatusRefresh());
 }
 
 async function reconcileActiveBetsWithOnchainTruth() {
@@ -660,64 +806,60 @@ app.get("/health", async (req, res) => {
     });
   }
   try {
-    const balance = await publicClient.readContract({
-      address: contracts.betToken,
-      abi: ERC20_ABI,
-      functionName: "balanceOf",
-      args: [account.address],
-    });
-    const formattedBalance = formatUnits(balance, contracts.betTokenDecimals);
+    const [balance, allowance, paymasterAllowance, paymasterFeeFund, paymasterFreeBetsFund] = await Promise.all([
+      readContractBestEffort({
+        address: contracts.betToken,
+        abi: ERC20_ABI,
+        functionName: "balanceOf",
+        args: [account.address],
+      }, 'health.balanceOf'),
+      readContractBestEffort({
+        address: contracts.betToken,
+        abi: ERC20_ABI,
+        functionName: "allowance",
+        args: [account.address, contracts.relayer],
+      }, 'health.allowance'),
+      contracts.paymaster
+        ? readContractBestEffort({
+            address: contracts.betToken,
+            abi: ERC20_ABI,
+            functionName: "allowance",
+            args: [account.address, contracts.paymaster],
+          }, 'health.paymasterAllowance')
+        : Promise.resolve(0n),
+      contracts.paymaster
+        ? readContractBestEffort({
+            address: contracts.paymaster,
+            abi: PAYMASTER_ABI,
+            functionName: "feeFund",
+            args: [account.address],
+          }, 'health.paymasterFeeFund')
+        : Promise.resolve(0n),
+      contracts.paymaster
+        ? readContractBestEffort({
+            address: contracts.paymaster,
+            abi: PAYMASTER_ABI,
+            functionName: "freeBetsFund",
+            args: [account.address],
+          }, 'health.paymasterFreeBetsFund')
+        : Promise.resolve(0n),
+    ]);
 
-    const allowance = await publicClient.readContract({
-      address: contracts.betToken,
-      abi: ERC20_ABI,
-      functionName: "allowance",
-      args: [account.address, contracts.relayer],
-    });
-    const formattedAllowance = formatUnits(
-      allowance,
-      contracts.betTokenDecimals,
-    );
-
-    const paymasterAllowance = contracts.paymaster
-      ? await publicClient.readContract({
-          address: contracts.betToken,
-          abi: ERC20_ABI,
-          functionName: "allowance",
-          args: [account.address, contracts.paymaster],
-        })
-      : 0n;
-
-    const paymasterFeeFund = contracts.paymaster
-      ? await publicClient.readContract({
-          address: contracts.paymaster,
-          abi: PAYMASTER_ABI,
-          functionName: "feeFund",
-          args: [account.address],
-        })
-      : 0n;
-
-    const paymasterFreeBetsFund = contracts.paymaster
-      ? await publicClient.readContract({
-          address: contracts.paymaster,
-          abi: PAYMASTER_ABI,
-          functionName: "freeBetsFund",
-          args: [account.address],
-        })
-      : 0n;
+    const degraded = [balance, allowance, paymasterAllowance, paymasterFeeFund, paymasterFreeBetsFund].some((value) => value === null);
 
     res.json({
-      status: "ok",
+      status: degraded ? "degraded" : "ok",
       wallet: account.address,
       chain: chain.name,
       chainId: CHAIN_ID,
       betToken: contracts.betToken,
-      balance: formattedBalance,
-      relayerAllowance: formattedAllowance,
-      paymasterAllowance: formatUnits(paymasterAllowance, contracts.betTokenDecimals),
-      paymasterFeeFund: formatUnits(paymasterFeeFund, contracts.betTokenDecimals),
-      paymasterFreeBetsFund: formatUnits(paymasterFreeBetsFund, contracts.betTokenDecimals),
+      balance: balance === null ? null : formatUnits(balance, contracts.betTokenDecimals),
+      relayerAllowance: allowance === null ? null : formatUnits(allowance, contracts.betTokenDecimals),
+      paymasterAllowance: paymasterAllowance === null ? null : formatUnits(paymasterAllowance, contracts.betTokenDecimals),
+      paymasterFeeFund: paymasterFeeFund === null ? null : formatUnits(paymasterFeeFund, contracts.betTokenDecimals),
+      paymasterFreeBetsFund: paymasterFreeBetsFund === null ? null : formatUnits(paymasterFreeBetsFund, contracts.betTokenDecimals),
       activeBets: activeBets.size,
+      onchainSnapshotAgeMs: onchainStatusCache.ts > 0 ? Date.now() - onchainStatusCache.ts : null,
       toolkitAvailable: toolkit !== null,
       relayerConfig: {
         relayerFeeAmount: (process.env.AZURO_RELAYER_FEE_AMOUNT ?? "0").toString(),
@@ -1061,7 +1203,10 @@ app.post("/bet", async (req, res) => {
           requestedOdds,
           acceptedOdds,
           odds: acceptedOdds ?? requestedOdds ?? minOddsDisplay ?? 0,
-          sport: normalizedMatchKey.split("::")[0] || "?",
+          sport: req.body.resolvedSport || normalizedMatchKey.split("::")[0] || "?",
+          originalSport: req.body.originalSport || null,
+          resolvedSport: req.body.resolvedSport || normalizedMatchKey.split("::")[0] || null,
+          esportsFamily: req.body.esportsFamily || null,
           matchKey: normalizedMatchKey,
           team: selectedTeam,
           placedAt: new Date().toISOString(),
@@ -1697,10 +1842,10 @@ app.get('/my-bets', async (req, res) => {
     const totalPendingUsd = pending.reduce((s, r) => s + (r.amount || 0), 0);
 
     // Get USDT balance
-    const balance = await publicClient.readContract({
+    const balance = await readContractBestEffort({
       address: contracts.betToken, abi: ERC20_ABI,
       functionName: 'balanceOf', args: [walletAddr],
-    });
+    }, 'my-bets.balanceOf', 3_000);
 
     console.log(`📊 My-bets on-chain: ${nftCount} NFTs, ${claimable.length} claimable ($${totalClaimableUsd.toFixed(2)}), ${alreadyPaid.length} already_paid, ${pending.length} pending, ${lost.length} lost`);
 
@@ -1712,8 +1857,9 @@ app.get('/my-bets', async (req, res) => {
       pending: pending.length,
       pendingUsd: totalPendingUsd,
       lost: lost.length,
-      balanceUsd: formatUnits(balance, contracts.betTokenDecimals),
+      balanceUsd: balance === null ? null : formatUnits(balance, contracts.betTokenDecimals),
       source: 'on-chain',
+      snapshotAgeMs: onchainStatusCache.ts > 0 ? Date.now() - onchainStatusCache.ts : null,
       bets: results,
     });
   } catch (e) {
@@ -1739,14 +1885,6 @@ app.post("/auto-claim", async (req, res) => {
   }
 
   try {
-    // ============================================================
-    // ON-CHAIN NFT ENUMERATION — no subgraph dependency!
-    // AzuroBet.balanceOf → tokenOfOwnerByIndex → LP.viewPayout
-    // ============================================================
-    const erc721Abi = parseAbi([
-      "function balanceOf(address) view returns (uint256)",
-      "function tokenOfOwnerByIndex(address,uint256) view returns (uint256)",
-    ]);
     const lpAbi = toolkit
       ? toolkit.lpAbi
       : parseAbi([
@@ -1755,15 +1893,8 @@ app.post("/auto-claim", async (req, res) => {
           "function viewPayout(address,uint256) view returns (uint128)",
         ]);
 
-    // Step 1: Count NFTs owned
-    const nftCount = Number(
-      await publicClient.readContract({
-        address: contracts.azuroBet,
-        abi: erc721Abi,
-        functionName: "balanceOf",
-        args: [account.address],
-      }),
-    );
+    const payoutResults = await fetchOnchainOwnedBetStatuses();
+    const nftCount = payoutResults.length;
 
     if (nftCount === 0) {
       return res.json({
@@ -1774,45 +1905,6 @@ app.post("/auto-claim", async (req, res) => {
     }
 
     console.log(`🔍 Auto-claim: scanning ${nftCount} AzuroBet NFTs...`);
-
-    // Step 2: Enumerate all tokenIds (batch of 10)
-    const tokenIds = [];
-    for (let i = 0; i < nftCount; i += 10) {
-      const batch = [];
-      for (let j = i; j < Math.min(i + 10, nftCount); j++) {
-        batch.push(
-          publicClient.readContract({
-            address: contracts.azuroBet,
-            abi: erc721Abi,
-            functionName: "tokenOfOwnerByIndex",
-            args: [account.address, BigInt(j)],
-          }),
-        );
-      }
-      tokenIds.push(...(await Promise.all(batch)));
-    }
-
-    // Step 3: Check viewPayout for each (parallel)
-    const payoutResults = await Promise.all(
-      tokenIds.map((tid) =>
-        publicClient
-          .readContract({
-            address: contracts.lp,
-            abi: lpAbi,
-            functionName: "viewPayout",
-            args: [contracts.core, tid],
-          })
-          .then((p) => ({
-            id: tid,
-            usd: Number(p) / 10 ** contracts.betTokenDecimals,
-            status: "resolved",
-          }))
-          .catch((e) => {
-            const cls = classifyViewPayoutError(e);
-            return { id: tid, usd: 0, status: cls }; // "already_paid" or "pending"
-          }),
-      ),
-    );
 
     const claimable = [];
     let totalPayout = 0;
@@ -1827,9 +1919,9 @@ app.post("/auto-claim", async (req, res) => {
         pendingCount++;
         continue;
       }
-      if (r.usd > 0) {
-        claimable.push(r.id);
-        totalPayout += r.usd;
+      if (r.status === "claimable" && r.payoutUsd > 0) {
+        claimable.push(BigInt(r.tokenId));
+        totalPayout += r.payoutUsd;
       }
     }
 
@@ -1867,14 +1959,14 @@ app.post("/auto-claim", async (req, res) => {
     const hash = await walletClient.writeContract(request);
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-    const balance = await publicClient.readContract({
+    const balance = await readContractBestEffort({
       address: contracts.betToken,
       abi: ERC20_ABI,
       functionName: "balanceOf",
       args: [account.address],
-    });
+    }, 'auto-claim.balanceOf', 3_000);
 
-    const newBalanceUsd = formatUnits(balance, contracts.betTokenDecimals);
+    const newBalanceUsd = balance === null ? null : formatUnits(balance, contracts.betTokenDecimals);
 
     console.log(
       `✅ Auto-claim: ${claimable.length} bets claimed, $${totalPayout.toFixed(2)}, tx=${hash}`,

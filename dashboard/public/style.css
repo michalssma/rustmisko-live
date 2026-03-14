@@ -177,7 +177,6 @@ body {
 .bet-meta { font-size: 11px; color: var(--muted); text-align: right; }
 
 /* ── Bets list ── */
-.bets-list { }
 .bet-row {
   padding: 12px 16px; border-top: 1px solid var(--border);
   display: flex; gap: 10px; align-items: center;
@@ -306,6 +305,19 @@ body {
 .pending-row { display:flex; align-items:center; padding:14px 16px; gap:10px; }
 .pending-dots { font-size:14px; color:var(--warning); letter-spacing:3px; }
 .pending-summary { flex:1; font-size:14px; font-weight:700; }
+.recent-bet-summary {
+  padding: 0 16px 14px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.ops-audit-summary {
+  padding: 0 16px 14px;
+  color: var(--info);
+  font-size: 11px;
+  line-height: 1.45;
+  border-top: 1px solid rgba(255,255,255,0.04);
+}
 .chevron-r { color:var(--muted); font-size:12px; }
 
 /* ── Loss limit bar ──────────────────────────────────────────────────────────── */
